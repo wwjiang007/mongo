@@ -50,7 +50,6 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/subplan.h"
-#include "mongo/db/exec/text.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -59,6 +58,7 @@
 #include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/plan_insert_listener.h"
 #include "mongo/db/query/plan_yield_policy_impl.h"
+#include "mongo/db/query/yield_policy_callbacks_impl.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
@@ -76,10 +76,11 @@ using std::vector;
 const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime =
     OperationContext::declareDecoration<repl::OpTime>();
 
-namespace {
-
-MONGO_FAIL_POINT_DEFINE(planExecutorAlwaysFails);
+// This failpoint is also accessed by the SBE executor so we define it outside of an anonymous
+// namespace.
 MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeShouldWaitForInserts);
+
+namespace {
 
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
@@ -93,13 +94,16 @@ std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutorImpl* exec,
         case PlanYieldPolicy::YieldPolicy::NO_YIELD:
         case PlanYieldPolicy::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY:
         case PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY: {
-            return std::make_unique<PlanYieldPolicyImpl>(exec, policy, yieldable);
+            return std::make_unique<PlanYieldPolicyImpl>(
+                exec, policy, yieldable, std::make_unique<YieldPolicyCallbacksImpl>(exec->nss()));
         }
         case PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT: {
-            return std::make_unique<AlwaysTimeOutYieldPolicy>(exec);
+            return std::make_unique<AlwaysTimeOutYieldPolicy>(
+                exec->getOpCtx()->getServiceContext()->getFastClockSource());
         }
         case PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED: {
-            return std::make_unique<AlwaysPlanKilledYieldPolicy>(exec);
+            return std::make_unique<AlwaysPlanKilledYieldPolicy>(
+                exec->getOpCtx()->getServiceContext()->getFastClockSource());
         }
         default:
             MONGO_UNREACHABLE;
@@ -114,6 +118,7 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    unique_ptr<CanonicalQuery> cq,
                                    const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                    const CollectionPtr& collection,
+                                   bool returnOwnedBson,
                                    NamespaceString nss,
                                    PlanYieldPolicy::YieldPolicy yieldPolicy)
     : _opCtx(opCtx),
@@ -123,35 +128,49 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
       _qs(std::move(qs)),
       _root(std::move(rt)),
       _planExplainer(plan_explainer_factory::make(_root.get())),
-      _nss(std::move(nss)),
-      // There's no point in yielding if the collection doesn't exist.
-      _yieldPolicy(
-          makeYieldPolicy(this,
-                          collection ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                          collection ? &collection : nullptr)) {
+      _mustReturnOwnedBson(returnOwnedBson),
+      _nss(std::move(nss)) {
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
     invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
 
-    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN stage.
-    // This is used for change streams in order to keep the the latest oplog timestamp and post
-    // batch resume token up to date as the oplog scan progresses.
+    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN
+    // stage. This is used for change streams in order to keep the the latest oplog timestamp
+    // and post batch resume token up to date as the oplog scan progresses.
     if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
         _collScanStage = static_cast<CollectionScan*>(collectionScan);
     }
 
-    // We may still need to initialize _nss from either collection or _cq.
-    if (!_nss.isEmpty()) {
-        return;  // We already have an _nss set, so there's nothing more to do.
+    // If we don't yet have a namespace string, then initialize it from either 'collection' or
+    // '_cq'.
+    if (_nss.isEmpty()) {
+        if (collection) {
+            _nss = collection->ns();
+        } else {
+            invariant(_cq);
+            _nss =
+                _cq->getFindCommandRequest().getNamespaceOrUUID().nss().value_or(NamespaceString());
+        }
     }
 
-    if (collection) {
-        _nss = collection->ns();
-    } else {
-        invariant(_cq);
-        _nss = _cq->getQueryRequest().nss();
-    }
+    // There's no point in yielding if the collection doesn't exist.
+    _yieldPolicy =
+        makeYieldPolicy(this,
+                        collection ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                        collection ? &collection : nullptr);
 
     uassertStatusOK(_pickBestPlan());
+
+    if (_qs) {
+        _planExplainer->updateEnumeratorExplainInfo(_qs->_enumeratorExplainInfo);
+    } else if (const MultiPlanStage* mps = getMultiPlanStage()) {
+        const QuerySolution* soln = mps->bestSolution();
+        _planExplainer->updateEnumeratorExplainInfo(soln->_enumeratorExplainInfo);
+
+    } else if (auto subplan = getStageByType(_root.get(), STAGE_SUBPLAN)) {
+        auto subplanStage = static_cast<SubplanStage*>(subplan);
+        _planExplainer->updateEnumeratorExplainInfo(
+            subplanStage->compositeSolution()->_enumeratorExplainInfo);
+    }
 }
 
 Status PlanExecutorImpl::_pickBestPlan() {
@@ -180,8 +199,9 @@ Status PlanExecutorImpl::_pickBestPlan() {
         return cachedPlan->pickBestPlan(_yieldPolicy.get());
     }
 
-    // Finally, we might have an explicit TrialPhase. This specifies exactly two candidate plans,
-    // one of which is to be evaluated. If it fails the trial, then the backup plan is adopted.
+    // Finally, we might have an explicit TrialPhase. This specifies exactly two candidate
+    // plans, one of which is to be evaluated. If it fails the trial, then the backup plan is
+    // adopted.
     foundStage = getStageByType(_root.get(), STAGE_TRIAL);
     if (foundStage) {
         TrialStage* trialStage = static_cast<TrialStage*>(foundStage);
@@ -195,16 +215,6 @@ Status PlanExecutorImpl::_pickBestPlan() {
 
 PlanExecutorImpl::~PlanExecutorImpl() {
     invariant(_currentState == kDisposed);
-}
-
-std::string PlanExecutor::statestr(ExecState execState) {
-    switch (execState) {
-        case PlanExecutor::ADVANCED:
-            return "ADVANCED";
-        case PlanExecutor::IS_EOF:
-            return "IS_EOF";
-    }
-    MONGO_UNREACHABLE;
 }
 
 PlanStage* PlanExecutorImpl::getRootStage() const {
@@ -308,10 +318,7 @@ PlanExecutor::ExecState PlanExecutorImpl::getNextDocument(Document* objOut, Reco
 
 PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* objOut,
                                                        RecordId* dlOut) {
-    if (MONGO_unlikely(planExecutorAlwaysFails.shouldFail())) {
-        uasserted(ErrorCodes::Error(4382101),
-                  "PlanExecutor hit planExecutorAlwaysFails fail point");
-    }
+    checkFailPointPlanExecAlwaysFails();
 
     invariant(_currentState == kUsable);
     if (isMarkedAsKilled()) {
@@ -329,8 +336,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
     size_t writeConflictsInARow = 0;
 
     // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
-    // insert notifier the entire time we are in the loop.  Holding a shared pointer to the capped
-    // insert notifier is necessary for the notifierVersion to advance.
+    // insert notifier the entire time we are in the loop.  Holding a shared pointer to the
+    // capped insert notifier is necessary for the notifierVersion to advance.
     insert_listener::CappedInsertNotifierData cappedInsertNotifierData;
     if (insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
         // We always construct the CappedInsertNotifier for awaitData cursors.
@@ -387,10 +394,16 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
 
             if (hasRequestedData) {
                 // transfer the metadata from the WSM to Document.
-                if (objOut && member->metadata()) {
-                    MutableDocument md(std::move(objOut->value()));
-                    md.setMetadata(member->releaseMetadata());
-                    objOut->setValue(md.freeze());
+                if (objOut) {
+                    if (_mustReturnOwnedBson) {
+                        objOut->value() = objOut->value().getOwned();
+                    }
+
+                    if (member->metadata()) {
+                        MutableDocument md(std::move(objOut->value()));
+                        md.setMetadata(member->releaseMetadata());
+                        objOut->setValue(md.freeze());
+                    }
                 }
                 _workingSet->free(id);
                 return PlanExecutor::ADVANCED;
@@ -456,10 +469,6 @@ void PlanExecutorImpl::markAsKilled(Status killStatus) {
 }
 
 void PlanExecutorImpl::dispose(OperationContext* opCtx) {
-    if (_currentState == kDisposed) {
-        return;
-    }
-
     _currentState = kDisposed;
 }
 
@@ -502,8 +511,8 @@ UpdateResult PlanExecutorImpl::getUpdateResult() const {
                             updateStats.objInserted);
     };
 
-    // If we're updating a non-existent collection, then the delete plan may have an EOF as the root
-    // stage.
+    // If we're updating a non-existent collection, then the delete plan may have an EOF as the
+    // root stage.
     if (_root->stageType() == STAGE_EOF) {
         const auto stats = std::make_unique<UpdateStats>();
         return updateStatsToResult(static_cast<const UpdateStats&>(*stats));
@@ -530,14 +539,14 @@ UpdateResult PlanExecutorImpl::getUpdateResult() const {
 long long PlanExecutorImpl::executeDelete() {
     _executePlan();
 
-    // If we're deleting from a non-existent collection, then the delete plan may have an EOF as the
-    // root stage.
+    // If we're deleting from a non-existent collection, then the delete plan may have an EOF as
+    // the root stage.
     if (_root->stageType() == STAGE_EOF) {
         return 0LL;
     }
 
-    // If the collection exists, the delete plan may either have a delete stage at the root, or (for
-    // findAndModify) a projection stage wrapping a delete stage.
+    // If the collection exists, the delete plan may either have a delete stage at the root, or
+    // (for findAndModify) a projection stage wrapping a delete stage.
     switch (_root->stageType()) {
         case StageType::STAGE_PROJECTION_DEFAULT:
         case StageType::STAGE_PROJECTION_COVERED:

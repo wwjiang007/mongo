@@ -51,12 +51,8 @@ public:
 
     virtual std::unique_ptr<mongo::RecordStore> createRecordStore(OperationContext* opCtx,
                                                                   const std::string& ns) {
-        return std::make_unique<RecordStore>(ns,
-                                             "ident"_sd /* ident */,
-                                             false /* isCapped */,
-                                             -1 /* cappedMaxSize */,
-                                             -1 /* cappedMaxDocs */,
-                                             nullptr /* cappedCallback */);
+        return std::make_unique<RecordStore>(
+            ns, "ident"_sd /* ident */, false /* isCapped */, nullptr /* cappedCallback */);
     }
 
 private:
@@ -69,7 +65,6 @@ std::unique_ptr<mongo::RecoveryUnitHarnessHelper> makeRecoveryUnitHarnessHelper(
 
 MONGO_INITIALIZER(RegisterRecoveryUnitHarnessFactory)(InitializerContext* const) {
     mongo::registerRecoveryUnitHarnessHelperFactory(makeRecoveryUnitHarnessHelper);
-    return Status::OK();
 }
 
 }  // namespace

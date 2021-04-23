@@ -32,6 +32,7 @@
 #include <memory>
 #include <string>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/exec/projection_node.h"
 
@@ -62,6 +63,14 @@ public:
             childPair.second->reportDependencies(deps);
         }
     }
+
+    /**
+     * Removes and returns a BSONObj representing the part of this project that depends only on
+     * 'oldName'. Also returns a bool indicating whether this entire project is extracted. In the
+     * extracted $project, 'oldName' is renamed to 'newName'. 'oldName' should not be dotted.
+     */
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
+                                                            const StringData& newName);
 
 protected:
     std::unique_ptr<ProjectionNode> makeChild(const std::string& fieldName) const final {
@@ -106,7 +115,16 @@ public:
 
     Document serializeTransformation(
         boost::optional<ExplainOptions::Verbosity> explain) const final {
-        return _root->serialize(explain);
+        MutableDocument output;
+
+        // The ExclusionNode tree in '_root' will always have a top-level _id node if _id is to be
+        // excluded. If the _id node is not present, then explicitly set {_id: true} to avoid
+        // ambiguity in the expected behavior of the serialized projection.
+        _root->serialize(explain, &output);
+        if (output.peek()["_id"].missing()) {
+            output.addField("_id", Value{true});
+        }
+        return output.freeze();
     }
 
     /**
@@ -138,6 +156,11 @@ public:
 
     boost::optional<std::set<FieldRef>> extractExhaustivePaths() const {
         return boost::none;
+    }
+
+    std::pair<BSONObj, bool> extractProjectOnFieldAndRename(const StringData& oldName,
+                                                            const StringData& newName) final {
+        return _root->extractProjectOnFieldAndRename(oldName, newName);
     }
 
 private:

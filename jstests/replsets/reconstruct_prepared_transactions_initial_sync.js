@@ -8,7 +8,10 @@
  * prepare a transaction while collection cloning is paused to test applying a prepare oplog entry
  * during oplog application phase of initial sync.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {

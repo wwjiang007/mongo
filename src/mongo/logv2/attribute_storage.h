@@ -34,6 +34,7 @@
 #include "mongo/logv2/constants.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/stdx/variant.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
 
 #include <boost/container/small_vector.hpp>
@@ -380,8 +381,21 @@ public:
                 if constexpr (std::is_same_v<decltype(val), CustomAttributeValue&&>) {
                     if (val.stringSerialize) {
                         val.stringSerialize(buffer);
-                    } else {
+                    } else if (val.toString) {
                         fmt::format_to(buffer, "{}", val.toString());
+                    } else if (val.BSONSerialize) {
+                        BSONObjBuilder objBuilder;
+                        val.BSONSerialize(objBuilder);
+                        objBuilder.done().jsonStringBuffer(
+                            JsonStringFormat::ExtendedRelaxedV2_0_0, 0, false, buffer);
+                    } else if (val.BSONAppend) {
+                        BSONObjBuilder objBuilder;
+                        val.BSONAppend(objBuilder, ""_sd);
+                        objBuilder.done().getField(""_sd).jsonStringBuffer(
+                            JsonStringFormat::ExtendedRelaxedV2_0_0, false, false, 0, buffer);
+                    } else {
+                        val.toBSONArray().jsonStringBuffer(
+                            JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true, buffer);
                     }
 
                 } else if constexpr (isDuration<std::decay_t<decltype(val)>>) {
@@ -481,8 +495,24 @@ public:
                     if (val.stringSerialize) {
                         fmt::format_to(buffer, "{}: ", key);
                         val.stringSerialize(buffer);
-                    } else {
+                    } else if (val.toString) {
                         fmt::format_to(buffer, "{}: {}", key, val.toString());
+                    } else if (val.BSONSerialize) {
+                        BSONObjBuilder objBuilder;
+                        val.BSONSerialize(objBuilder);
+                        fmt::format_to(buffer, "{}: ", key);
+                        objBuilder.done().jsonStringBuffer(
+                            JsonStringFormat::ExtendedRelaxedV2_0_0, 0, false, buffer);
+                    } else if (val.BSONAppend) {
+                        BSONObjBuilder objBuilder;
+                        val.BSONAppend(objBuilder, ""_sd);
+                        fmt::format_to(buffer, "{}: ", key);
+                        objBuilder.done().getField(""_sd).jsonStringBuffer(
+                            JsonStringFormat::ExtendedRelaxedV2_0_0, false, false, 0, buffer);
+                    } else {
+                        fmt::format_to(buffer, "{}: ", key);
+                        val.toBSONArray().jsonStringBuffer(
+                            JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true, buffer);
                     }
                 } else if constexpr (isDuration<std::decay_t<decltype(val)>>) {
                     fmt::format_to(buffer, "{}: {}", key, val.toString());
@@ -523,10 +553,10 @@ private:
 class NamedAttribute {
 public:
     NamedAttribute() = default;
-    NamedAttribute(StringData n, long double val) = delete;
+    NamedAttribute(const char* n, long double val) = delete;
 
     template <typename T>
-    NamedAttribute(StringData n, const boost::optional<T>& val)
+    NamedAttribute(const char* n, const boost::optional<T>& val)
         : NamedAttribute(val ? NamedAttribute(n, *val) : NamedAttribute()) {
         if (!val) {
             name = n;
@@ -535,9 +565,9 @@ public:
     }
 
     template <typename T>
-    NamedAttribute(StringData n, const T& val) : name(n), value(mapValue(val)) {}
+    NamedAttribute(const char* n, const T& val) : name(n), value(mapValue(val)) {}
 
-    StringData name;
+    const char* name = nullptr;
     stdx::variant<int,
                   unsigned int,
                   long long,
@@ -563,8 +593,7 @@ template <typename... Args>
 class AttributeStorage {
 public:
     AttributeStorage(const Args&... args)
-        : _data{detail::NamedAttribute(StringData(args.name.data(), args.name.size()),
-                                       args.value)...} {}
+        : _data{detail::NamedAttribute(args.name, args.value)...} {}
 
 private:
     static const size_t kNumArgs = sizeof...(Args);
@@ -593,26 +622,26 @@ public:
                                    std::is_enum_v<T> || detail::isDuration<T>,
                                int> = 0>
     void add(const char (&name)[N], T value) {
-        _attributes.emplace_back(StringData(name, N - 1), value);
+        _attributes.emplace_back(name, value);
     }
 
     template <size_t N>
     void add(const char (&name)[N], BSONObj value) {
         BSONObj owned = value.getOwned();
-        _attributes.emplace_back(StringData(name, N - 1), owned);
+        _attributes.emplace_back(name, owned);
     }
 
     template <size_t N>
     void add(const char (&name)[N], BSONArray value) {
         BSONArray owned = static_cast<BSONArray>(value.getOwned());
-        _attributes.emplace_back(StringData(name, N - 1), owned);
+        _attributes.emplace_back(name, owned);
     }
 
     template <size_t N,
               typename T,
               std::enable_if_t<std::is_class_v<T> && !detail::isDuration<T>, int> = 0>
     void add(const char (&name)[N], const T& value) {
-        _attributes.emplace_back(StringData(name, N - 1), value);
+        _attributes.emplace_back(name, value);
     }
 
     template <size_t N,
@@ -622,7 +651,7 @@ public:
 
     template <size_t N>
     void add(const char (&name)[N], StringData value) {
-        _attributes.emplace_back(StringData(name, N - 1), value);
+        _attributes.emplace_back(name, value);
     }
 
     // Deep copies the string instead of taking it by reference
@@ -635,7 +664,7 @@ public:
     // Does not have the protections of add() above. Be careful about lifetime of value!
     template <size_t N, typename T>
     void addUnsafe(const char (&name)[N], const T& value) {
-        _attributes.emplace_back(StringData(name, N - 1), value);
+        _attributes.emplace_back(name, value);
     }
 
 private:
@@ -681,9 +710,8 @@ public:
     // Applies a function to every stored named attribute in order they are captured
     template <typename Func>
     void apply(Func&& f) const {
-        std::for_each(_data, _data + _size, [&f](const detail::NamedAttribute& attr) {
-            StringData name = attr.name;
-            stdx::visit([name, &f](auto&& val) { f(name, val); }, attr.value);
+        std::for_each(_data, _data + _size, [&](const auto& attr) {
+            stdx::visit([&](auto&& val) { f(attr.name, val); }, attr.value);
         });
     }
 

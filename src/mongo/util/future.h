@@ -268,6 +268,8 @@ private:
     friend class future_details::FutureImpl;
     template <typename>
     friend class SharedSemiFuture;
+    template <typename>
+    friend class SemiFuture;
 
 
     explicit SemiFuture(future_details::SharedStateHolder<T_unless_void>&& impl)
@@ -516,6 +518,11 @@ public:
         return Future<T>(std::move(this->_impl).tapAll(std::forward<Func>(func)));
     }
 
+    // Calling this on a Future is never strictly necessary, since this is already an inline
+    // Future, but making this public helps for writing generic utilities which need to use
+    // unsafeToInlineFuture for some future types but not others.
+    using SemiFuture<T>::unsafeToInlineFuture;
+
 private:
     template <typename>
     friend class ExecutorFuture;
@@ -526,7 +533,6 @@ private:
     friend class Promise<T>;
     friend class SharedPromise<T>;
 
-    using SemiFuture<T>::unsafeToInlineFuture;
 
     template <typename Func, typename Arg, typename U>
     static auto wrap(future_details::FutureImpl<U>&& impl) {
@@ -680,6 +686,14 @@ public:
                 .template onErrorCategory<category>(wrapCB<Status>(std::forward<Func>(func))));
     }
 
+    /**
+     * Returns an inline Future type from this ExecutorFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    using SemiFuture<T>::unsafeToInlineFuture;
+
 private:
     // This *must* take exec by ref to ensure it isn't moved from while evaluating wrapCB above.
     ExecutorFuture(ExecutorPtr&& exec, Impl&& impl) : SemiFuture<T>(std::move(impl)), _exec(exec) {
@@ -708,8 +722,6 @@ private:
 
     template <typename Sig>
     MONGO_COMPILER_NOINLINE auto wrapCBHelper(unique_function<Sig>&& func);
-
-    using SemiFuture<T>::unsafeToInlineFuture;
 
     template <typename>
     friend class ExecutorFuture;
@@ -1137,17 +1149,6 @@ private:
 };
 
 /**
- * Makes a ready Future with the return value of a nullary function. This has the same semantics as
- * Promise::setWith, and has the same reasons to prefer it over Future<T>::makeReady(). Also, it
- * deduces the T, so it is easier to use.
- */
-TEMPLATE(typename Func)
-REQUIRES(future_details::isCallable<Func, void>)
-auto makeReadyFutureWith(Func&& func) {
-    return Future<void>::makeReady().then(std::forward<Func>(func));
-}
-
-/**
  * Returns a bound Promise and Future in a struct with friendly names (promise and future) that also
  * works well with C++17 structured bindings.
  */
@@ -1181,6 +1182,37 @@ inline auto makePromiseFuture() {
 template <typename Func, typename... Args>
 using FutureContinuationResult =
     future_details::UnwrappedType<std::invoke_result_t<Func, Args&&...>>;
+
+/**
+ * This type transform is useful for coercing (T,StatusWith<T>)->Future<T> and Status->Future<void>.
+ */
+template <typename T>
+using FutureFor = Future<future_details::UnwrappedType<T>>;
+
+template <typename T>
+auto coerceToFuture(T&& value) {
+    return FutureFor<T>(std::forward<T>(value));
+}
+
+/**
+ * Makes a Future with the return value of a nullary function. This has the same semantics as
+ * Promise::setWith, and has the same reasons to prefer it over Future<T>::makeReady(). Also, it
+ * deduces the T, so it is easier to use.
+ *
+ * Note that if func returns an unready Future, this function will not block until it is ready.
+ */
+TEMPLATE(typename Func)
+REQUIRES(future_details::isCallable<Func, void>)
+auto makeReadyFutureWith(Func&& func) -> Future<FutureContinuationResult<Func&&>> try {
+    if constexpr (std::is_void_v<std::invoke_result_t<Func>>) {
+        std::forward<Func>(func)();
+        return Future<void>::makeReady();
+    } else {
+        return std::forward<Func>(func)();
+    }
+} catch (const DBException& ex) {
+    return ex.toStatus();
+}
 
 //
 // Implementations of methods that couldn't be defined in the class due to ordering requirements.

@@ -5,6 +5,37 @@
 load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
 
 /**
+ * Returns a sub-element of the 'queryPlanner' explain output which represents a winning plan.
+ */
+function getWinningPlan(queryPlanner) {
+    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
+    // it will hold a serialized winning plan, otherwise it will be stored in the 'winningPlan'
+    // field itself.
+    return queryPlanner.winningPlan.hasOwnProperty("queryPlan") ? queryPlanner.winningPlan.queryPlan
+                                                                : queryPlanner.winningPlan;
+}
+
+/**
+ * Returns an element of explain output which represents a rejected candidate plan.
+ */
+function getRejectedPlan(rejectedPlan) {
+    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
+    // it will hold a serialized winning plan, otherwise it will be stored in the 'rejectedPlan'
+    // element itself.
+    return rejectedPlan.hasOwnProperty("queryPlan") ? rejectedPlan.queryPlan : rejectedPlan;
+}
+
+/**
+ * Returns a sub-element of the 'cachedPlan' explain output which represents a query plan.
+ */
+function getCachedPlan(cachedPlan) {
+    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present, it
+    // will hold a serialized cached plan, otherwise it will be stored in the 'cachedPlan' field
+    // itself.
+    return cachedPlan.hasOwnProperty("queryPlan") ? cachedPlan.queryPlan : cachedPlan;
+}
+
+/**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns all
  * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
  * requested stage.
@@ -27,16 +58,33 @@ function getPlanStages(root, stage) {
     }
 
     if ("queryPlanner" in root) {
-        results = results.concat(getPlanStages(root.queryPlanner.winningPlan, stage));
+        results = results.concat(getPlanStages(getWinningPlan(root.queryPlanner), stage));
+    }
+
+    if ("thenStage" in root) {
+        results = results.concat(getPlanStages(root.thenStage, stage));
+    }
+
+    if ("elseStage" in root) {
+        results = results.concat(getPlanStages(root.elseStage, stage));
+    }
+
+    if ("outerStage" in root) {
+        results = results.concat(getPlanStages(root.outerStage, stage));
+    }
+
+    if ("innerStage" in root) {
+        results = results.concat(getPlanStages(root.innerStage, stage));
     }
 
     if ("shards" in root) {
         if (Array.isArray(root.shards)) {
-            results = root.shards.reduce(
-                (res, shard) => res.concat(getPlanStages(
-                    shard.hasOwnProperty("winningPlan") ? shard.winningPlan : shard.executionStages,
-                    stage)),
-                results);
+            results =
+                root.shards.reduce((res, shard) => res.concat(getPlanStages(
+                                       shard.hasOwnProperty("winningPlan") ? getWinningPlan(shard)
+                                                                           : shard.executionStages,
+                                       stage)),
+                                   results);
         } else {
             const shards = Object.keys(root.shards);
             results = shards.reduce(
@@ -146,10 +194,13 @@ function getExecutionStages(root) {
  * subdocuments whose stage is 'stage'. This can either be an agg stage name like "$cursor" or
  * "$sort", or a query stage name like "IXSCAN" or "SORT".
  *
+ * If 'useQueryPlannerSection' is set to 'true', the 'queryPlanner' section of the explain output
+ * will be used to lookup the given 'stage', even if 'executionStats' section is available.
+ *
  * Returns an empty array if the plan does not have the requested stage. Asserts that agg explain
  * structure matches expected format.
  */
-function getAggPlanStages(root, stage) {
+function getAggPlanStages(root, stage, useQueryPlannerSection = false) {
     let results = [];
 
     function getDocumentSources(docSourceArray) {
@@ -171,13 +222,13 @@ function getAggPlanStages(root, stage) {
 
         // If execution stats are available, then use the execution stats tree. Otherwise use the
         // plan info from the "queryPlanner" section.
-        if (queryLayerOutput.hasOwnProperty("executionStats")) {
+        if (queryLayerOutput.hasOwnProperty("executionStats") && !useQueryPlannerSection) {
             assert(queryLayerOutput.executionStats.hasOwnProperty("executionStages"));
             results = results.concat(
                 getPlanStages(queryLayerOutput.executionStats.executionStages, stage));
         } else {
             results =
-                results.concat(getPlanStages(queryLayerOutput.queryPlanner.winningPlan, stage));
+                results.concat(getPlanStages(getWinningPlan(queryLayerOutput.queryPlanner), stage));
         }
 
         return results;
@@ -238,9 +289,12 @@ function getAggPlanStages(root, stage) {
  * Given the root stage of agg explain's JSON representation of a query plan ('root'), returns the
  * subdocument with its stage as 'stage'. Returns null if the plan does not have such a stage.
  * Asserts that no more than one stage is a match.
+ *
+ * If 'useQueryPlannerSection' is set to 'true', the 'queryPlanner' section of the explain output
+ * will be used to lookup the given 'stage', even if 'executionStats' section is available.
  */
-function getAggPlanStage(root, stage) {
-    let planStageList = getAggPlanStages(root, stage);
+function getAggPlanStage(root, stage, useQueryPlannerSection = false) {
+    let planStageList = getAggPlanStages(root, stage, useQueryPlannerSection);
 
     if (planStageList.length === 0) {
         return null;
@@ -342,22 +396,47 @@ function isQueryPlan(root) {
 }
 
 /**
- * Get the number of chunk skips for the BSON exec stats tree rooted at 'root'.
+ * Get the "chunk skips" for a single shard. Here, "chunk skips" refer to documents excluded by the
+ * shard filter.
  */
-function getChunkSkips(root) {
-    if (root.stage === "SHARDING_FILTER") {
-        return root.chunkSkips;
-    } else if ("inputStage" in root) {
-        return getChunkSkips(root.inputStage);
-    } else if ("inputStages" in root) {
-        var skips = 0;
-        for (var i = 0; i < root.inputStages.length; i++) {
-            skips += getChunkSkips(root.inputStages[0]);
-        }
-        return skips;
+function getChunkSkipsFromShard(shardPlan, shardExecutionStages) {
+    const shardFilterPlanStage = getPlanStage(getWinningPlan(shardPlan), "SHARDING_FILTER");
+    if (!shardFilterPlanStage) {
+        return 0;
     }
 
-    return 0;
+    if (shardFilterPlanStage.hasOwnProperty("planNodeId")) {
+        const shardFilterNodeId = shardFilterPlanStage.planNodeId;
+
+        // If the query plan's shard filter has a 'planNodeId' value, we search for the
+        // corresponding SBE filter stage and use its stats to determine how many documents were
+        // excluded.
+        const filters = getPlanStages(shardExecutionStages.executionStages, "filter")
+                            .filter(stage => (stage.planNodeId === shardFilterNodeId));
+        return filters.reduce((numSkips, stage) => (numSkips + (stage.numTested - stage.advances)),
+                              0);
+    } else {
+        // Otherwise, we assume that execution used a "classic" SHARDING_FILTER stage, which
+        // explicitly reports a "chunkSkips" value.
+        const filters = getPlanStages(shardExecutionStages.executionStages, "SHARDING_FILTER");
+        return filters.reduce((numSkips, stage) => (numSkips + stage.chunkSkips), 0);
+    }
+}
+
+/**
+ * Get the sum of "chunk skips" from all shards. Here, "chunk skips" refer to documents excluded by
+ * the shard filter.
+ */
+function getChunkSkipsFromAllShards(explainResult) {
+    const shardPlanArray = explainResult.queryPlanner.winningPlan.shards;
+    const shardExecutionStagesArray = explainResult.executionStats.executionStages.shards;
+    assert.eq(shardPlanArray.length, shardExecutionStagesArray.length, explainResult);
+
+    let totalChunkSkips = 0;
+    for (let i = 0; i < shardPlanArray.length; i++) {
+        totalChunkSkips += getChunkSkipsFromShard(shardPlanArray[i], shardExecutionStagesArray[i]);
+    }
+    return totalChunkSkips;
 }
 
 /**
@@ -375,14 +454,21 @@ function assertExplainCount({explainResults, expectedCount}) {
         for (let shardExplain of execStages.shards) {
             const countStage = shardExplain.executionStages;
             assert(countStage.stage === "COUNT" || countStage.stage === "RECORD_STORE_FAST_COUNT",
-                   "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
+                   `Root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT. ` +
+                       `The actual plan is: ${tojson(explainResults)}`);
             totalCounted += countStage.nCounted;
         }
-        assert.eq(totalCounted, expectedCount, "wrong count result");
+        assert.eq(totalCounted,
+                  expectedCount,
+                  assert.eq(totalCounted, expectedCount, "wrong count result"));
     } else {
         assert(execStages.stage === "COUNT" || execStages.stage === "RECORD_STORE_FAST_COUNT",
-               "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
-        assert.eq(execStages.nCounted, expectedCount, "wrong count result");
+               `Root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT. ` +
+                   `The actual plan is: ${tojson(explainResults)}`);
+        assert.eq(
+            execStages.nCounted,
+            expectedCount,
+            "Wrong count result. Actual: " + execStages.nCounted + "expected: " + expectedCount);
     }
 }
 
@@ -391,12 +477,12 @@ function assertExplainCount({explainResults, expectedCount}) {
  */
 function assertCoveredQueryAndCount({collection, query, project, count}) {
     let explain = collection.find(query, project).explain();
-    assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
+    assert(isIndexOnly(db, getWinningPlan(explain.queryPlanner)),
            "Winning plan was not covered: " + tojson(explain.queryPlanner.winningPlan));
 
     // Same query as a count command should also be covered.
     explain = collection.explain("executionStats").find(query).count();
-    assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
+    assert(isIndexOnly(db, getWinningPlan(explain.queryPlanner)),
            "Winning plan for count was not covered: " + tojson(explain.queryPlanner.winningPlan));
     assertExplainCount({explainResults: explain, expectedCount: count});
 }
@@ -408,7 +494,7 @@ function assertCoveredQueryAndCount({collection, query, project, count}) {
  */
 function assertStagesForExplainOfCommand({coll, cmdObj, expectedStages, stagesNotExpected}) {
     const plan = assert.commandWorked(coll.runCommand({explain: cmdObj}));
-    const winningPlan = plan.queryPlanner.winningPlan;
+    const winningPlan = getWinningPlan(plan.queryPlanner);
     for (let expectedStage of expectedStages) {
         assert(planHasStage(coll.getDB(), winningPlan, expectedStage),
                "Could not find stage " + expectedStage + ". Plan: " + tojson(plan));

@@ -311,24 +311,24 @@ void _scheduleFirstOplogEntryFetcherResponse(executor::NetworkInterfaceMock* net
  * Generates oplog entries with the given optime.
  */
 BSONObj _makeOplogEntry(Timestamp ts, long long term) {
-    return OplogEntry(OpTime(ts, term),                 // optime
-                      boost::none,                      // hash
-                      OpTypeEnum::kNoop,                // op type
-                      NamespaceString("a.a"),           // namespace
-                      boost::none,                      // uuid
-                      boost::none,                      // fromMigrate
-                      repl::OplogEntry::kOplogVersion,  // version
-                      BSONObj(),                        // o
-                      boost::none,                      // o2
-                      {},                               // sessionInfo
-                      boost::none,                      // upsert
-                      Date_t(),                         // wall clock time
-                      boost::none,                      // statement id
-                      boost::none,  // optime of previous write within same transaction
-                      boost::none,  // pre-image optime
-                      boost::none,  // post-image optime
-                      boost::none,  // ShardId of resharding recipient
-                      boost::none)  // _id
+    return DurableOplogEntry(OpTime(ts, term),                 // optime
+                             boost::none,                      // hash
+                             OpTypeEnum::kNoop,                // op type
+                             NamespaceString("a.a"),           // namespace
+                             boost::none,                      // uuid
+                             boost::none,                      // fromMigrate
+                             repl::OplogEntry::kOplogVersion,  // version
+                             BSONObj(),                        // o
+                             boost::none,                      // o2
+                             {},                               // sessionInfo
+                             boost::none,                      // upsert
+                             Date_t(),                         // wall clock time
+                             {},                               // statement ids
+                             boost::none,  // optime of previous write within same transaction
+                             boost::none,  // pre-image optime
+                             boost::none,  // post-image optime
+                             boost::none,  // ShardId of resharding recipient
+                             boost::none)  // _id
         .toBSON();
 }
 
@@ -602,7 +602,7 @@ TEST_F(SyncSourceResolverTest,
     ASSERT_TRUE(_resolver->isActive());
 
     _scheduleFirstOplogEntryFetcherResponse(
-        getNet(), _selector.get(), candidate1, candidate2, {BSON("t" << 1)});
+        getNet(), _selector.get(), candidate1, candidate2, {BSON("t" << 1LL)});
 
     ASSERT_TRUE(_resolver->isActive());
     ASSERT_EQUALS(candidate1, _selector->getLastBlacklistedSyncSource_forTest());
@@ -654,7 +654,7 @@ TEST_F(SyncSourceResolverTest, SyncSourceResolverWillSucceedWithExtraFields) {
                                             _selector.get(),
                                             candidate1,
                                             HostAndPort(),
-                                            {BSON("ts" << Timestamp(1, 1) << "t" << 1 << "note"
+                                            {BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "note"
                                                        << "a")});
 
     _resolver->join();

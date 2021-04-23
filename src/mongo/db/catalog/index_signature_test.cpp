@@ -34,6 +34,7 @@
 #include "mongo/db/catalog/index_catalog_entry_impl.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/query/collection_query_info.h"
 
 namespace mongo {
@@ -61,6 +62,12 @@ public:
     std::unique_ptr<IndexDescriptor> makeIndexDescriptor(BSONObj spec) {
         auto keyPattern = spec.getObjectField(IndexDescriptor::kKeyPatternFieldName);
         return std::make_unique<IndexDescriptor>(IndexNames::findPluginName(keyPattern), spec);
+    }
+
+    BSONObj normalizeIndexSpec(BSONObj spec) {
+        std::vector<BSONObj> specs =
+            IndexBuildsCoordinator::normalizeIndexSpecs(opCtx(), coll(), {spec});
+        return specs[0];
     }
 
     const NamespaceString& nss() const {
@@ -108,19 +115,20 @@ TEST_F(IndexSignatureTest, CanCreateMultipleIndexesOnSameKeyPatternWithDifferent
     // Confirm that attempting to build this index will result in ErrorCodes::IndexAlreadyExists.
     ASSERT_EQ(createIndex(collationDesc->infoObj()), ErrorCodes::IndexAlreadyExists);
 
-    // Now set the unique field. The indexes now compare kEquivalent, but not kIdentical. This means
-    // that all signature fields which uniquely identify the index match, but other fields differ.
-    auto collationUniqueDesc =
-        makeIndexDescriptor(collationDesc->infoObj().addFields(fromjson("{unique: true}")));
-    ASSERT(collationUniqueDesc->compareIndexOptions(opCtx(), coll()->ns(), basicIndex) ==
+    // Now add storage engine option. The indexes now compare kEquivalent, but not kIdentical. This
+    // means that all signature fields which uniquely identify the index match, but other fields
+    // differ.
+    auto collationStorageEngineDesc =
+        makeIndexDescriptor(indexSpec.addFields(fromjson("{storageEngine: {wiredTiger: {}}}")));
+    ASSERT(collationStorageEngineDesc->compareIndexOptions(opCtx(), coll()->ns(), basicIndex) ==
            IndexDescriptor::Comparison::kEquivalent);
 
     // Attempting to build the index, whether with the same name or a different name, now throws
     // IndexOptionsConflict. The error message returned with the exception specifies whether the
     // name matches an existing index.
-    ASSERT_EQ(createIndex(collationUniqueDesc->infoObj()), ErrorCodes::IndexOptionsConflict);
-    ASSERT_EQ(createIndex(
-                  collationUniqueDesc->infoObj().addFields(fromjson("{name: 'collationUnique'}"))),
+    ASSERT_EQ(createIndex(collationStorageEngineDesc->infoObj()), ErrorCodes::IndexOptionsConflict);
+    ASSERT_EQ(createIndex(collationStorageEngineDesc->infoObj().addFields(
+                  fromjson("{name: 'collationStorageEngine'}"))),
               ErrorCodes::IndexOptionsConflict);
 
     // Now create an index spec with an entirely different collation. The two indexes compare as
@@ -164,22 +172,23 @@ TEST_F(IndexSignatureTest,
     // Confirm that attempting to build this index will result in ErrorCodes::IndexAlreadyExists.
     ASSERT_EQ(createIndex(partialFilterDupeDesc->infoObj()), ErrorCodes::IndexAlreadyExists);
 
-    // Now set the unique field. The indexes now compare kEquivalent, but not kIdentical. This means
-    // that all signature fields which uniquely identify the index match, but other fields differ.
-    auto partialFilterUniqueDesc =
-        makeIndexDescriptor(partialFilterDesc->infoObj().addFields(fromjson("{unique: true}")));
-    ASSERT(
-        partialFilterUniqueDesc->compareIndexOptions(opCtx(), coll()->ns(), partialFilterIndex) ==
-        IndexDescriptor::Comparison::kEquivalent);
+    // Now add the storage engine field. The indexes now compare kEquivalent, but not kIdentical.
+    // This means that all signature fields which uniquely identify the index match, but other
+    // fields differ.
+    auto partialFilterStorageEngineDesc = makeIndexDescriptor(
+        partialFilterDesc->infoObj().addFields(fromjson("{storageEngine: {wiredTiger: {}}}")));
+    ASSERT(partialFilterStorageEngineDesc->compareIndexOptions(
+               opCtx(), coll()->ns(), partialFilterIndex) ==
+           IndexDescriptor::Comparison::kEquivalent);
 
     // Attempting to build the index, whether with the same name or a different name, now throws
     // IndexOptionsConflict. The error message returned with the exception specifies whether the
     // name matches an existing index.
-    ASSERT_EQ(createIndex(partialFilterUniqueDesc->infoObj().addFields(
-                  fromjson("{name: 'partialFilterExpression'}"))),
+    ASSERT_EQ(createIndex(partialFilterStorageEngineDesc->infoObj().addFields(
+                  fromjson("{name: 'partialFilter'}"))),
               ErrorCodes::IndexOptionsConflict);
-    ASSERT_EQ(createIndex(partialFilterUniqueDesc->infoObj().addFields(
-                  fromjson("{name: 'partialFilterUnique'}"))),
+    ASSERT_EQ(createIndex(partialFilterStorageEngineDesc->infoObj().addFields(
+                  fromjson("{name: 'partialFilterStorageEngine'}"))),
               ErrorCodes::IndexOptionsConflict);
 
     // Now create an index spec with an entirely different partialFilterExpression. The two indexes
@@ -200,10 +209,8 @@ TEST_F(IndexSignatureTest, CannotCreateMultipleIndexesOnSameKeyPatternIfNonSigna
     auto indexSpec = fromjson("{v: 2, name: 'a_1', key: {a: 1}}");
     auto* basicIndex = unittest::assertGet(createIndex(indexSpec));
 
-    // TODO SERVER-47657: unique and sparse should be part of the signature.
     std::vector<BSONObj> nonSigOptions = {
-        BSON(IndexDescriptor::kUniqueFieldName << true),
-        BSON(IndexDescriptor::kSparseFieldName << true),
+        BSON(IndexDescriptor::kStorageEngineFieldName << BSON("wiredTiger"_sd << BSONObj())),
         BSON(IndexDescriptor::kExpireAfterSecondsFieldName << 10)};
 
     // Verify that changing each of the non-signature fields does not distinguish this index from
@@ -214,17 +221,224 @@ TEST_F(IndexSignatureTest, CannotCreateMultipleIndexesOnSameKeyPatternIfNonSigna
                IndexDescriptor::Comparison::kEquivalent);
         ASSERT_EQ(createIndex(nonSigDesc->infoObj()), ErrorCodes::IndexOptionsConflict);
     }
+}
 
-    // Build a wildcard index and confirm that 'wildcardProjection' is a non-signature field.
-    // TODO SERVER-47659: wildcardProjection should be part of the signature.
-    auto* wildcardIndex =
-        unittest::assertGet(createIndex(fromjson("{v: 2, name: '$**_1', key: {'$**': 1}}")));
-    auto nonSigWildcardDesc = makeIndexDescriptor(
-        wildcardIndex->descriptor()->infoObj().addFields(fromjson("{wildcardProjection: {a: 1}}")));
-    ASSERT(nonSigWildcardDesc->compareIndexOptions(opCtx(), coll()->ns(), wildcardIndex) ==
+TEST_F(IndexSignatureTest, CanCreateMultipleIndexesOnSameKeyPatternWithDifferentUniqueProperty) {
+    // Create an index on {a: 1}.
+    auto indexSpec = fromjson("{v: 2, name: 'a_1', key: {a: 1}}");
+    auto* basicIndex = unittest::assertGet(createIndex(indexSpec));
+
+    auto basicIndexDesc = makeIndexDescriptor(indexSpec);
+
+    // Create an index on the same key pattern with the 'unique' field explicitly set to false.
+    // The two indexes compare as kIdentical.
+    auto uniqueFalseDesc = makeIndexDescriptor(
+        basicIndexDesc->infoObj().addFields(fromjson("{name: 'a_1', unique: false}")));
+    ASSERT(uniqueFalseDesc->compareIndexOptions(opCtx(), coll()->ns(), basicIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+
+    // Verify that creating an index with the same name and 'unique' = false fails with
+    // IndexAlreadyExists error code.
+    ASSERT_EQ(createIndex(uniqueFalseDesc->infoObj()), ErrorCodes::IndexAlreadyExists);
+
+    // Now set the unique field. The indexes now compare kDifferent. This means that the index
+    // signature does not match and we can create this index.
+    auto uniqueDesc = makeIndexDescriptor(
+        basicIndexDesc->infoObj().addFields(fromjson("{unique: true, name: 'a_unique'}")));
+    ASSERT(uniqueDesc->compareIndexOptions(opCtx(), coll()->ns(), basicIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+
+    // Verify that we can build this index alongside the existing index since its 'unique' option
+    // differs.
+    auto* uniqueIndex = unittest::assertGet(createIndex(uniqueDesc->infoObj()));
+
+    // Now create another unique index. The indexes now compare kIdentical.
+    auto uniqueDesc2 = makeIndexDescriptor(
+        basicIndexDesc->infoObj().addFields(fromjson("{unique: true, name: 'a_unique2'}")));
+    ASSERT(uniqueDesc2->compareIndexOptions(opCtx(), coll()->ns(), uniqueIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+
+    // Verify that creating another unique index with a different name fails with
+    // IndexOptionsConflict error.
+    ASSERT_EQ(createIndex(uniqueDesc2->infoObj()), ErrorCodes::IndexOptionsConflict);
+
+    // Now add a non-signature index option to the unique index and two indexes compare kEquivalent.
+    auto uniqueStorageEngineDesc = makeIndexDescriptor(
+        uniqueDesc->infoObj().addFields(fromjson("{storageEngine: {wiredTiger: {}}}")));
+    ASSERT(uniqueStorageEngineDesc->compareIndexOptions(opCtx(), coll()->ns(), uniqueIndex) ==
            IndexDescriptor::Comparison::kEquivalent);
+
+    // Verify that creating another unique index with a non-signature option fails with
+    // IndexOptionsConflict error.
+    ASSERT_EQ(createIndex(uniqueStorageEngineDesc->infoObj()), ErrorCodes::IndexOptionsConflict);
+}
+
+TEST_F(IndexSignatureTest, CanCreateMultipleIndexesOnSameKeyPatternWithDifferentSparseProperty) {
+    // Create an index on {a: 1}.
+    auto indexSpec = fromjson("{v: 2, name: 'a_1', key: {a: 1}}");
+    auto* basicIndex = unittest::assertGet(createIndex(indexSpec));
+
+    auto basicIndexDesc = makeIndexDescriptor(indexSpec);
+
+    // Create an index on the same key pattern with the 'sparse' field explicitly set to false.
+    // The two indexes compare as kIdentical.
+    auto sparseFalseDesc = makeIndexDescriptor(
+        basicIndexDesc->infoObj().addFields(fromjson("{name: 'a_1', unique: false}")));
+    ASSERT(sparseFalseDesc->compareIndexOptions(opCtx(), coll()->ns(), basicIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+
+    // Verify that creating an index with the same name and 'sparse' = false fails with
+    // IndexAlreadyExists error code.
+    ASSERT_EQ(createIndex(sparseFalseDesc->infoObj()), ErrorCodes::IndexAlreadyExists);
+
+    // Now set the sparse field. The indexes now compare kDifferent. This means that the index
+    // signature does not match and we can create this index.
+    auto sparseDesc = makeIndexDescriptor(
+        basicIndexDesc->infoObj().addFields(fromjson("{sparse: true, name: 'a_sparse'}")));
+    ASSERT(sparseDesc->compareIndexOptions(opCtx(), coll()->ns(), basicIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+
+    // Verify that we can build this index alongside the existing index since its 'sparse' option
+    // differs.
+    auto* sparseIndex = unittest::assertGet(createIndex(sparseDesc->infoObj()));
+
+    // Now create another sparse index. The indexes now compare kIdentical.
+    auto sparseDesc2 = makeIndexDescriptor(
+        basicIndexDesc->infoObj().addFields(fromjson("{sparse: true, name: 'a_sparse2'}")));
+    ASSERT(sparseDesc2->compareIndexOptions(opCtx(), coll()->ns(), sparseIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+
+    // Verify that creating another sparse index with a different name fails with
+    // IndexOptionsConflict error.
+    ASSERT_EQ(createIndex(sparseDesc2->infoObj()), ErrorCodes::IndexOptionsConflict);
+
+    // Now add a non-signature index option to the sparse index and two indexes compare kEquivalent.
+    auto sparseStorageEngineDesc = makeIndexDescriptor(
+        sparseDesc->infoObj().addFields(fromjson("{storageEngine: {wiredTiger: {}}}")));
+    ASSERT(sparseStorageEngineDesc->compareIndexOptions(opCtx(), coll()->ns(), sparseIndex) ==
+           IndexDescriptor::Comparison::kEquivalent);
+
+    // Verify that creating another sparse index with a non-signature option fails with
+    // IndexOptionsConflict error.
+    ASSERT_EQ(createIndex(sparseStorageEngineDesc->infoObj()), ErrorCodes::IndexOptionsConflict);
+}
+
+TEST_F(IndexSignatureTest, NormalizeOnlyWildcardAllKeyPattern) {
+    auto wcAInclusionSpec = fromjson("{v: 2, key: {'a.$**': 1}}");
+
+    // Verifies that the path projection is not normalized.
+    auto wcAInclusionDesc = makeIndexDescriptor(wcAInclusionSpec);
+    auto wcAInclusionSpecAfterNormalization = normalizeIndexSpec(wcAInclusionSpec);
+    ASSERT_TRUE(SimpleBSONObjComparator::kInstance.evaluate(wcAInclusionSpec ==
+                                                            wcAInclusionSpecAfterNormalization));
+
+    // Verifies that the path projection is not normalized for the created index catalog entry.
+    auto* wcAInclusionIndex = unittest::assertGet(
+        createIndex(wcAInclusionSpec.addFields(fromjson("{name: 'wc_a_all'}"))));
+    ASSERT_TRUE(wcAInclusionIndex->descriptor()->normalizedPathProjection().isEmpty());
+}
+
+TEST_F(IndexSignatureTest,
+       CanCreateMultipleIndexesOnSameKeyPatternWithDifferentWildcardProjections) {
+    // Creates a base wildcard index to verify 'wildcardProjection' option is part of index
+    // signature.
+    auto* wildcardIndex =
+        unittest::assertGet(createIndex(fromjson("{v: 2, name: 'wc_all', key: {'$**': 1}}")));
+
+    // Verifies that another wildcard index with empty wildcardProjection compares identical
+    // to 'wildcardIndex' after normalizing the index spec.
+    auto anotherWcAllSpec = normalizeIndexSpec(fromjson("{v: 2, key: {'$**': 1}}"));
+    auto anotherWcAllProjDesc = makeIndexDescriptor(anotherWcAllSpec);
+    ASSERT(anotherWcAllProjDesc->compareIndexOptions(opCtx(), coll()->ns(), wildcardIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+    ASSERT_EQ(createIndex(anotherWcAllProjDesc->infoObj().addFields(fromjson("{name: 'wc_all'}"))),
+              ErrorCodes::IndexAlreadyExists);
     ASSERT_EQ(
-        createIndex(nonSigWildcardDesc->infoObj().addFields(fromjson("{name: 'nonSigWildcard'}"))),
+        createIndex(anotherWcAllProjDesc->infoObj().addFields(fromjson("{name: 'wc_all_1'}"))),
+        ErrorCodes::IndexOptionsConflict);
+
+    // Verifies that an index with non-empty value for 'wildcardProjection' option compares
+    // different from the base wildcard index and thus can be created.
+    auto wcProjADesc =
+        makeIndexDescriptor(normalizeIndexSpec(wildcardIndex->descriptor()->infoObj().addFields(
+            fromjson("{wildcardProjection: {a: 1}}"))));
+    ASSERT(wcProjADesc->compareIndexOptions(opCtx(), coll()->ns(), wildcardIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+    auto* wcProjAIndex = unittest::assertGet(
+        createIndex(wcProjADesc->infoObj().addFields(fromjson("{name: 'wc_a'}"))));
+
+    // Verifies that an index with the same value for 'wildcardProjection' option as the
+    // wcProjAIndex compares identical.
+    auto anotherWcProjADesc =
+        makeIndexDescriptor(normalizeIndexSpec(wildcardIndex->descriptor()->infoObj().addFields(
+            fromjson("{wildcardProjection: {a: 1}}"))));
+    ASSERT(anotherWcProjADesc->compareIndexOptions(opCtx(), coll()->ns(), wcProjAIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+
+    // Verifies that creating an index with the same value for 'wildcardProjection' option and the
+    // same name fails with IndexAlreadyExists error.
+    ASSERT_EQ(createIndex(anotherWcProjADesc->infoObj().addFields(fromjson("{name: 'wc_a'}"))),
+              ErrorCodes::IndexAlreadyExists);
+    // Verifies that creating an index with the same value for 'wildcardProjection' option and a
+    // different name fails with IndexOptionsConflict error.
+    ASSERT_EQ(createIndex(anotherWcProjADesc->infoObj().addFields(fromjson("{name: 'wc_a_1'}"))),
+              ErrorCodes::IndexOptionsConflict);
+
+    // Verifies that an index with a different value for 'wildcardProjection' option compares
+    // different from the base wildcard index or 'wc_a' and thus can be created.
+    auto wcProjABDesc =
+        makeIndexDescriptor(normalizeIndexSpec(wildcardIndex->descriptor()->infoObj().addFields(
+            fromjson("{wildcardProjection: {a: 1, b: 1}}"))));
+    ASSERT(wcProjABDesc->compareIndexOptions(opCtx(), coll()->ns(), wildcardIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+    ASSERT(wcProjABDesc->compareIndexOptions(opCtx(), coll()->ns(), wcProjAIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+    auto* wcProjABIndex = unittest::assertGet(
+        createIndex(wcProjABDesc->infoObj().addFields(fromjson("{name: 'wc_a_b'}"))));
+
+    // Verifies that an index with sub fields for 'wildcardProjection' option compares
+    // different from the base wildcard index or 'wc_a' or 'wc_a_b' and thus can be created.
+    auto wcProjASubBCDesc =
+        makeIndexDescriptor(normalizeIndexSpec(wildcardIndex->descriptor()->infoObj().addFields(
+            fromjson("{wildcardProjection: {a: {b: 1, c: 1}}}"))));
+    ASSERT(wcProjASubBCDesc->compareIndexOptions(opCtx(), coll()->ns(), wildcardIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+    ASSERT(wcProjASubBCDesc->compareIndexOptions(opCtx(), coll()->ns(), wcProjAIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+    ASSERT(wcProjASubBCDesc->compareIndexOptions(opCtx(), coll()->ns(), wcProjABIndex) ==
+           IndexDescriptor::Comparison::kDifferent);
+    auto* wcProjASubBCIndex = unittest::assertGet(
+        createIndex(wcProjASubBCDesc->infoObj().addFields(fromjson("{name: 'wc_a_sub_b_c'}"))));
+
+    // Verifies that two indexes with the same projection in different order compares identical.
+    auto wcProjASubCBDesc =
+        makeIndexDescriptor(normalizeIndexSpec(wildcardIndex->descriptor()->infoObj().addFields(
+            fromjson("{wildcardProjection: {a: {c: 1, b: 1}}}"))));
+    ASSERT(wcProjASubCBDesc->compareIndexOptions(opCtx(), coll()->ns(), wcProjASubBCIndex) ==
+           IndexDescriptor::Comparison::kIdentical);
+    // Verifies that two indexes with the same projection in different order can not be created.
+    ASSERT_EQ(
+        createIndex(wcProjASubCBDesc->infoObj().addFields(fromjson("{name: 'wc_a_sub_b_c'}"))),
+        ErrorCodes::IndexAlreadyExists);
+    ASSERT_EQ(
+        createIndex(wcProjASubCBDesc->infoObj().addFields(fromjson("{name: 'wc_a_sub_c_b'}"))),
+        ErrorCodes::IndexOptionsConflict);
+
+    // Verifies that an index with the same value for 'wildcardProjection' option and an
+    // non-signature index option compares equivalent as the 'wcProjAIndex'
+    auto wcProjAWithNonSigDesc = makeIndexDescriptor(
+        anotherWcProjADesc->infoObj().addFields(fromjson("{storageEngine: {wiredTiger: {}}}")));
+    ASSERT(wcProjAWithNonSigDesc->compareIndexOptions(opCtx(), coll()->ns(), wcProjAIndex) ==
+           IndexDescriptor::Comparison::kEquivalent);
+
+    // Verifies that an index with the same value for 'wildcardProjection' option, non-signature
+    // index option, and the same name fails with IndexOptionsConflict error.
+    ASSERT_EQ(createIndex(wcProjAWithNonSigDesc->infoObj().addFields(fromjson("{name: 'wc_a'}"))),
+              ErrorCodes::IndexOptionsConflict);
+    // Verifies that an index with the same value for 'wildcardProjection' option, non-signature
+    // index option, and a different name fails with IndexOptionsConflict error too.
+    ASSERT_EQ(
+        createIndex(wcProjAWithNonSigDesc->infoObj().addFields(fromjson("{name: 'wc_a_nonsig'}"))),
         ErrorCodes::IndexOptionsConflict);
 }
 

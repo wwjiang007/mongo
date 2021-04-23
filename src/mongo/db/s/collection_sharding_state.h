@@ -36,18 +36,16 @@
 namespace mongo {
 
 /**
- * Each collection on a mongod instance is dynamically assigned an implementation of
- * CollectionShardingState for the duration of its lifetime, which represents the
- * shard's knowledge of its the shard version and the set of chunks that it owns, as well as
- * functions for updating and tracking this state.
+ * Each collection on a MongoD instance is assigned an instance of CollectionShardingState for the
+ * duration of its lifetime, which represents the shard's knowledge of that collection's shard
+ * version and the set of chunks that it owns, as well as functions for tracking this state.
+ *
+ * This is the only interface that non-sharding consumers should be interfacing with.
  *
  * On shard servers, the implementation used is CollectionShardingRuntime.
  *
  * On embedded or non-shard servers, the implementation used is CollectionShardingStateStandalone,
  * which is a mostly empty implementation.
- *
- * This separation was required for linking reasons and the difference between sharded and not
- * sharded clusters.
  *
  * The CollectionShardingStateFactory class below is used to instantiate the correct subclass of
  * CollectionShardingState at runtime.
@@ -72,6 +70,14 @@ public:
      * returned pointer must not be stored.
      */
     static CollectionShardingState* get(OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Obtain a pointer to the CollectionShardingState that remains safe to access without holding
+     * a collection lock. Should be called instead of the regular get() if no collection lock is
+     * held. The returned CollectionShardingState instance should not be modified!
+     */
+    static std::shared_ptr<CollectionShardingState> getSharedForLockFreeReads(
+        OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Reports all collections which have filtering information associated.

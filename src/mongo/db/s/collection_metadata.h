@@ -78,12 +78,17 @@ public:
     boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const;
 
     /**
-     * Writes should run in distributed transactions when
-     *      1. The coordinator is between the mirroring and committed states, OR
-     *      2. The coordinator is in the renaming state, but the epoch is still the original epoch.
+     * Throws an exception if resharding fields currently exist in the collection metadata.
      */
-    bool writesShouldRunInDistributedTransaction(const OID& originalEpoch,
-                                                 const OID& reshardingEpoch) const;
+    void throwIfReshardingInProgress(NamespaceString const& nss) const;
+
+    /**
+     * The caller should disallow writes when
+     *      1. The coordinator is in the mirroring state, OR
+     *      2. The coordinator is in the decision persisted state, but the UUID is still the
+     *         original UUID.
+     */
+    bool disallowWritesForResharding(const UUID& currentCollectionUUID) const;
 
     /**
      * Returns the current shard version for the collection or UNSHARDED if it is not sharded.
@@ -165,10 +170,16 @@ public:
      */
     void toBSONBasic(BSONObjBuilder& bb) const;
 
+    BSONObj toBSON() const;
+
     /**
      * String output of the collection and shard versions.
      */
     std::string toStringBasic() const;
+
+    std::string toString() const {
+        return toStringBasic();
+    }
 
     //
     // Methods used for orphan filtering and general introspection of the chunks owned by the shard
@@ -210,6 +221,11 @@ public:
     }
 
     /**
+     * Returns true if this shard has any chunks for the collection.
+     */
+    bool currentShardHasAnyChunks() const;
+
+    /**
      * Given a key in the shard key range, get the next range which overlaps or is greater than
      * this key.
      *
@@ -243,6 +259,11 @@ public:
     const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
         invariant(isSharded());
         return _cm->getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        invariant(isSharded());
+        return _cm->getTimeseriesFields();
     }
 
 private:

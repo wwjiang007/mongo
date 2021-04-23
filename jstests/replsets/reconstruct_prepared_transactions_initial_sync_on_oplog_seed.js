@@ -8,7 +8,10 @@
  * and the prepare oplog entry will be inserted as the oplog seed. We then make sure the oplog seed
  * entry is visible and the prepared transaction is properly reconstructed.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {

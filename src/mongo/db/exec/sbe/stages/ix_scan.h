@@ -31,13 +31,12 @@
 
 #include "mongo/bson/ordering.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/sbe/stages/collection_helpers.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/trial_run_progress_tracker.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo::sbe {
-
 /**
  * A stage that iterates the entries of a collection index, starting from a bound specified by the
  * value in 'seekKeySlotLow' and ending (via IS_EOF) with the 'seekKeySlotHigh' bound. (An
@@ -51,7 +50,8 @@ namespace mongo::sbe {
  *
  * The "output" slots are
  *   - 'recordSlot': the "KeyString" representing the index entry,
- *   - 'recordIdSlot': a reference that can be used to fetch the entire document, and
+ *   - 'recordIdSlot': a reference that can be used to fetch the entire document,
+ *   - 'snapshotIdSlot': the storage snapshot that this index scan is reading from, and
  *   - 'vars': one slot for each value in the index key that should be "projected" out of the entry.
  *
  * The 'indexKeysToInclude' bitset determines which values are included in the projection based
@@ -60,18 +60,19 @@ namespace mongo::sbe {
  */
 class IndexScanStage final : public PlanStage {
 public:
-    IndexScanStage(const NamespaceStringOrUUID& name,
-                   std::string_view indexName,
+    IndexScanStage(CollectionUUID collUuid,
+                   StringData indexName,
                    bool forward,
                    boost::optional<value::SlotId> recordSlot,
                    boost::optional<value::SlotId> recordIdSlot,
+                   boost::optional<value::SlotId> snapshotIdSlot,
                    IndexKeysInclusionSet indexKeysToInclude,
                    value::SlotVector vars,
                    boost::optional<value::SlotId> seekKeySlotLow,
                    boost::optional<value::SlotId> seekKeySlotHigh,
                    PlanYieldPolicy* yieldPolicy,
-                   TrialRunProgressTracker* tracker,
-                   PlanNodeId nodeId);
+                   PlanNodeId nodeId,
+                   LockAcquisitionCallback lockAcquisitionCallback);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -89,21 +90,37 @@ protected:
     void doSaveState() override;
     void doRestoreState() override;
     void doDetachFromOperationContext() override;
-    void doAttachFromOperationContext(OperationContext* opCtx) override;
+    void doAttachToOperationContext(OperationContext* opCtx) override;
+    void doDetachFromTrialRunTracker() override;
+    void doAttachToTrialRunTracker(TrialRunTracker* tracker) override;
 
 private:
-    const NamespaceStringOrUUID _name;
+    /**
+     * When this stage is re-opened after being closed, or during yield recovery, called to verify
+     * that the index (and the index's collection) remain valid. If any validity check fails, throws
+     * a UserException that terminates execution of the query.
+     */
+    void restoreCollectionAndIndex();
+
+    const CollectionUUID _collUuid;
     const std::string _indexName;
     const bool _forward;
     const boost::optional<value::SlotId> _recordSlot;
     const boost::optional<value::SlotId> _recordIdSlot;
+    const boost::optional<value::SlotId> _snapshotIdSlot;
     const IndexKeysInclusionSet _indexKeysToInclude;
     const value::SlotVector _vars;
     const boost::optional<value::SlotId> _seekKeySlotLow;
     const boost::optional<value::SlotId> _seekKeySlotHigh;
 
+    NamespaceString _collName;
+    uint64_t _catalogEpoch;
+
+    LockAcquisitionCallback _lockAcquisitionCallback;
+
     std::unique_ptr<value::ViewOfValueAccessor> _recordAccessor;
     std::unique_ptr<value::ViewOfValueAccessor> _recordIdAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _snapshotIdAccessor;
 
     // One accessor and slot for each key component that this stage will bind from an index entry's
     // KeyString. The accessors are in the same order as the key components they bind to.
@@ -120,7 +137,7 @@ private:
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;
     std::weak_ptr<const IndexCatalogEntry> _weakIndexCatalogEntry;
     boost::optional<Ordering> _ordering{boost::none};
-    boost::optional<AutoGetCollectionForRead> _coll;
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> _coll;
     boost::optional<KeyStringEntry> _nextRecord;
 
     // This buffer stores values that are projected out of the index entry. Values in the
@@ -133,6 +150,6 @@ private:
 
     // If provided, used during a trial run to accumulate certain execution stats. Once the trial
     // run is complete, this pointer is reset to nullptr.
-    TrialRunProgressTracker* _tracker{nullptr};
+    TrialRunTracker* _tracker{nullptr};
 };
 }  // namespace mongo::sbe

@@ -45,15 +45,18 @@ value::SlotAccessor* CoScanStage::getAccessor(CompileCtx& ctx, value::SlotId slo
 }
 
 void CoScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
 }
 
 PlanState CoScanStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     checkForInterrupt(_opCtx);
 
     // Run forever.
-    _commonStats.advances++;
-    return PlanState::ADVANCED;
+    return trackPlanState(PlanState::ADVANCED);
 }
 
 std::unique_ptr<PlanStageStats> CoScanStage::getStats(bool includeDebugInfo) const {
@@ -66,6 +69,8 @@ const SpecificStats* CoScanStage::getSpecificStats() const {
 }
 
 void CoScanStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 }
 

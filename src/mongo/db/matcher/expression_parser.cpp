@@ -44,7 +44,7 @@
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/expression_geo.h"
-#include "mongo/db/matcher/expression_internal_expr_eq.h"
+#include "mongo/db/matcher/expression_internal_expr_comparison.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_type.h"
@@ -90,6 +90,21 @@ bool hasNode(const MatchExpression* root, MatchExpression::MatchType type) {
     return false;
 }
 
+// TODO SERVER-49852: Currently SBE cannot handle match expressions with numeric path
+// components due to some of the complexity around how arrays are handled.
+void disableSBEForNumericPathComponent(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       const FieldRef* fieldRef) {
+    if (fieldRef && fieldRef->hasNumericPathComponents()) {
+        expCtx->sbeCompatible = false;
+    }
+}
+
+void addExpressionToRoot(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                         AndMatchExpression* root,
+                         std::unique_ptr<MatchExpression> newNode) {
+    disableSBEForNumericPathComponent(expCtx, newNode->fieldRef());
+    root->add(std::move(newNode));
+}
 }  // namespace
 
 namespace mongo {
@@ -282,9 +297,8 @@ StatusWithMatchExpression parse(const BSONObj& obj,
             // be added to 'root', because it is handled outside of the MatchExpressionParser
             // library. The following operators currently follow this convention:
             //    - $comment  has no action associated with the operator.
-            if (parsedExpression.getValue().get()) {
-                root->add(parsedExpression.getValue().release());
-            }
+            if (auto&& expr = parsedExpression.getValue())
+                root->add(std::move(expr));
 
             continue;
         }
@@ -306,7 +320,8 @@ StatusWithMatchExpression parse(const BSONObj& obj,
             auto result = parseRegexElement(e.fieldNameStringData(), e, expCtx);
             if (!result.isOK())
                 return result;
-            root->add(result.getValue().release());
+
+            addExpressionToRoot(expCtx, root.get(), std::move(result.getValue()));
             continue;
         }
 
@@ -322,14 +337,11 @@ StatusWithMatchExpression parse(const BSONObj& obj,
         if (!eq.isOK())
             return eq;
 
-        root->add(eq.getValue().release());
+        addExpressionToRoot(expCtx, root.get(), std::move(eq.getValue()));
     }
 
-    if (root->numChildren() == 1) {
-        std::unique_ptr<MatchExpression> real(root->getChild(0));
-        root->clearAndRelease();
-        return {std::move(real)};
-    }
+    if (root->numChildren() == 1)
+        return {std::move((*root->getChildVector())[0])};
 
     return {std::move(root)};
 }
@@ -491,7 +503,6 @@ StatusWithMatchExpression parseExpr(StringData name,
     if ((allowedFeatures & MatchExpressionParser::AllowedFeatures::kExpr) == 0u) {
         return {Status(ErrorCodes::QueryFeatureNotAllowed, "$expr is not allowed in this context")};
     }
-
     return {std::make_unique<ExprMatchExpression>(
         std::move(elem),
         expCtx,
@@ -620,6 +631,10 @@ StatusWithMatchExpression parseType(StringData name,
                        str::stream() << name << " must match at least one type")};
     }
 
+    if constexpr (std::is_same_v<T, InternalSchemaTypeExpression> ||
+                  std::is_same_v<T, InternalSchemaBinDataEncryptedTypeExpression>) {
+        expCtx->sbeCompatible = false;
+    }
     return {std::make_unique<T>(
         name,
         std::move(typeSet.getValue()),
@@ -734,7 +749,8 @@ StatusWithMatchExpression parseBitTest(StringData name,
     return {std::move(bitTestMatchExpression)};
 }
 
-StatusWithMatchExpression parseInternalSchemaFmod(StringData name, BSONElement elem) {
+StatusWithMatchExpression parseInternalSchemaFmod(
+    StringData name, BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     StringData path(name);
     if (elem.type() != BSONType::Array)
         return {ErrorCodes::BadValue,
@@ -763,6 +779,7 @@ StatusWithMatchExpression parseInternalSchemaFmod(StringData name, BSONElement e
         return {ErrorCodes::BadValue, str::stream() << path << " has too many elements"};
     }
 
+    expCtx->sbeCompatible = false;
     return {std::make_unique<InternalSchemaFmodMatchExpression>(
         name, d.numberDecimal(), r.numberDecimal())};
 }
@@ -785,6 +802,7 @@ StatusWithMatchExpression parseInternalSchemaRootDocEq(
                        str::stream() << InternalSchemaRootDocEqMatchExpression::kName
                                      << " must be an object, found type " << elem.type())};
     }
+    expCtx->sbeCompatible = false;
     auto rootDocEq =
         std::make_unique<InternalSchemaRootDocEqMatchExpression>(elem.embeddedObject());
     return {std::move(rootDocEq)};
@@ -795,13 +813,14 @@ StatusWithMatchExpression parseInternalSchemaRootDocEq(
  * of type 'T' that gets initialized with the resulting integer.
  */
 template <class T>
-StatusWithMatchExpression parseInternalSchemaSingleIntegerArgument(StringData name,
-                                                                   BSONElement elem) {
+StatusWithMatchExpression parseInternalSchemaSingleIntegerArgument(
+    StringData name, BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     auto parsedInt = elem.parseIntegerElementToNonNegativeLong();
     if (!parsedInt.isOK()) {
         return parsedInt.getStatus();
     }
 
+    expCtx->sbeCompatible = false;
     return {std::make_unique<T>(name, parsedInt.getValue())};
 }
 
@@ -821,6 +840,7 @@ StatusWithMatchExpression parseTopLevelInternalSchemaSingleIntegerArgument(
     if (!parsedInt.isOK()) {
         return parsedInt.getStatus();
     }
+    expCtx->sbeCompatible = false;
     return {std::make_unique<T>(parsedInt.getValue())};
 }
 
@@ -1055,6 +1075,7 @@ StatusWithMatchExpression parseInternalSchemaAllowedProperties(
         return properties.getStatus();
     }
 
+    expCtx->sbeCompatible = false;
     return {std::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
         std::move(properties.getValue()),
         namePlaceholder.getValue(),
@@ -1110,6 +1131,7 @@ StatusWithMatchExpression parseInternalSchemaMatchArrayIndex(
         return expressionWithPlaceholder.getStatus();
     }
 
+    expCtx->sbeCompatible = false;
     return {std::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
         path, index.getValue(), std::move(expressionWithPlaceholder.getValue()))};
 }
@@ -1126,6 +1148,7 @@ StatusWithMatchExpression parseGeo(StringData name,
             return parseStatus;
         }
         auto operatorName = section.firstElementFieldName();
+        expCtx->sbeCompatible = false;
         return {std::make_unique<GeoMatchExpression>(
             name,
             gq.release(),
@@ -1144,6 +1167,7 @@ StatusWithMatchExpression parseGeo(StringData name,
         if (!status.isOK()) {
             return status;
         }
+        expCtx->sbeCompatible = false;
         return {std::make_unique<GeoNearMatchExpression>(name, nq.release(), section)};
     }
 }
@@ -1176,9 +1200,12 @@ StatusWithMatchExpression parseTreeTopLevel(
         if (!sub.isOK())
             return sub.getStatus();
 
-        temp->add(sub.getValue().release());
+        temp->add(std::move(sub.getValue()));
     }
 
+    if constexpr (std::is_same_v<T, InternalSchemaXorMatchExpression>) {
+        expCtx->sbeCompatible = false;
+    }
     return {std::move(temp)};
 }
 
@@ -1228,10 +1255,9 @@ StatusWithMatchExpression parseElemMatch(StringData name,
                 expCtx, e.fieldNameStringData().toString(), BSON(name << e.wrap())));
 
         doc_validation_error::annotateTreeToIgnoreForErrorDetails(expCtx, &theAnd);
-        for (size_t i = 0; i < theAnd.numChildren(); i++) {
-            emValueExpr->add(theAnd.getChild(i));
-        }
-        theAnd.clearAndRelease();
+        for (size_t i = 0; i < theAnd.numChildren(); i++)
+            emValueExpr->add(theAnd.releaseChild(i));
+        theAnd.clear();
 
         return {std::move(emValueExpr)};
     }
@@ -1258,7 +1284,7 @@ StatusWithMatchExpression parseElemMatch(StringData name,
 
     return {std::make_unique<ElemMatchObjectMatchExpression>(
         name,
-        sub.release(),
+        std::move(sub),
         doc_validation_error::createAnnotation(
             expCtx, e.fieldNameStringData().toString(), BSON(name << e.wrap())))};
 }
@@ -1303,7 +1329,8 @@ StatusWithMatchExpression parseAll(StringData name,
                 return inner;
             doc_validation_error::annotateTreeToIgnoreForErrorDetails(expCtx,
                                                                       inner.getValue().get());
-            myAnd->add(inner.getValue().release());
+
+            addExpressionToRoot(expCtx, myAnd.get(), std::move(inner.getValue()));
         }
 
         return {std::move(myAnd)};
@@ -1315,7 +1342,7 @@ StatusWithMatchExpression parseAll(StringData name,
         if (e.type() == BSONType::RegEx) {
             auto expr = std::make_unique<RegexMatchExpression>(
                 name, e, doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnore));
-            myAnd->add(expr.release());
+            addExpressionToRoot(expCtx, myAnd.get(), std::move(expr));
         } else if (e.type() == BSONType::Object &&
                    MatchExpressionParser::parsePathAcceptingKeyword(e.Obj().firstElement())) {
             return {Status(ErrorCodes::BadValue, "no $ expressions in $all")};
@@ -1323,7 +1350,7 @@ StatusWithMatchExpression parseAll(StringData name,
             auto expr = std::make_unique<EqualityMatchExpression>(
                 name, e, doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnore));
             expr->setCollator(expCtx->getCollator());
-            myAnd->add(expr.release());
+            addExpressionToRoot(expCtx, myAnd.get(), std::move(expr));
         }
     }
 
@@ -1382,6 +1409,7 @@ StatusWithMatchExpression parseInternalSchemaFixedArityArgument(
         ++position;
     }
 
+    expCtx->sbeCompatible = false;
     return {std::make_unique<T>(std::move(expressions))};
 }
 
@@ -1428,7 +1456,8 @@ StatusWithMatchExpression parseNot(StringData name,
         theAnd.release(), doc_validation_error::createAnnotation(expCtx, "$not", BSONObj()))};
 }
 
-StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSONElement e) {
+StatusWithMatchExpression parseInternalSchemaBinDataSubType(
+    StringData name, BSONElement e, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     if (!e.isNumber()) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << InternalSchemaBinDataSubTypeExpression::kName
@@ -1450,6 +1479,7 @@ StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSO
                           << " value must represent BinData subtype: " << valueAsInt.getValue());
     }
 
+    expCtx->sbeCompatible = false;
     return {std::make_unique<InternalSchemaBinDataSubTypeExpression>(
         name, static_cast<BinDataType>(valueAsInt.getValue()))};
 }
@@ -1468,19 +1498,6 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                                         MatchExpressionParser::AllowedFeatureSet allowedFeatures,
                                         DocumentParseLevel currentLevel) {
     invariant(e);
-
-    if ("$eq"_sd == e.fieldNameStringData()) {
-        return parseComparison(
-            name,
-            std::make_unique<EqualityMatchExpression>(
-                name,
-                e,
-                doc_validation_error::createAnnotation(
-                    expCtx, e.fieldNameStringData().toString(), BSON(name << e.wrap()))),
-            e,
-            expCtx,
-            allowedFeatures);
-    }
 
     if ("$not"_sd == e.fieldNameStringData()) {
         return parseNot(name, e, expCtx, extensionsCallback, allowedFeatures, currentLevel);
@@ -1558,6 +1575,11 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                 e,
                 expCtx,
                 allowedFeatures);
+
+            // The NotMatchExpression below does not have a path, so 's' must be checked for a
+            // numeric path component instead.
+            disableSBEForNumericPathComponent(expCtx, s.getValue()->fieldRef());
+
             return {std::make_unique<NotMatchExpression>(
                 s.getValue().release(),
                 doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnoreButDescend))};
@@ -1601,6 +1623,10 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
             if (!parseStatus.isOK()) {
                 return parseStatus;
             }
+
+            // The NotMatchExpression below does not have a path, so 's' must be checked for a
+            // numeric path component instead.
+            disableSBEForNumericPathComponent(expCtx, temp->fieldRef());
             return {std::make_unique<NotMatchExpression>(
                 temp.release(),
                 doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnoreButDescend))};
@@ -1705,6 +1731,55 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
             return {std::move(exprEqExpr)};
         }
 
+        case PathAcceptingKeyword::INTERNAL_EXPR_GT: {
+            if (e.type() == BSONType::Undefined || e.type() == BSONType::Array) {
+                return {Status(ErrorCodes::BadValue,
+                               str::stream() << InternalExprGTMatchExpression::kName
+                                             << " cannot be used to compare to type: "
+                                             << typeName(e.type()))};
+            }
+
+            auto exprGtExpr = std::make_unique<InternalExprGTMatchExpression>(name, e);
+            exprGtExpr->setCollator(expCtx->getCollator());
+            return {std::move(exprGtExpr)};
+        }
+        case PathAcceptingKeyword::INTERNAL_EXPR_GTE: {
+            if (e.type() == BSONType::Undefined || e.type() == BSONType::Array) {
+                return {Status(ErrorCodes::BadValue,
+                               str::stream() << InternalExprGTEMatchExpression::kName
+                                             << " cannot be used to compare to type: "
+                                             << typeName(e.type()))};
+            }
+
+            auto exprGteExpr = std::make_unique<InternalExprGTEMatchExpression>(name, e);
+            exprGteExpr->setCollator(expCtx->getCollator());
+            return {std::move(exprGteExpr)};
+        }
+        case PathAcceptingKeyword::INTERNAL_EXPR_LT: {
+            if (e.type() == BSONType::Undefined || e.type() == BSONType::Array) {
+                return {Status(ErrorCodes::BadValue,
+                               str::stream() << InternalExprLTMatchExpression::kName
+                                             << " cannot be used to compare to type: "
+                                             << typeName(e.type()))};
+            }
+
+            auto exprLtExpr = std::make_unique<InternalExprLTMatchExpression>(name, e);
+            exprLtExpr->setCollator(expCtx->getCollator());
+            return {std::move(exprLtExpr)};
+        }
+        case PathAcceptingKeyword::INTERNAL_EXPR_LTE: {
+            if (e.type() == BSONType::Undefined || e.type() == BSONType::Array) {
+                return {Status(ErrorCodes::BadValue,
+                               str::stream() << InternalExprLTEMatchExpression::kName
+                                             << " cannot be used to compare to type: "
+                                             << typeName(e.type()))};
+            }
+
+            auto exprLteExpr = std::make_unique<InternalExprLTEMatchExpression>(name, e);
+            exprLteExpr->setCollator(expCtx->getCollator());
+            return {std::move(exprLteExpr)};
+        }
+
         // Handles bitwise query operators.
         case PathAcceptingKeyword::BITS_ALL_SET: {
             return parseBitTest<BitsAllSetMatchExpression>(name, e, expCtx);
@@ -1723,16 +1798,16 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_FMOD:
-            return parseInternalSchemaFmod(name, e);
+            return parseInternalSchemaFmod(name, e, expCtx);
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_MIN_ITEMS: {
             return parseInternalSchemaSingleIntegerArgument<InternalSchemaMinItemsMatchExpression>(
-                name, e);
+                name, e, expCtx);
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_MAX_ITEMS: {
             return parseInternalSchemaSingleIntegerArgument<InternalSchemaMaxItemsMatchExpression>(
-                name, e);
+                name, e, expCtx);
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_OBJECT_MATCH: {
@@ -1750,6 +1825,7 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                 return parsedSubObjExpr;
             }
 
+            expCtx->sbeCompatible = false;
             return {std::make_unique<InternalSchemaObjectMatchExpression>(
                 name,
                 std::move(parsedSubObjExpr.getValue()),
@@ -1762,17 +1838,18 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                         str::stream() << name << " must be a boolean of value true"};
             }
 
+            expCtx->sbeCompatible = false;
             return {std::make_unique<InternalSchemaUniqueItemsMatchExpression>(name)};
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_MIN_LENGTH: {
             return parseInternalSchemaSingleIntegerArgument<InternalSchemaMinLengthMatchExpression>(
-                name, e);
+                name, e, expCtx);
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_MAX_LENGTH: {
             return parseInternalSchemaSingleIntegerArgument<InternalSchemaMaxLengthMatchExpression>(
-                name, e);
+                name, e, expCtx);
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_MATCH_ARRAY_INDEX: {
@@ -1840,6 +1917,8 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
             if (!exprWithPlaceholder.isOK()) {
                 return exprWithPlaceholder.getStatus();
             }
+
+            expCtx->sbeCompatible = false;
             return {std::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
                 name, parsedIndex.getValue(), std::move(exprWithPlaceholder.getValue()))};
         }
@@ -1849,6 +1928,7 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_EQ: {
+            expCtx->sbeCompatible = false;
             return {std::make_unique<InternalSchemaEqMatchExpression>(name, e)};
         }
 
@@ -1857,7 +1937,7 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
         }
 
         case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE: {
-            return parseInternalSchemaBinDataSubType(name, e);
+            return parseInternalSchemaBinDataSubType(name, e, expCtx);
         }
     }
 
@@ -1895,7 +1975,7 @@ Status parseSub(StringData name,
                 auto s =
                     parseGeo(name, PathAcceptingKeyword::GEO_NEAR, sub, expCtx, allowedFeatures);
                 if (s.isOK()) {
-                    root->add(s.getValue().release());
+                    addExpressionToRoot(expCtx, root, std::move(s.getValue()));
                 }
 
                 // Propagate geo parsing result to caller.
@@ -1910,8 +1990,9 @@ Status parseSub(StringData name,
         if (!s.isOK())
             return s.getStatus();
 
-        if (s.getValue())
-            root->add(s.getValue().release());
+        if (s.getValue()) {
+            addExpressionToRoot(expCtx, root, std::move(s.getValue()));
+        }
     }
 
     return Status::OK();
@@ -1994,7 +2075,6 @@ MONGO_INITIALIZER(PathlessOperatorMap)(InitializerContext* context) {
             {"text", &parseText},
             {"where", &parseWhere},
         });
-    return Status::OK();
 }
 
 // Maps from query operator string name to operator PathAcceptingKeyword.
@@ -2003,8 +2083,11 @@ std::unique_ptr<StringMap<PathAcceptingKeyword>> queryOperatorMap;
 MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
     queryOperatorMap =
         std::make_unique<StringMap<PathAcceptingKeyword>>(StringMap<PathAcceptingKeyword>{
-            // TODO: SERVER-19565 Add $eq after auditing callers.
             {"_internalExprEq", PathAcceptingKeyword::INTERNAL_EXPR_EQ},
+            {"_internalExprGt", PathAcceptingKeyword::INTERNAL_EXPR_GT},
+            {"_internalExprGte", PathAcceptingKeyword::INTERNAL_EXPR_GTE},
+            {"_internalExprLt", PathAcceptingKeyword::INTERNAL_EXPR_LT},
+            {"_internalExprLte", PathAcceptingKeyword::INTERNAL_EXPR_LTE},
             {"_internalSchemaAllElemMatchFromIndex",
              PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX},
             {"_internalSchemaBinDataEncryptedType",
@@ -2029,6 +2112,7 @@ MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
             {"bitsAnyClear", PathAcceptingKeyword::BITS_ANY_CLEAR},
             {"bitsAnySet", PathAcceptingKeyword::BITS_ANY_SET},
             {"elemMatch", PathAcceptingKeyword::ELEM_MATCH},
+            {"eq", PathAcceptingKeyword::EQUALITY},
             {"exists", PathAcceptingKeyword::EXISTS},
             {"geoIntersects", PathAcceptingKeyword::GEO_INTERSECTS},
             {"geoNear", PathAcceptingKeyword::GEO_NEAR},
@@ -2049,7 +2133,6 @@ MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
             {"type", PathAcceptingKeyword::TYPE},
             {"within", PathAcceptingKeyword::WITHIN},
         });
-    return Status::OK();
 }
 
 /**

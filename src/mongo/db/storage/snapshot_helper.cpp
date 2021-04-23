@@ -56,9 +56,7 @@ bool canReadAtLastApplied(OperationContext* opCtx) {
     }
     return false;
 }
-}  // namespace
 
-namespace SnapshotHelper {
 bool shouldReadAtLastApplied(OperationContext* opCtx,
                              const NamespaceString& nss,
                              std::string* reason) {
@@ -118,17 +116,31 @@ bool shouldReadAtLastApplied(OperationContext* opCtx,
         return false;
     }
 
+    // Linearizable read concern should never be read at lastApplied, they must always read from
+    // latest and are only allowed on primaries.
+    if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
+        repl::ReadConcernLevel::kLinearizableReadConcern) {
+        if (reason) {
+            *reason = "linearizable read concern";
+        }
+        return false;
+    }
+
     return true;
 }
-boost::optional<RecoveryUnit::ReadSource> getNewReadSource(OperationContext* opCtx,
-                                                           const NamespaceString& nss) {
+}  // namespace
+
+namespace SnapshotHelper {
+
+ReadSourceChange shouldChangeReadSource(OperationContext* opCtx, const NamespaceString& nss) {
+    std::string reason;
+    const bool readAtLastApplied = shouldReadAtLastApplied(opCtx, nss, &reason);
+
     if (!canReadAtLastApplied(opCtx)) {
-        return boost::none;
+        return {boost::none, readAtLastApplied};
     }
 
     const auto existing = opCtx->recoveryUnit()->getTimestampReadSource();
-    std::string reason;
-    const bool readAtLastApplied = shouldReadAtLastApplied(opCtx, nss, &reason);
     if (existing == RecoveryUnit::ReadSource::kNoTimestamp) {
         // Shifting from reading without a timestamp to reading with a timestamp can be dangerous
         // because writes will appear to vanish. This case is intended for new reads on secondaries
@@ -138,7 +150,7 @@ boost::optional<RecoveryUnit::ReadSource> getNewReadSource(OperationContext* opC
         // at the lastApplied point because reading without a timestamp is not safe.
         if (readAtLastApplied) {
             LOGV2_DEBUG(4452901, 2, "Changing ReadSource to kLastApplied", logAttrs(nss));
-            return RecoveryUnit::ReadSource::kLastApplied;
+            return {RecoveryUnit::ReadSource::kLastApplied, readAtLastApplied};
         }
     } else if (existing == RecoveryUnit::ReadSource::kLastApplied) {
         // For some reason, we can no longer read at lastApplied.
@@ -156,10 +168,10 @@ boost::optional<RecoveryUnit::ReadSource> getNewReadSource(OperationContext* opC
             // manipulate their ReadSources after performing reads at an un-timetamped snapshot. The
             // only exception is callers of this function that may need to change from kNoTimestamp
             // to kLastApplied in the event of a catalog conflict or query yield.
-            return RecoveryUnit::ReadSource::kNoTimestamp;
+            return {RecoveryUnit::ReadSource::kNoTimestamp, readAtLastApplied};
         }
     }
-    return boost::none;
+    return {boost::none, readAtLastApplied};
 }
 
 bool collectionChangesConflictWithRead(boost::optional<Timestamp> collectionMin,

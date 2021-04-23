@@ -4,7 +4,8 @@
  *
  * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 (function() {
 'use strict';
@@ -28,30 +29,30 @@ const kBatchTypes = {
     remove: 3
 };
 
+const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: 'donor',
-    nodeOptions: {
+    nodeOptions: Object.assign(migrationX509Options.donor, {
         setParameter: {
             internalInsertMaxBatchSize:
-                kMaxBatchSize /* Decrease internal max batch size so we can still show writes are
+                kMaxBatchSize, /* Decrease internal max batch size so we can still show writes are
                                  batched without inserting hundreds of documents. */
+            // Allow non-timestamped reads on donor after migration completes for testing.
+            'failpoint.tenantMigrationDonorAllowsNonTimestampedReads': tojson({mode: 'alwaysOn'}),
         }
-    }
+    })
 });
 const recipientRst = new ReplSetTest({
     nodes: 1,
     name: 'recipient',
-    nodeOptions: {
+    nodeOptions: Object.assign(migrationX509Options.recipient, {
         setParameter: {
-            internalInsertMaxBatchSize:
-                kMaxBatchSize /* Decrease internal max batch size so we can still show writes are
-                                 batched without inserting hundreds of documents. */
-            ,
-            // TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
-            'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'})
+            internalInsertMaxBatchSize: kMaxBatchSize /* Decrease internal max batch size so we can
+                                                         still show writes are batched without
+                                                         inserting hundreds of documents. */
         },
-    }
+    })
 });
 const kRecipientConnString = recipientRst.getURL();
 
@@ -87,31 +88,6 @@ function bulkWriteDocsUnordered(primaryHost, dbName, collName, numDocs) {
         res = e;
     }
     return {res: res.getRawResponse(), ops: bulk.getOperations()};
-}
-
-/**
- * TODO SERVER-51764: Refine test cases to check if write errors are retried properly.
- * Looks through the write errors array and retries command against the recipient.
- */
-function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
-    jsTestLog("Retrying writes that errored during migration.");
-
-    writeErrors.forEach(err => {
-        let retryOp = ops[0].operations[err.index];
-        switch (ops[0].batchType) {
-            case kBatchTypes.insert:
-                assert.commandWorked(primaryDB[collName].insert(retryOp));
-                break;
-            case kBatchTypes.update:
-                assert.commandWorked(primaryDB[collName].update(retryOp.q, retryOp.u));
-                break;
-            case kBatchTypes.remove:
-                assert.commandWorked(primaryDB[collName].remove(retryOp));
-                break;
-            default:
-                throw new Error(`Invalid write op type ${retryOp.batchType}.`);
-        }
-    });
 }
 
 (() => {
@@ -153,7 +129,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     writeFp.wait();
 
     const migrationRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     writeFp.off();
     bulkWriteThread.join();
@@ -172,10 +148,6 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
         } else {
             assert(!err.errmsg);
         }
-
-        assert.eq(err.errInfo.recipientConnectionString,
-                  tenantMigrationTest.getRecipientConnString());
-        assert.eq(err.errInfo.tenantId, tenantId);
     });
 
     tenantMigrationTest.stop();
@@ -221,7 +193,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsUnordered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -239,7 +211,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     migrationThread.join();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     let bulkWriteRes = bulkWriteThread.returnData();
     let writeErrors = bulkWriteRes.res.writeErrors;
@@ -251,14 +223,11 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     writeErrors.forEach((err, index) => {
         assert.eq(err.code, ErrorCodes.TenantMigrationCommitted);
         if (index == 0) {
-            assert.eq(err.errmsg, "Write must be re-routed to the new owner of this tenant");
+            assert.eq(err.errmsg,
+                      "Write or read must be re-routed to the new owner of this tenant");
         } else {
             assert.eq(err.errmsg, "");
         }
-
-        assert.eq(err.errInfo.recipientConnectionString,
-                  tenantMigrationTest.getRecipientConnString());
-        assert.eq(err.errInfo.tenantId, tenantId);
     });
 
     tenantMigrationTest.stop();
@@ -303,12 +272,12 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsUnordered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationAfterBlockingStarts");
+    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
 
-    // The failpoint below is used to ensure that a write to throw TenantMigrationConflict in the op
-    // observer. Without this failpoint, the migration could have already aborted by the time the
-    // write gets to the op observer.
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    // The failpoint below is used to ensure that a write to throw
+    // TenantMigrationConflict in the op observer. Without this failpoint, the migration
+    // could have already aborted by the time the write gets to the op observer.
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -328,7 +297,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     abortFp.off();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kAborted);
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;
@@ -390,7 +359,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     writeFp.wait();
 
     const migrationRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     writeFp.off();
     bulkWriteThread.join();
@@ -402,13 +371,10 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     assert.eq(writeErrors.length, 1);
     assert(writeErrors[0].errmsg);
 
-    // The single write error should correspond to the first write after the migration started
-    // blocking writes.
+    // The single write error should correspond to the first write after the migration
+    // started blocking writes.
     assert.eq(writeErrors[0].index, kNumWriteBatchesWithoutMigrationConflict * kMaxBatchSize);
     assert.eq(writeErrors[0].code, ErrorCodes.TenantMigrationCommitted);
-    assert.eq(writeErrors[0].errInfo.recipientConnectionString,
-              tenantMigrationTest.getRecipientConnString());
-    assert.eq(writeErrors[0].errInfo.tenantId, tenantId);
 
     tenantMigrationTest.stop();
     donorRst.stopSet();
@@ -453,7 +419,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsOrdered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -471,7 +437,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     migrationThread.join();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;
@@ -480,13 +446,10 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     assert.eq(writeErrors.length, 1);
     assert(writeErrors[0].errmsg);
 
-    // The single write error should correspond to the first write after the migration started
-    // blocking writes.
+    // The single write error should correspond to the first write after the migration
+    // started blocking writes.
     assert.eq(writeErrors[0].index, kNumWriteBatchesWithoutMigrationConflict * kMaxBatchSize);
     assert.eq(writeErrors[0].code, ErrorCodes.TenantMigrationCommitted);
-    assert.eq(writeErrors[0].errInfo.recipientConnectionString,
-              tenantMigrationTest.getRecipientConnString());
-    assert.eq(writeErrors[0].errInfo.tenantId, tenantId);
 
     tenantMigrationTest.stop();
     donorRst.stopSet();
@@ -530,12 +493,12 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsOrdered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationAfterBlockingStarts");
+    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
 
-    // The failpoint below is used to ensure that a write to throw TenantMigrationConflict in the op
-    // observer. Without this failpoint, the migration could have already aborted by the time the
-    // write gets to the op observer.
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    // The failpoint below is used to ensure that a write to throw
+    // TenantMigrationConflict in the op observer. Without this failpoint, the migration
+    // could have already aborted by the time the write gets to the op observer.
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -555,7 +518,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     abortFp.off();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kAborted);
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;
@@ -564,8 +527,8 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     assert.eq(writeErrors.length, 1);
     assert(writeErrors[0].errmsg);
 
-    // The single write error should correspond to the first write after the migration started
-    // blocking writes.
+    // The single write error should correspond to the first write after the migration
+    // started blocking writes.
     assert.eq(writeErrors[0].index, kNumWriteBatchesWithoutMigrationConflict * kMaxBatchSize);
     assert.eq(writeErrors[0].code, ErrorCodes.TenantMigrationAborted);
 

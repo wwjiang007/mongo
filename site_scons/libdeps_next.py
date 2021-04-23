@@ -51,13 +51,24 @@ automatically added when missing.
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-from collections import OrderedDict
+from collections import defaultdict
 from functools import partial
 import enum
 import copy
+import json
 import os
 import sys
+import glob
 import textwrap
+import hashlib
+import json
+import fileinput
+
+try:
+    import networkx
+    from buildscripts.libdeps.libdeps.graph import EdgeProps, NodeProps, LibdepsGraph
+except ImportError:
+    pass
 
 import SCons.Errors
 import SCons.Scanner
@@ -72,6 +83,7 @@ class Constants:
     LibdepsCached = "LIBDEPS_cached"
     LibdepsDependents = "LIBDEPS_DEPENDENTS"
     LibdepsGlobal = "LIBDEPS_GLOBAL"
+    LibdepsNoInherit = "LIBDEPS_NO_INHERIT"
     LibdepsInterface ="LIBDEPS_INTERFACE"
     LibdepsPrivate = "LIBDEPS_PRIVATE"
     LibdepsTypeinfo = "LIBDEPS_TYPEINFO"
@@ -136,8 +148,8 @@ class FlaggedLibdep:
 
         # We need to maintain our own copy so as not to disrupt the env's original list.
         try:
-            self.prefix_flags = copy.copy(libnode.get_env().get('LIBDEPS_PREFIX_FLAGS', []))
-            self.postfix_flags = copy.copy(libnode.get_env().get('LIBDEPS_POSTFIX_FLAGS', []))
+            self.prefix_flags = copy.copy(getattr(libnode.attributes, 'libdeps_prefix_flags', []))
+            self.postfix_flags = copy.copy(getattr(libnode.attributes, 'libdeps_postfix_flags', []))
         except AttributeError:
             self.prefix_flags = []
             self.postfix_flags = []
@@ -549,7 +561,7 @@ class LibdepLinter:
         if self._check_for_lint_tags('lint-allow-nonprivate-on-deps-dependents'):
             return
 
-        if (libdep.dependency_type != deptype.Private
+        if (libdep.dependency_type != deptype.Private and libdep.dependency_type != deptype.Global
             and len(self._get_deps_dependents()) > 0):
 
             target_type = self.target[0].builder.get_name(self.env)
@@ -580,8 +592,8 @@ class LibdepLinter:
 
                 target_type = self.target[0].builder.get_name(self.env)
                 self._raise_libdep_lint_exception(textwrap.dedent(f"""\
-                    Found non-list type '{libdeps_list}' while evaluating {dep_type_val} for {target_type} '{self.target[0]}'
-                    {dep_type_val} must be setup as a list."""
+                    Found non-list type '{libdeps_list}' while evaluating {dep_type_val[1]} for {target_type} '{self.target[0]}'
+                    {dep_type_val[1]} must be setup as a list."""
                 ))
 
 dependency_visibility_ignored = {
@@ -641,13 +653,59 @@ def _get_sorted_direct_libdeps(node):
     return direct_sorted
 
 
-def _libdeps_visit(n, tsorted, marked, walking=None, debug=False):
-    if walking is None:
-        walking = set()
+class LibdepsVisitationMark(enum.IntEnum):
+    UNMARKED = 0
+    MARKED_PRIVATE = 1
+    MARKED_PUBLIC = 2
 
-    if n.target_node in marked:
-        return marked, tsorted
 
+def _libdeps_visit_private(n, marked, walking, debug=False):
+    if marked[n.target_node] >= LibdepsVisitationMark.MARKED_PRIVATE:
+        return
+
+    if n.target_node in walking:
+        raise DependencyCycleError(n.target_node)
+
+    walking.add(n.target_node)
+
+    try:
+        for child in _get_sorted_direct_libdeps(n.target_node):
+            _libdeps_visit_private(child, marked, walking)
+
+        marked[n.target_node] = LibdepsVisitationMark.MARKED_PRIVATE
+
+    except DependencyCycleError as e:
+        if len(e.cycle_nodes) == 1 or e.cycle_nodes[0] != e.cycle_nodes[-1]:
+            e.cycle_nodes.insert(0, n.target_node)
+        raise
+
+    finally:
+        walking.remove(n.target_node)
+
+
+def _libdeps_visit(n, tsorted, marked, walking, debug=False):
+    # The marked dictionary tracks which sorts of visitation a node
+    # has received. Values for a given node can be UNMARKED/absent,
+    # MARKED_PRIVATE, or MARKED_PUBLIC. These are to be interpreted as
+    # follows:
+    #
+    # 0/UNMARKED: Node is not not marked.
+    #
+    # MARKED_PRIVATE: Node has only been explored as part of looking
+    # for cycles under a LIBDEPS_PRIVATE edge.
+    #
+    # MARKED_PUBLIC: Node has been explored and any of its transiive
+    # dependencies have been incorporated into `tsorted`.
+    #
+    # The __libdeps_visit_private function above will only mark things
+    # at with MARKED_PRIVATE, while __libdeps_visit will mark things
+    # MARKED_PUBLIC.
+    if marked[n.target_node] == LibdepsVisitationMark.MARKED_PUBLIC:
+        return
+
+    # The walking set is used for cycle detection. We record all our
+    # predecessors in our depth-first search, and if we observe one of
+    # our predecessors as a child, we know we have a cycle.
     if n.target_node in walking:
         raise DependencyCycleError(n.target_node)
 
@@ -657,11 +715,32 @@ def _libdeps_visit(n, tsorted, marked, walking=None, debug=False):
         print(f"    * {n.dependency_type} => {n.listed_name}")
 
     try:
-        for child in _get_sorted_direct_libdeps(n.target_node):
-            if child.dependency_type != deptype.Private:
-                marked, tsorted = _libdeps_visit(child, tsorted, marked, walking=walking)
+        children = _get_sorted_direct_libdeps(n.target_node)
 
-        marked.add(n.target_node)
+        # We first walk all of our public dependencies so that we can
+        # put full marks on anything that is in our public transitive
+        # graph. We then do a second walk into any private nodes to
+        # look for cycles. While we could do just one walk over the
+        # children, it is slightly faster to do two passes, since if
+        # the algorithm walks into a private edge early, it would do a
+        # lot of non-productive (except for cycle checking) walking
+        # and marking, but if another public path gets into that same
+        # subtree, then it must walk and mark it again to raise it to
+        # the public mark level. Whereas, if the algorithm first walks
+        # the whole public tree, then those are all productive marks
+        # and add to tsorted, and then the private walk will only need
+        # to examine those things that are only reachable via private
+        # edges.
+
+        for child in children:
+            if child.dependency_type != deptype.Private:
+                _libdeps_visit(child, tsorted, marked, walking, debug)
+
+        for child in children:
+            if child.dependency_type == deptype.Private:
+                _libdeps_visit_private(child, marked, walking, debug)
+
+        marked[n.target_node] = LibdepsVisitationMark.MARKED_PUBLIC
 
         if getattr(n.target_node.attributes, "needs_link", True):
             tsorted.append(n.target_node)
@@ -671,7 +750,8 @@ def _libdeps_visit(n, tsorted, marked, walking=None, debug=False):
             e.cycle_nodes.insert(0, n.target_node)
         raise
 
-    return marked, tsorted
+    finally:
+        walking.remove(n.target_node)
 
 
 def _get_libdeps(node, debug=False):
@@ -679,9 +759,6 @@ def _get_libdeps(node, debug=False):
 
     Computes the dependencies if they're not already cached.
     """
-
-    tsorted = []
-    marked = set()
 
     cache = getattr(node.attributes, Constants.LibdepsCached, None)
     if cache is not None:
@@ -694,17 +771,17 @@ def _get_libdeps(node, debug=False):
     if debug:
         print(f"  Edges:")
 
+    tsorted = []
+
+    marked = defaultdict(lambda: LibdepsVisitationMark.UNMARKED)
+    walking = set()
+
     for child in _get_sorted_direct_libdeps(node):
-        if child.dependency_type == deptype.Interface:
-            tsorted.append(child.target_node)
-            if debug:
-                print(f"    * {child.dependency_type} => {child.target_node}")
-        else:
-            _, tsorted = _libdeps_visit(child, tsorted, marked, debug=debug)
-
+        if child.dependency_type != deptype.Interface:
+            _libdeps_visit(child, tsorted, marked, walking, debug=debug)
     tsorted.reverse()
-    setattr(node.attributes, Constants.LibdepsCached, tsorted)
 
+    setattr(node.attributes, Constants.LibdepsCached, tsorted)
     return tsorted
 
 
@@ -732,6 +809,8 @@ def update_scanner(env, builder_name=None, debug=False):
             print(f"    public: {env.get(Constants.Libdeps, None)}")
             print(f"    interface: {env.get(Constants.LibdepsInterface, None)}")
             print(f"    typeinfo: {env.get(Constants.LibdepsTypeinfo, None)}")
+            print(f"    no_inherit: {env.get(Constants.LibdepsNoInherit, None)}")
+
         if old_scanner:
             result = old_scanner.function(node, env, path)
         else:
@@ -879,14 +958,39 @@ def _get_node_with_ixes(env, node, node_builder_type):
 
 _get_node_with_ixes.node_type_ixes = dict()
 
+def add_node_from(env, node):
+
+    env.GetLibdepsGraph().add_nodes_from([(
+        str(node.abspath),
+        {
+            NodeProps.bin_type.name: node.builder.get_name(env),
+            NodeProps.shim.name: getattr(node.attributes, "is_shim", False)
+        })])
+
+def add_edge_from(env, from_node, to_node, visibility, direct):
+
+    env.GetLibdepsGraph().add_edges_from([(
+        from_node,
+        to_node,
+        {
+            EdgeProps.direct.name: direct,
+            EdgeProps.visibility.name: int(visibility)
+        })])
 
 def add_libdeps_node(env, target, libdeps):
+
     if str(target).endswith(env["SHLIBSUFFIX"]):
-        t_str = _get_node_with_ixes(env, str(target.abspath), target.get_builder().get_name(env)).abspath
-        env.GetLibdepsGraph().add_node(t_str)
+        node = _get_node_with_ixes(env, str(target.abspath), target.get_builder().get_name(env))
+        add_node_from(env, node)
+
         for libdep in libdeps:
             if str(libdep.target_node).endswith(env["SHLIBSUFFIX"]):
-                env.GetLibdepsGraph().add_edge(str(libdep.target_node.abspath), t_str, visibility=libdep.dependency_type)
+                add_edge_from(
+                    env,
+                    str(node.abspath),
+                    str(libdep.target_node.abspath),
+                    visibility=libdep.dependency_type,
+                    direct=True)
 
 
 def get_libdeps_nodes(env, target, builder, debug=False, visibility_map=None):
@@ -896,10 +1000,14 @@ def get_libdeps_nodes(env, target, builder, debug=False, visibility_map=None):
     if not SCons.Util.is_List(target):
         target = [target]
 
+    # Get the current list of nodes not to inherit on each target
+    no_inherit = set(env.get(Constants.LibdepsNoInherit, []))
+
     # Get all the libdeps from the env so we can
     # can append them to the current target_node.
     libdeps = []
     for dep_type in sorted(visibility_map.keys()):
+
         if dep_type == deptype.Global:
             if any("conftest" in str(t) for t in target):
                 # Ignore global dependencies for conftests
@@ -915,11 +1023,17 @@ def get_libdeps_nodes(env, target, builder, debug=False, visibility_map=None):
             if not lib:
                 continue
 
-            if debug and not any("conftest" in str(t) for t in target):
-                print(f"     {dep_type} => {lib}")
-
             lib_with_ixes = _get_node_with_ixes(env, lib, builder)
-            libdeps.append(dependency(lib_with_ixes, dep_type, lib))
+
+            if lib in no_inherit:
+                if debug and not any("conftest" in str(t) for t in target):
+                    print(f"     {dep_type[1]} =/> {lib}")
+
+            else:
+                if debug and not any("conftest" in str(t) for t in target):
+                    print(f"     {dep_type[1]} => {lib}")
+
+                libdeps.append(dependency(lib_with_ixes, dep_type, lib))
 
     return libdeps
 
@@ -953,8 +1067,11 @@ def libdeps_emitter(target, source, env, debug=False, builder=None, visibility_m
         print(f"    public: {env.get(Constants.Libdeps, None)}")
         print(f"    interface: {env.get(Constants.LibdepsInterface, None)}")
         print(f"    typeinfo: {env.get(Constants.LibdepsTypeinfo, None)}")
+        print(f"    no_inherit: {env.get(Constants.LibdepsNoInherit, None)}")
         print(f"  Edges:")
+
     libdeps = get_libdeps_nodes(env, target, builder, debug, visibility_map)
+
     if debug and not any("conftest" in str(t) for t in target):
         print(f"\n")
 
@@ -1050,7 +1167,7 @@ def expand_libdeps_with_flags(source, target, env, for_signature):
         #   -Wl--on-flag libA.a -Wl--off-flag -Wl--on-flag libA.a -Wl--off-flag
         # This loop below will spot the cases were the flag was turned off and then
         # immediately turned back on
-        for switch_flag in env.get('LIBDEPS_SWITCH_FLAGS', []):
+        for switch_flag in getattr(flagged_libdep.libnode.attributes, 'libdeps_switch_flags', []):
             if (prev_libdep and switch_flag['on'] in flagged_libdep.prefix_flags
                 and switch_flag['off'] in prev_libdep.postfix_flags):
 
@@ -1076,55 +1193,61 @@ def expand_libdeps_with_flags(source, target, env, for_signature):
 
 def generate_libdeps_graph(env):
     if env.get('SYMBOLDEPSSUFFIX', None):
-        import glob
-        from buildscripts.libdeps.graph_analyzer import EdgeProps
-        find_symbols = env.Dir("$BUILD_DIR").path + "/libdeps/find_symbols"
-        symbol_deps = []
-        for target, source in env.get('LIBDEPS_SYMBOL_DEP_FILES', []):
-            direct_libdeps = []
-            for direct_libdep in _get_sorted_direct_libdeps(source):
-                env.GetLibdepsGraph().add_edges_from([(
-                    str(direct_libdep.target_node.abspath),
-                    str(source.abspath),
-                    {
-                        EdgeProps.direct.name: 1,
-                        EdgeProps.visibility.name: int(direct_libdep.dependency_type)
-                    })])
-                direct_libdeps.append(direct_libdep.target_node.abspath)
-            for libdep in _get_libdeps(source):
-                if libdep.abspath not in direct_libdeps:
-                    env.GetLibdepsGraph().add_edges_from([(
-                        str(libdep.abspath),
-                        str(source.abspath),
-                        {
-                            EdgeProps.direct.name: 0,
-                            EdgeProps.visibility.name: int(deptype.Public)
-                        })])
 
-            ld_path = ":".join([os.path.dirname(str(libdep)) for libdep in _get_libdeps(source)])
+        find_symbols = env.Dir("$BUILD_DIR").path + "/libdeps/find_symbols"
+        libdeps_graph = env.GetLibdepsGraph()
+
+        symbol_deps = []
+        for symbols_file, target_node in env.get('LIBDEPS_SYMBOL_DEP_FILES', []):
+
+            direct_libdeps = []
+            for direct_libdep in _get_sorted_direct_libdeps(target_node):
+                add_node_from(env, direct_libdep.target_node)
+                add_edge_from(
+                    env,
+                    str(target_node.abspath),
+                    str(direct_libdep.target_node.abspath),
+                    visibility=int(direct_libdep.dependency_type),
+                    direct=True)
+                direct_libdeps.append(direct_libdep.target_node.abspath)
+
+            for libdep in _get_libdeps(target_node):
+                if libdep.abspath not in direct_libdeps:
+                    add_node_from(env, libdep)
+                    add_edge_from(
+                        env,
+                        str(target_node.abspath),
+                        str(libdep.abspath),
+                        visibility=int(deptype.Public),
+                        direct=False)
+            if env['PLATFORM'] == 'darwin':
+                sep = ' '
+            else:
+                sep = ':'
+            ld_path = sep.join([os.path.dirname(str(libdep)) for libdep in _get_libdeps(target_node)])
             symbol_deps.append(env.Command(
-                target=target,
-                source=source,
+                target=symbols_file,
+                source=target_node,
                 action=SCons.Action.Action(
                     f'{find_symbols} $SOURCE "{ld_path}" $TARGET',
-                    "Generating $SOURCE symbol dependencies")))
+                    "Generating $SOURCE symbol dependencies" if not env['VERBOSE'] else "")))
 
         def write_graph_hash(env, target, source):
-            import networkx
-            import hashlib
-            import json
+
             with open(target[0].path, 'w') as f:
                 json_str = json.dumps(networkx.readwrite.json_graph.node_link_data(env.GetLibdepsGraph()), sort_keys=True).encode('utf-8')
                 f.write(hashlib.sha256(json_str).hexdigest())
 
         graph_hash = env.Command(target="$BUILD_DIR/libdeps/graph_hash.sha256",
-                    source=symbol_deps + [
-                        env.File("#SConstruct")] +
-                        glob.glob("**/SConscript", recursive=True) +
-                        [os.path.abspath(__file__)],
+                    source=symbol_deps,
                     action=SCons.Action.FunctionAction(
                         write_graph_hash,
                         {"cmdstr": None}))
+        env.Depends(graph_hash, [
+                        env.File("#SConstruct")] +
+                        glob.glob("**/SConscript", recursive=True) +
+                        [os.path.abspath(__file__),
+                        env.File('$BUILD_DIR/mongo/util/version_constants.h')])
 
         graph_node = env.Command(
             target=env.get('LIBDEPS_GRAPH_FILE', None),
@@ -1133,7 +1256,7 @@ def generate_libdeps_graph(env):
                 generate_graph,
                 {"cmdstr": "Generating libdeps graph"}))
 
-        env.Depends(graph_node, graph_hash)
+        env.Depends(graph_node, [graph_hash] + env.Glob("#buildscripts/libdeps/libdeps/*"))
 
 def get_typeinfo_link_command():
     if LibdepLinter.skip_linting:
@@ -1189,30 +1312,35 @@ def get_libdeps_ld_path(source, target, env, for_signature):
 
 
 def generate_graph(env, target, source):
-    import fileinput
-    import networkx
-    import json
+
+    libdeps_graph = env.GetLibdepsGraph()
 
     for symbol_deps_file in source:
         with open(str(symbol_deps_file)) as f:
             symbols = {}
-            for symbol, lib in json.load(f).items():
-                # ignore symbols from external libraries,
-                # they will just clutter the graph
-                if lib.startswith(env.Dir("$BUILD_DIR").path):
-                    if lib not in symbols:
-                        symbols[lib] = []
-                    symbols[lib].append(symbol)
+            try:
+                for symbol, lib in json.load(f).items():
+                    # ignore symbols from external libraries,
+                    # they will just clutter the graph
+                    if lib.startswith(env.Dir("$BUILD_DIR").path):
+                        if lib not in symbols:
+                            symbols[lib] = []
+                        symbols[lib].append(symbol)
+            except json.JSONDecodeError:
+                env.FatalError(f"Failed processing json file: {str(symbol_deps_file)}")
 
-            for lib in symbols:
-                env.GetLibdepsGraph().add_edges_from([(
-                    os.path.abspath(lib).strip(),
-                    os.path.abspath(str(symbol_deps_file)[:-len(env['SYMBOLDEPSSUFFIX'])]),
-                    {"symbols": " ".join(symbols[lib]) })])
-
+            for libdep in symbols:
+                from_node = os.path.abspath(str(symbol_deps_file)[:-len(env['SYMBOLDEPSSUFFIX'])])
+                to_node = os.path.abspath(libdep).strip()
+                libdeps_graph.add_edges_from([(
+                    from_node,
+                    to_node,
+                    {EdgeProps.symbols.name: " ".join(symbols[libdep]) })])
+                node = env.File(str(symbol_deps_file)[:-len(env['SYMBOLDEPSSUFFIX'])])
+                add_node_from(env, node)
 
     libdeps_graph_file = f"{env.Dir('$BUILD_DIR').path}/libdeps/libdeps.graphml"
-    networkx.write_graphml(env.GetLibdepsGraph(), libdeps_graph_file, named_key_ids=True)
+    networkx.write_graphml(libdeps_graph, libdeps_graph_file, named_key_ids=True)
     with fileinput.FileInput(libdeps_graph_file, inplace=True) as file:
         for line in file:
             print(line.replace(str(env.Dir("$BUILD_DIR").abspath + os.sep), ''), end='')
@@ -1273,14 +1401,18 @@ def setup_environment(env, emitting_shared=False, debug='off', linting='on', san
         "${BUILD_DIR}/libdeps/libdeps.graphml")[0]
 
     if str(env['LIBDEPS_GRAPH_ALIAS']) in COMMAND_LINE_TARGETS:
-        import networkx
 
         # Detect if the current system has the tools to perform the generation.
         if env.GetOption('ninja') != 'disabled':
             env.FatalError("Libdeps graph generation is not supported with ninja builds.")
         if not emitting_shared:
             env.FatalError("Libdeps graph generation currently only supports dynamic builds.")
-        for bin in ['awk', 'grep', 'ldd', 'nm']:
+
+        if env['PLATFORM'] == 'darwin':
+            required_bins = ['awk', 'sed', 'otool', 'nm']
+        else:
+            required_bins = ['awk', 'grep', 'ldd', 'nm']
+        for bin in required_bins:
             if not env.WhereIs(bin):
                 env.FatalError(f"'{bin}' not found, Libdeps graph generation requires {bin}.")
 
@@ -1304,14 +1436,21 @@ def setup_environment(env, emitting_shared=False, debug='off', linting='on', san
             symbol_deps.append(symbol_deps_file)
         env.AddMethod(append_symbol_deps, "AppendSymbolDeps")
 
-        libdeps_graph = networkx.DiGraph()
+        env['LIBDEPS_SYMBOL_DEP_FILES'] = symbol_deps
+        env['LIBDEPS_GRAPH_FILE'] = env.File("${BUILD_DIR}/libdeps/libdeps.graphml")
+        env['LIBDEPS_GRAPH_SCHEMA_VERSION'] = 2
+        env["SYMBOLDEPSSUFFIX"] = '.symbol_deps'
+
+        libdeps_graph = LibdepsGraph()
+        libdeps_graph.graph['invocation'] = " ".join([env['ESCAPE'](str(sys.executable))] + [env['ESCAPE'](arg) for arg in sys.argv])
+        libdeps_graph.graph['git_hash'] = env['MONGO_GIT_HASH']
+        libdeps_graph.graph['graph_schema_version'] = env['LIBDEPS_GRAPH_SCHEMA_VERSION']
+        libdeps_graph.graph['build_dir'] = env.Dir('$BUILD_DIR').path
+        libdeps_graph.graph['deptypes'] = json.dumps({key: value[0] for key, value in deptype.__members__.items() if isinstance(value, tuple)})
+
         def get_libdeps_graph(env):
             return libdeps_graph
         env.AddMethod(get_libdeps_graph, "GetLibdepsGraph")
-
-        env['LIBDEPS_SYMBOL_DEP_FILES'] = symbol_deps
-        env['LIBDEPS_GRAPH_FILE'] = env.File("${BUILD_DIR}/libdeps/libdeps.graphml")
-        env["SYMBOLDEPSSUFFIX"] = '.symbol_deps'
 
         # Now we will setup an emitter, and an additional action for several
         # of the builder involved with dynamic builds.
@@ -1365,7 +1504,6 @@ def setup_environment(env, emitting_shared=False, debug='off', linting='on', san
     )
 
     env.Prepend(_LIBFLAGS="$_LIBDEPS_TAGS $_LIBDEPS $_SYSLIBDEPS ")
-    env.Prepend(ARFLAGS="$_LIBDEPS_TAGS")
     for builder_name in ("Program", "SharedLibrary", "LoadableModule", "SharedArchive"):
         try:
             update_scanner(env, builder_name, debug=debug)

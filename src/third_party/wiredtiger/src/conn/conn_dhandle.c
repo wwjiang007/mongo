@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -99,6 +99,12 @@ __conn_dhandle_config_set(WT_SESSION_IMPL *session)
     case WT_DHANDLE_TYPE_TABLE:
         WT_ERR(__wt_strdup(session, WT_CONFIG_BASE(session, table_meta), &dhandle->cfg[0]));
         break;
+    case WT_DHANDLE_TYPE_TIERED:
+        WT_ERR(__wt_strdup(session, WT_CONFIG_BASE(session, tiered_meta), &dhandle->cfg[0]));
+        break;
+    case WT_DHANDLE_TYPE_TIERED_TREE:
+        WT_ERR(__wt_strdup(session, WT_CONFIG_BASE(session, tier_meta), &dhandle->cfg[0]));
+        break;
     }
     dhandle->cfg[1] = metaconf;
     dhandle->meta_base = base;
@@ -127,6 +133,12 @@ __conn_dhandle_destroy(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle)
     case WT_DHANDLE_TYPE_TABLE:
         ret = __wt_schema_close_table(session, (WT_TABLE *)dhandle);
         break;
+    case WT_DHANDLE_TYPE_TIERED:
+        ret = __wt_tiered_close(session, (WT_TIERED *)dhandle);
+        break;
+    case WT_DHANDLE_TYPE_TIERED_TREE:
+        ret = __wt_tiered_tree_close(session, (WT_TIERED_TREE *)dhandle);
+        break;
     }
 
     __wt_rwlock_destroy(session, &dhandle->rwlock);
@@ -150,6 +162,8 @@ __wt_conn_dhandle_alloc(WT_SESSION_IMPL *session, const char *uri, const char *c
     WT_DATA_HANDLE *dhandle;
     WT_DECL_RET;
     WT_TABLE *table;
+    WT_TIERED *tiered;
+    WT_TIERED_TREE *tiered_tree;
     uint64_t bucket;
 
     /*
@@ -165,6 +179,14 @@ __wt_conn_dhandle_alloc(WT_SESSION_IMPL *session, const char *uri, const char *c
         WT_RET(__wt_calloc_one(session, &table));
         dhandle = (WT_DATA_HANDLE *)table;
         dhandle->type = WT_DHANDLE_TYPE_TABLE;
+    } else if (WT_PREFIX_MATCH(uri, "tier:")) {
+        WT_RET(__wt_calloc_one(session, &tiered_tree));
+        dhandle = (WT_DATA_HANDLE *)tiered_tree;
+        dhandle->type = WT_DHANDLE_TYPE_TIERED_TREE;
+    } else if (WT_PREFIX_MATCH(uri, "tiered:")) {
+        WT_RET(__wt_calloc_one(session, &tiered));
+        dhandle = (WT_DATA_HANDLE *)tiered;
+        dhandle->type = WT_DHANDLE_TYPE_TIERED;
     } else
         WT_RET_PANIC(session, EINVAL, "illegal handle allocation URI %s", uri);
 
@@ -223,7 +245,7 @@ __wt_conn_dhandle_find(WT_SESSION_IMPL *session, const char *uri, const char *ch
     conn = S2C(session);
 
     /* We must be holding the handle list lock at a higher level. */
-    WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST));
+    WT_ASSERT(session, FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_HANDLE_LIST));
 
     bucket = __wt_hash_city64(uri, strlen(uri)) & (conn->dh_hash_size - 1);
     if (checkpoint == NULL) {
@@ -290,9 +312,9 @@ __wt_conn_dhandle_close(WT_SESSION_IMPL *session, bool final, bool mark_dead)
      * schema lock we might deadlock with a thread that has the schema lock and wants a handle lock.
      */
     no_schema_lock = false;
-    if (!F_ISSET(session, WT_SESSION_LOCKED_SCHEMA)) {
+    if (!FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_SCHEMA)) {
         no_schema_lock = true;
-        F_SET(session, WT_SESSION_NO_SCHEMA_LOCK);
+        FLD_SET(session->lock_flags, WT_SESSION_NO_SCHEMA_LOCK);
     }
 
     /*
@@ -364,6 +386,12 @@ __wt_conn_dhandle_close(WT_SESSION_IMPL *session, bool final, bool mark_dead)
     case WT_DHANDLE_TYPE_TABLE:
         WT_TRET(__wt_schema_close_table(session, (WT_TABLE *)dhandle));
         break;
+    case WT_DHANDLE_TYPE_TIERED:
+        WT_TRET(__wt_tiered_close(session, (WT_TIERED *)dhandle));
+        break;
+    case WT_DHANDLE_TYPE_TIERED_TREE:
+        WT_TRET(__wt_tiered_tree_close(session, (WT_TIERED_TREE *)dhandle));
+        break;
     }
 
     /*
@@ -401,12 +429,63 @@ err:
     __wt_spin_unlock(session, &dhandle->close_lock);
 
     if (no_schema_lock)
-        F_CLR(session, WT_SESSION_NO_SCHEMA_LOCK);
+        FLD_CLR(session->lock_flags, WT_SESSION_NO_SCHEMA_LOCK);
 
     if (is_btree)
         __wt_evict_file_exclusive_off(session);
 
     return (ret);
+}
+
+/*
+ * __conn_dhandle_config_parse --
+ *     Parse out configuration settings relevant for the data handle.
+ */
+static int
+__conn_dhandle_config_parse(WT_SESSION_IMPL *session)
+{
+    WT_CONFIG_ITEM cval, sval;
+    WT_DATA_HANDLE *dhandle;
+    WT_DECL_RET;
+    const char **cfg;
+
+    dhandle = session->dhandle;
+    cfg = dhandle->cfg;
+
+    /* Clear all the flags. */
+    dhandle->ts_flags = 0;
+
+    /* Debugging information */
+    WT_RET(__wt_config_gets(session, cfg, "assert.write_timestamp", &cval));
+    if (WT_STRING_MATCH("on", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_ASSERT_TS_WRITE);
+
+    WT_RET(__wt_config_gets(session, cfg, "assert.read_timestamp", &cval));
+    if (WT_STRING_MATCH("always", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_ASSERT_TS_READ_ALWAYS);
+    else if (WT_STRING_MATCH("never", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_ASSERT_TS_READ_NEVER);
+
+    /* Setup verbose options */
+    WT_RET(__wt_config_gets(session, cfg, "verbose", &cval));
+    if ((ret = __wt_config_subgets(session, &cval, "write_timestamp", &sval)) == 0 && sval.val != 0)
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_VERB_TS_WRITE);
+    WT_RET_NOTFOUND_OK(ret);
+
+    /* Setup timestamp usage hints */
+    WT_RET(__wt_config_gets(session, cfg, "write_timestamp_usage", &cval));
+    if (WT_STRING_MATCH("always", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_TS_ALWAYS);
+    else if (WT_STRING_MATCH("key_consistent", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_TS_KEY_CONSISTENT);
+    else if (WT_STRING_MATCH("mixed_mode", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_TS_MIXED_MODE);
+    else if (WT_STRING_MATCH("never", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_TS_NEVER);
+    else if (WT_STRING_MATCH("ordered", cval.str, cval.len))
+        FLD_SET(dhandle->ts_flags, WT_DHANDLE_TS_ORDERED);
+
+    return (0);
 }
 
 /*
@@ -447,6 +526,7 @@ __wt_conn_dhandle_open(WT_SESSION_IMPL *session, const char *cfg[], uint32_t fla
     /* Discard any previous configuration, set up the new configuration. */
     __conn_dhandle_config_clear(session);
     WT_ERR(__conn_dhandle_config_set(session));
+    WT_ERR(__conn_dhandle_config_parse(session));
 
     switch (dhandle->type) {
     case WT_DHANDLE_TYPE_BTREE:
@@ -465,7 +545,13 @@ __wt_conn_dhandle_open(WT_SESSION_IMPL *session, const char *cfg[], uint32_t fla
         WT_ERR(__wt_btree_open(session, cfg));
         break;
     case WT_DHANDLE_TYPE_TABLE:
-        WT_ERR(__wt_schema_open_table(session, cfg));
+        WT_ERR(__wt_schema_open_table(session));
+        break;
+    case WT_DHANDLE_TYPE_TIERED:
+        WT_ERR(__wt_tiered_open(session, cfg));
+        break;
+    case WT_DHANDLE_TYPE_TIERED_TREE:
+        WT_ERR(__wt_tiered_tree_open(session, cfg));
         break;
     }
 
@@ -595,6 +681,7 @@ __wt_conn_btree_apply(WT_SESSION_IMPL *session, const char *uri,
             conn->ckpt_apply = conn->ckpt_skip = 0;
             conn->ckpt_apply_time = conn->ckpt_skip_time = 0;
             time_start = __wt_clock(session);
+            F_SET(conn, WT_CONN_CKPT_GATHER);
         }
         for (dhandle = NULL;;) {
             WT_WITH_HANDLE_LIST_READ_LOCK(
@@ -610,6 +697,7 @@ __wt_conn_btree_apply(WT_SESSION_IMPL *session, const char *uri,
         }
 done:
         if (WT_SESSION_IS_CHECKPOINT(session)) {
+            F_CLR(conn, WT_CONN_CKPT_GATHER);
             time_stop = __wt_clock(session);
             time_diff = WT_CLOCKDIFF_US(time_stop, time_start);
             WT_STAT_CONN_SET(session, txn_checkpoint_handle_applied, conn->ckpt_apply);
@@ -623,6 +711,7 @@ done:
     }
 
 err:
+    F_CLR(conn, WT_CONN_CKPT_GATHER);
     WT_DHANDLE_RELEASE(dhandle);
     return (ret);
 }
@@ -684,7 +773,7 @@ __wt_conn_dhandle_close_all(WT_SESSION_IMPL *session, const char *uri, bool remo
 
     conn = S2C(session);
 
-    WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
+    WT_ASSERT(session, FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
     WT_ASSERT(session, session->dhandle == NULL);
 
     /*
@@ -723,7 +812,7 @@ __conn_dhandle_remove(WT_SESSION_IMPL *session, bool final)
     dhandle = session->dhandle;
     bucket = dhandle->name_hash & (conn->dh_hash_size - 1);
 
-    WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
+    WT_ASSERT(session, FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
     WT_ASSERT(session, dhandle != conn->cache->walk_tree);
 
     /* Check if the handle was reacquired by a session while we waited. */
@@ -761,7 +850,7 @@ __wt_conn_dhandle_discard_single(WT_SESSION_IMPL *session, bool final, bool mark
      * Kludge: interrupt the eviction server in case it is holding the handle list lock.
      */
     set_pass_intr = false;
-    if (!F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST)) {
+    if (!FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_HANDLE_LIST)) {
         set_pass_intr = true;
         (void)__wt_atomic_addv32(&S2C(session)->cache->pass_intr, 1);
     }
@@ -845,6 +934,37 @@ restart:
     WT_TAILQ_SAFE_REMOVE_END
 
     return (ret);
+}
+
+/*
+ * __wt_dhandle_update_write_gens --
+ *     Update the open dhandles write generation, run write generation and base write generation
+ *     number.
+ */
+void
+__wt_dhandle_update_write_gens(WT_SESSION_IMPL *session)
+{
+    WT_BTREE *btree;
+    WT_CONNECTION_IMPL *conn;
+    WT_DATA_HANDLE *dhandle;
+
+    conn = S2C(session);
+
+    for (dhandle = NULL;;) {
+        WT_WITH_HANDLE_LIST_WRITE_LOCK(session, WT_DHANDLE_NEXT(session, dhandle, &conn->dhqh, q));
+        if (dhandle == NULL)
+            break;
+        btree = (WT_BTREE *)dhandle->handle;
+
+        WT_ASSERT(session, btree != NULL);
+
+        /*
+         * Initialize the btree write generation numbers after rollback to stable so that the
+         * transaction ids of the pages will be reset when loaded from disk to memory.
+         */
+        btree->write_gen = btree->base_write_gen = btree->run_write_gen =
+          WT_MAX(btree->write_gen, conn->base_write_gen);
+    }
 }
 
 /*

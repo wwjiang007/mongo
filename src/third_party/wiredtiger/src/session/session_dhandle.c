@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -494,7 +494,7 @@ __wt_session_get_dhandle(WT_SESSION_IMPL *session, const char *uri, const char *
          * handles in the meantime. A combination of the schema and handle list locks are used to
          * enforce this.
          */
-        if (!F_ISSET(session, WT_SESSION_LOCKED_SCHEMA)) {
+        if (!FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_SCHEMA)) {
             dhandle->excl_session = NULL;
             dhandle->excl_ref = 0;
             F_CLR(dhandle, WT_DHANDLE_EXCLUSIVE);

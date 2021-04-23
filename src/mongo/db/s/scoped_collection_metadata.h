@@ -57,9 +57,8 @@ public:
         return _impl->get().isSharded();
     }
 
-    bool writesShouldRunInDistributedTransaction(const OID& originalEpoch,
-                                                 const OID& reshardingEpoch) const {
-        return _impl->get().writesShouldRunInDistributedTransaction(originalEpoch, reshardingEpoch);
+    bool disallowWritesForResharding(const UUID& currentCollectionUUID) const {
+        return _impl->get().disallowWritesForResharding(currentCollectionUUID);
     }
 
     bool isValidKey(const BSONObj& key) const {
@@ -68,6 +67,10 @@ public:
 
     boost::optional<ShardKeyPattern> getReshardingKeyIfShouldForwardOps() const {
         return _impl->get().getReshardingKeyIfShouldForwardOps();
+    }
+
+    void throwIfReshardingInProgress(NamespaceString const& nss) const {
+        _impl->get().throwIfReshardingInProgress(nss);
     }
 
     const BSONObj& getKeyPattern() const {
@@ -96,6 +99,10 @@ public:
 
     const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
         return _impl->get().getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        return _impl->get().getTimeseriesFields();
     }
 
 protected:

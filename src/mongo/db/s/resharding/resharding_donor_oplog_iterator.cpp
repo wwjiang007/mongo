@@ -27,18 +27,30 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 
-#include <fmt/format.h>
+#include <tuple>
+#include <utility>
 
-#include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/client.h"
+#include "mongo/db/pipeline/document_source_lookup.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_unwind.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -58,77 +70,182 @@ ReshardingDonorOplogId getId(const repl::OplogEntry& oplog) {
 }  // anonymous namespace
 
 ReshardingDonorOplogIterator::ReshardingDonorOplogIterator(
-    NamespaceString donorOplogBufferNs, boost::optional<ReshardingDonorOplogId> resumeToken)
-    : _oplogBufferNs(std::move(donorOplogBufferNs)), _resumeToken(std::move(resumeToken)) {}
+    NamespaceString oplogBufferNss,
+    ReshardingDonorOplogId resumeToken,
+    resharding::OnInsertAwaitable* insertNotifier)
+    : _oplogBufferNss(std::move(oplogBufferNss)),
+      _resumeToken(std::move(resumeToken)),
+      _insertNotifier(insertNotifier) {}
 
-Future<boost::optional<repl::OplogEntry>> ReshardingDonorOplogIterator::getNext(
-    OperationContext* opCtx) {
-    boost::optional<repl::OplogEntry> oplogToReturn;
+std::unique_ptr<Pipeline, PipelineDeleter> ReshardingDonorOplogIterator::makePipeline(
+    OperationContext* opCtx, std::shared_ptr<MongoProcessInterface> mongoProcessInterface) {
+    using Doc = Document;
+    using Arr = std::vector<Value>;
+    using V = Value;
 
-    if (_hasSeenFinalOplogEntry) {
-        return Future<boost::optional<repl::OplogEntry>>::makeReady(oplogToReturn);
-    }
-
-    if (!_pipeline) {
-        auto expCtx = _makeExpressionContext(opCtx);
-        _pipeline = createAggForReshardingOplogBuffer(std::move(expCtx), _resumeToken, true);
-        _pipeline->detachFromOperationContext();
-    }
-
-    _pipeline->reattachToOperationContext(opCtx);
-    ON_BLOCK_EXIT([this] {
-        if (_pipeline) {
-            _pipeline->detachFromOperationContext();
-        }
-    });
-
-    auto next = _pipeline->getNext();
-
-    if (!next) {
-        _pipeline.reset();
-        return _waitForNewOplog().then([this, opCtx] { return getNext(opCtx); });
-    }
-
-    auto nextOplog = uassertStatusOK(repl::OplogEntry::parse(next->toBson()));
-    if (isFinalOplog(nextOplog)) {
-        _hasSeenFinalOplogEntry = true;
-        _pipeline.reset();
-        return Future<boost::optional<repl::OplogEntry>>::makeReady(oplogToReturn);
-    }
-
-    _resumeToken = getId(nextOplog);
-
-    oplogToReturn = std::move(nextOplog);
-    return Future<boost::optional<repl::OplogEntry>>::makeReady(std::move(oplogToReturn));
-}
-
-bool ReshardingDonorOplogIterator::hasMore() const {
-    return !_hasSeenFinalOplogEntry;
-}
-
-Future<void> ReshardingDonorOplogIterator::_waitForNewOplog() {
-    return Future<void>::makeReady();
-}
-
-boost::intrusive_ptr<ExpressionContext> ReshardingDonorOplogIterator::_makeExpressionContext(
-    OperationContext* opCtx) {
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
-    resolvedNamespaces.emplace(_oplogBufferNs.coll(),
-                               ExpressionContext::ResolvedNamespace{_oplogBufferNs, {}});
+    resolvedNamespaces[_oplogBufferNss.coll()] = {_oplogBufferNss, std::vector<BSONObj>{}};
 
-    return make_intrusive<ExpressionContext>(opCtx,
-                                             boost::none /* explain */,
-                                             false /* fromMongos */,
-                                             false /* needsMerge */,
-                                             false /* allowDiskUse */,
-                                             false /* bypassDocumentValidation */,
-                                             false /* isMapReduceCommand */,
-                                             _oplogBufferNs,
-                                             boost::none /* runtimeConstants */,
-                                             nullptr /* collator */,
-                                             MongoProcessInterface::create(opCtx),
-                                             std::move(resolvedNamespaces),
-                                             boost::none /* collUUID */);
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx,
+                                                    boost::none, /* explain */
+                                                    false,       /* fromMongos */
+                                                    false,       /* needsMerge */
+                                                    false,       /* allowDiskUse */
+                                                    false,       /* bypassDocumentValidation */
+                                                    false,       /* isMapReduceCommand */
+                                                    _oplogBufferNss,
+                                                    boost::none, /* runtimeConstants */
+                                                    nullptr,     /* collator */
+                                                    std::move(mongoProcessInterface),
+                                                    std::move(resolvedNamespaces),
+                                                    boost::none /* collUUID */);
+
+    Pipeline::SourceContainer stages;
+
+    stages.emplace_back(
+        DocumentSourceMatch::create(BSON("_id" << BSON("$gt" << _resumeToken.toBSON())), expCtx));
+
+    stages.emplace_back(DocumentSourceSort::create(expCtx, BSON("_id" << 1)));
+
+    stages.emplace_back(DocumentSourceReplaceRoot::createFromBson(
+        BSON("$replaceWith" << BSON(kActualOpFieldName << "$$ROOT")).firstElement(), expCtx));
+
+    for (const auto& [tsFieldName, opFieldName] :
+         std::initializer_list<std::pair<std::string, StringData>>{
+             {"$" + kActualOpFieldName + ".preImageOpTime.ts", kPreImageOpFieldName},
+             {"$" + kActualOpFieldName + ".postImageOpTime.ts", kPostImageOpFieldName}}) {
+
+        stages.emplace_back(DocumentSourceLookUp::createFromBson(
+            Doc{{"$lookup",
+                 Doc{{"from", _oplogBufferNss.coll()},
+                     {"let",
+                      Doc{{"preOrPostImageId",
+                           Doc{{"clusterTime", tsFieldName}, {"ts", tsFieldName}}}}},
+                     {"pipeline", Arr{V{Doc(fromjson("{$match: {$expr: {\
+                        $eq: ['$_id', '$$preOrPostImageId']}}}"))}}},
+                     {"as", opFieldName}}}}
+                .toBson()
+                .firstElement(),
+            expCtx));
+
+        stages.emplace_back(DocumentSourceUnwind::create(expCtx,
+                                                         opFieldName.toString(),
+                                                         true /* preserveNullAndEmptyArrays */,
+                                                         boost::none /* includeArrayIndex */));
+    }
+
+    return Pipeline::create(std::move(stages), std::move(expCtx));
+}
+
+std::vector<repl::OplogEntry> ReshardingDonorOplogIterator::_fillBatch(Pipeline& pipeline) {
+    std::vector<repl::OplogEntry> batch;
+
+    int numBytes = 0;
+    do {
+        auto doc = pipeline.getNext();
+        if (!doc) {
+            break;
+        }
+
+        Value actualOp, preImageOp, postImageOp;
+        auto iter = doc->fieldIterator();
+        while (iter.more()) {
+            StringData field;
+            Value value;
+            std::tie(field, value) = iter.next();
+
+            if (kActualOpFieldName == field) {
+                actualOp = std::move(value);
+            } else if (kPreImageOpFieldName == field) {
+                preImageOp = std::move(value);
+            } else if (kPostImageOpFieldName == field) {
+                postImageOp = std::move(value);
+            } else {
+                uasserted(4990404,
+                          str::stream() << "Unexpected top-level field from pipeline for iterating"
+                                           " donor's oplog buffer: "
+                                        << field);
+            }
+        }
+
+        uassert(4990405, "Expected nested document for 'actualOp' field", actualOp.isObject());
+
+        auto obj = actualOp.getDocument().toBson();
+        auto& entry = batch.emplace_back(obj.getOwned());
+
+        if (!preImageOp.missing()) {
+            uassert(
+                4990406, "Expected nested document for 'preImageOp' field", preImageOp.isObject());
+            entry.setPreImageOp(preImageOp.getDocument().toBson());
+        }
+
+        if (!postImageOp.missing()) {
+            uassert(4990407,
+                    "Expected nested document for 'postImageOp' field",
+                    postImageOp.isObject());
+            entry.setPostImageOp(postImageOp.getDocument().toBson());
+        }
+
+        numBytes += obj.objsize();
+    } while (numBytes < resharding::gReshardingBatchLimitBytes &&
+             batch.size() < std::size_t(resharding::gReshardingBatchLimitOperations));
+
+    return batch;
+}
+
+ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getNextBatch(
+    std::shared_ptr<executor::TaskExecutor> executor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) {
+    if (_hasSeenFinalOplogEntry) {
+        invariant(!_pipeline);
+        return ExecutorFuture(std::move(executor), std::vector<repl::OplogEntry>{});
+    }
+
+    auto batch = [&] {
+        auto opCtx = factory.makeOperationContext(&cc());
+        if (_pipeline) {
+            _pipeline->reattachToOperationContext(opCtx.get());
+        } else {
+            auto pipeline = makePipeline(opCtx.get(), MongoProcessInterface::create(opCtx.get()));
+            _pipeline = pipeline->getContext()
+                            ->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
+                                pipeline.release());
+        }
+
+        auto batch = _fillBatch(*_pipeline);
+
+        if (batch.empty()) {
+            _pipeline.reset();
+        } else {
+            const auto& lastEntryInBatch = batch.back();
+            _resumeToken = getId(lastEntryInBatch);
+
+            if (isFinalOplog(lastEntryInBatch)) {
+                _hasSeenFinalOplogEntry = true;
+                // Skip returning the final oplog entry because it is known to be a no-op.
+                batch.pop_back();
+                _pipeline.reset();
+            } else {
+                _pipeline->detachFromOperationContext();
+            }
+        }
+
+        return batch;
+    }();
+
+    if (batch.empty() && !_hasSeenFinalOplogEntry) {
+        return ExecutorFuture(executor)
+            .then([this, cancelToken] {
+                return future_util::withCancellation(_insertNotifier->awaitInsert(_resumeToken),
+                                                     cancelToken);
+            })
+            .then([this, cancelToken, executor, factory] {
+                return getNextBatch(std::move(executor), cancelToken, factory);
+            });
+    }
+
+    return ExecutorFuture(std::move(executor), std::move(batch));
 }
 
 }  // namespace mongo

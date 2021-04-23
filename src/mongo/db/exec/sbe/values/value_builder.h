@@ -68,11 +68,11 @@ public:
     ValueBuilder(ValueBuilder& other) = delete;
 
     void append(const MinKeyLabeler& id) {
-        unsupportedType("minKey");
+        appendValue(TypeTags::MinKey, 0);
     }
 
     void append(const MaxKeyLabeler& id) {
-        unsupportedType("maxKey");
+        appendValue(TypeTags::MaxKey, 0);
     }
 
     void append(const NullLabeler& id) {
@@ -80,7 +80,7 @@ public:
     }
 
     void append(const UndefinedLabeler& id) {
-        unsupportedType("undefined");
+        appendValue(TypeTags::bsonUndefined, 0);
     }
 
     void append(const bool in) {
@@ -105,23 +105,26 @@ public:
     }
 
     void append(StringData in) {
-        if (in.size() < kSmallStringThreshold - 1) {
-            appendValue(makeSmallString(std::string_view(in.rawData(), in.size())));
+        if (canUseSmallString({in.rawData(), in.size()})) {
+            appendValue(makeSmallString({in.rawData(), in.size()}));
         } else {
             appendValueBufferOffset(TypeTags::StringBig);
-
-            // Note: This _will_ write a NULL-terminated string, even if the input StringData does
-            // not have a NULL terminator.
-            _valueBufferBuilder->appendStr(in);
+            _valueBufferBuilder->appendNum(static_cast<int32_t>(in.size() + 1));
+            _valueBufferBuilder->appendStr(in, true /* includeEndingNull */);
         }
     }
 
     void append(const BSONSymbol& in) {
-        unsupportedType("symbol");
+        appendValueBufferOffset(TypeTags::bsonSymbol);
+        _valueBufferBuilder->appendNum(static_cast<int32_t>(in.symbol.size() + 1));
+        _valueBufferBuilder->appendStr(in.symbol, true /* includeEndingNull */);
     }
 
     void append(const BSONCode& in) {
-        unsupportedType("javascript");
+        appendValueBufferOffset(TypeTags::bsonJavascript);
+        // Add one to account null byte at the end.
+        _valueBufferBuilder->appendNum(static_cast<uint32_t>(in.code.size() + 1));
+        _valueBufferBuilder->appendStr(in.code, true /* includeEndingNull */);
     }
 
     void append(const BSONCodeWScope& in) {
@@ -136,11 +139,16 @@ public:
     }
 
     void append(const BSONRegEx& in) {
-        unsupportedType("regex");
+        appendValueBufferOffset(TypeTags::bsonRegex);
+        _valueBufferBuilder->appendStr(in.pattern, true /* includeEndingNull */);
+        _valueBufferBuilder->appendStr(in.flags, true /* includeEndingNull */);
     }
 
     void append(const BSONDBRef& in) {
-        unsupportedType("dbPointer");
+        appendValueBufferOffset(TypeTags::bsonDBPointer);
+        _valueBufferBuilder->appendNum(static_cast<int32_t>(in.ns.size() + 1));
+        _valueBufferBuilder->appendStr(in.ns, true /* includeEndingNull */);
+        _valueBufferBuilder->appendBuf(in.oid.view().view(), OID::kOIDSize);
     }
 
     void append(double in) {
@@ -202,10 +210,14 @@ public:
                 // convert those offsets into pointers.
                 case TypeTags::ObjectId:
                 case TypeTags::StringBig:
+                case TypeTags::bsonSymbol:
                 case TypeTags::NumberDecimal:
                 case TypeTags::bsonObject:
                 case TypeTags::bsonArray:
-                case TypeTags::bsonBinData: {
+                case TypeTags::bsonBinData:
+                case TypeTags::bsonRegex:
+                case TypeTags::bsonJavascript:
+                case TypeTags::bsonDBPointer: {
                     auto offset = bitcastTo<decltype(bufferLen)>(val);
                     invariant(offset < bufferLen);
                     val = bitcastFrom<const char*>(_valueBufferBuilder->buf() + offset);
@@ -244,7 +256,7 @@ private:
     //
     // During the building process, pointers into that memory can become invalidated, so instead of
     // storing a pointer, we store an _offset_ into the under-construction buffer. Translation from
-    // offset to pointer occurs as part of the 'releaseValues()' function.
+    // offset to pointer occurs as part of the 'readValues()' function.
     void appendValueBufferOffset(TypeTags tag) {
         _tagList[_numValues] = tag;
         _valList[_numValues] = value::bitcastFrom<int32_t>(_valueBufferBuilder->len());

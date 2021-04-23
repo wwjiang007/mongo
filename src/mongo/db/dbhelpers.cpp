@@ -81,14 +81,14 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     if (!collection)
         return RecordId();
 
-    auto qr = std::make_unique<QueryRequest>(collection->ns());
-    qr->setFilter(query);
-    return findOne(opCtx, collection, std::move(qr), requireIndex);
+    auto findCommand = std::make_unique<FindCommandRequest>(collection->ns());
+    findCommand->setFilter(query);
+    return findOne(opCtx, collection, std::move(findCommand), requireIndex);
 }
 
 RecordId Helpers::findOne(OperationContext* opCtx,
                           const CollectionPtr& collection,
-                          std::unique_ptr<QueryRequest> qr,
+                          std::unique_ptr<FindCommandRequest> findCommand,
                           bool requireIndex) {
     if (!collection)
         return RecordId();
@@ -98,7 +98,8 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx,
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false,
                                      expCtx,
                                      extensionsCallback,
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
@@ -107,6 +108,7 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
+    options = options | QueryPlannerParams::OMIT_REPL_STATE_PERMITS_READS_CHECK;
     auto exec = uassertStatusOK(getExecutor(
         opCtx, &collection, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, options));
 
@@ -185,9 +187,12 @@ bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& res
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     boost::optional<AutoGetOplog> autoOplog;
     const auto& collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+    if (!collection) {
+        return false;
+    }
 
-    auto exec = InternalPlanner::collectionScan(
-        opCtx, ns, &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
+    auto exec =
+        InternalPlanner::collectionScan(opCtx, &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
     PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     CurOp::get(opCtx)->done();
@@ -207,9 +212,12 @@ bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) 
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     boost::optional<AutoGetOplog> autoOplog;
     const auto& collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+    if (!collection) {
+        return false;
+    }
 
     auto exec = InternalPlanner::collectionScan(
-        opCtx, ns, &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD, InternalPlanner::BACKWARD);
+        opCtx, &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD, InternalPlanner::BACKWARD);
     PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     // Non-yielding collection scans from InternalPlanner will never error.
@@ -247,7 +255,9 @@ UpdateResult Helpers::upsert(OperationContext* opCtx,
     request.setQuery(filter);
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
     request.setUpsert();
-    request.setFromMigration(fromMigrate);
+    if (fromMigrate) {
+        request.setSource(OperationSource::kFromMigrate);
+    }
     request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
     return ::mongo::update(opCtx, context.db(), request);
@@ -266,7 +276,9 @@ void Helpers::update(OperationContext* opCtx,
 
     request.setQuery(filter);
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
-    request.setFromMigration(fromMigrate);
+    if (fromMigrate) {
+        request.setSource(OperationSource::kFromMigrate);
+    }
     request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
     ::mongo::update(opCtx, context.db(), request);
@@ -310,6 +322,37 @@ void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& ns
         ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
         : nullptr;
     deleteObjects(opCtx, collection, nss, BSONObj(), false);
+}
+
+bool Helpers::findByIdAndNoopUpdate(OperationContext* opCtx,
+                                    const CollectionPtr& collection,
+                                    const BSONObj& idQuery,
+                                    BSONObj& result) {
+    auto recordId = Helpers::findById(opCtx, collection, idQuery);
+    if (recordId.isNull()) {
+        return false;
+    }
+
+    Snapshotted<BSONObj> snapshottedDoc;
+    auto foundDoc = collection->findDoc(opCtx, recordId, &snapshottedDoc);
+    if (!foundDoc) {
+        return false;
+    }
+
+    result = snapshottedDoc.value();
+
+    // Use an UnreplicatedWritesBlock to avoid generating an oplog entry for this no-op update.
+    // The update is being used to generated write conflicts and isn't modifying the data itself, so
+    // secondaries don't need to know about it. Also set CollectionUpdateArgs::update to an empty
+    // BSONObj because that's a second way OpObserverImpl::onUpdate() detects and ignores no-op
+    // updates.
+    repl::UnreplicatedWritesBlock uwb(opCtx);
+    CollectionUpdateArgs args;
+    args.criteria = idQuery;
+    args.update = BSONObj();
+    collection->updateDocument(opCtx, recordId, snapshottedDoc, result, false, nullptr, &args);
+
+    return true;
 }
 
 }  // namespace mongo

@@ -34,7 +34,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/repl/optime_with.h"
-#include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -47,14 +46,7 @@
 
 namespace mongo {
 
-struct CollectionOptions;
-class OperationContext;
-class RemoteCommandTargeter;
-class ServiceContext;
-class UUID;
-
 struct RemoveShardProgress {
-
     /**
      * Used to indicate to the caller of the removeShard method whether draining of chunks for
      * a particular shard has started, is ongoing, or has been completed.
@@ -89,7 +81,6 @@ struct RemoveShardProgress {
 class ShardingCatalogManager {
     ShardingCatalogManager(const ShardingCatalogManager&) = delete;
     ShardingCatalogManager& operator=(const ShardingCatalogManager&) = delete;
-    friend class ConfigSvrShardCollectionCommand;
 
 public:
     ShardingCatalogManager(ServiceContext* serviceContext,
@@ -292,85 +283,61 @@ public:
      * In a single transaction, effectively bumps the shard version for each shard in the collection
      * to be the current collection version's major version + 1 inside an already-running
      * transaction.
-     *
-     * Note: it's the responsibility of the caller to ensure that the list of shards is stable,
-     * as any shards added after the shard ids have been passed in will be missed.
      */
-    void bumpCollShardVersionsAndChangeMetadataInTxn(
+    void bumpCollectionVersionAndChangeMetadataInTxn(
         OperationContext* opCtx,
         const NamespaceString& nss,
-        const std::vector<ShardId>& shardIds,
         unique_function<void(OperationContext*, TxnNumber)> changeMetadataFunc);
+
+    /**
+     * Same as bumpCollectionVersionAndChangeMetadataInTxn, but bumps the version for several
+     * collections in a single transaction.
+     */
+    void bumpMultipleCollectionVersionsAndChangeMetadataInTxn(
+        OperationContext* opCtx,
+        const std::vector<NamespaceString>& collNames,
+        unique_function<void(OperationContext*, TxnNumber)> changeMetadataFunc);
+
+    /**
+     * Performs a split on the chunk with min value "minKey". If the split fails, it is marked as
+     * jumbo.
+     */
+    void splitOrMarkJumbo(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          const BSONObj& minKey);
+
+    /**
+     * In a transaction, sets the 'allowMigrations' to the requested state and bumps the collection
+     * version.
+     */
+    void setAllowMigrationsAndBumpOneChunk(OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           bool allowMigrations);
 
     //
     // Database Operations
     //
 
     /**
-     * Checks if a database with the same name already exists, and if not, selects a primary shard
-     * for the database and creates a new entry for it in config.databases.
-     *
-     * Returns the database entry.
-     *
-     * Throws DatabaseDifferCase if the database already exists with a different case.
+     * Checks if a database with the same name, optPrimaryShard and enableSharding state already
+     * exists, and if not, creates a new one that matches these prerequisites. If a database already
+     * exists and matches all the prerequisites returns success, otherwise throws NamespaceNotFound.
      */
     DatabaseType createDatabase(OperationContext* opCtx,
                                 StringData dbName,
-                                const ShardId& primaryShard);
-
-    /**
-     * Creates a ScopedLock on the database name in _namespaceSerializer. This is to prevent
-     * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same db.
-     */
-    NamespaceSerializer::ScopedLock serializeCreateOrDropDatabase(OperationContext* opCtx,
-                                                                  StringData dbName);
-
-    /**
-     * Creates the database if it does not exist, then marks its entry in config.databases as
-     * sharding-enabled.
-     *
-     * Throws DatabaseDifferCase if the database already exists with a different case.
-     */
-    void enableSharding(OperationContext* opCtx, StringData dbName, const ShardId& primaryShard);
-
-    /**
-     * Retrieves all databases for a shard.
-     *
-     * Returns a !OK status if an error occurs.
-     */
-    StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
-                                                              const ShardId& shardId);
+                                const boost::optional<ShardId>& optPrimaryShard,
+                                bool enableSharding);
 
     /**
      * Updates metadata in config.databases collection to show the given primary database on its
      * new shard.
      */
+    // TODO SERVER-54879 throw out this method once 5.0 becomes last-LTS
     Status commitMovePrimary(OperationContext* opCtx, const StringData nss, const ShardId& toShard);
 
     //
     // Collection Operations
     //
-
-    /**
-     * Drops the specified collection from the collection metadata store.
-     *
-     * Throws a DBException for any failures. These are some of the known failures:
-     *  - NamespaceNotFound - Collection does not exist
-     */
-    void dropCollection(OperationContext* opCtx, const NamespaceString& nss);
-
-    /**
-     * Ensures that a namespace that has received a dropCollection, but no longer has an entry in
-     * config.collections, has cleared all relevant metadata entries for the corresponding
-     * collection. As part of this, sends dropCollection and setShardVersion to all shards -- in
-     * case shards didn't receive these commands as part of the original dropCollection.
-     *
-     * This function does not guarantee that all shards will eventually receive setShardVersion,
-     * unless the client infinitely retries until hearing back success. This function does, however,
-     * increase the likelihood of shards having received setShardVersion.
-     */
-
-    void ensureDropCollectionCompleted(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Refines the shard key of an existing collection with namespace 'nss'. Here, 'shardKey'
@@ -393,14 +360,6 @@ public:
                                                       const CollectionType& coll,
                                                       const bool upsert,
                                                       TxnNumber txnNumber);
-
-    /**
-     * Creates a ScopedLock on the collection name in _namespaceSerializer. This is to prevent
-     * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same
-     * collection.
-     */
-    NamespaceSerializer::ScopedLock serializeCreateOrDropCollection(OperationContext* opCtx,
-                                                                    const NamespaceString& nss);
 
     //
     // Shard Operations
@@ -445,31 +404,40 @@ public:
     Status setFeatureCompatibilityVersionOnShards(OperationContext* opCtx, const BSONObj& cmdObj);
 
     /**
-     * Removes all entries from the config server's config.collections where 'dropped' is true.
+     * Patches-up persistent metadata for 5.0.
      *
-     * Before v5.0, when a collection was dropped, its entry in config.collections remained, tagged
-     * as 'dropped: true'. As those are no longer needed, this method cleans up the leftover
-     * metadata.
-     *
-     * It shall be called when upgrading to 4.9 or newer versions.
+     * It shall be called when upgrading to 5.0 or newer versions, when shards are in phase-1 of the
+     * setFCV protocol.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void removePre49LegacyMetadata(OperationContext* opCtx);
+    void upgradeMetadataFor50Phase1(OperationContext* opCtx);
 
     /**
-     * Creates a 'timestamp' for each one of the entries in the config server's config.collections,
-     * where 'timestamp' does not already exist.
+     * Patches-up persistent metadata for 5.0.
      *
-     * It shall be called when upgrading to 4.9.
+     * It shall be called when upgrading to 5.0 or newer versions, when shards are in phase-2 of the
+     * setFCV protocol.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void createCollectionTimestampsFor49(OperationContext* opCtx);
+    void upgradeMetadataFor50Phase2(OperationContext* opCtx);
 
     /**
-     * Downgrades the config.collections entries to prior 4.9 version. More specifically, it removes
-     * the 'timestamp' field from all the documents in config.collections.
+     * Patches-up persistent metadata for downgrade from 5.0.
      *
-     * It shall be called when downgrading from 4.9 to an earlier version.
+     * It shall be called when downgrading from 5.0 to an earlier version, when shards are in
+     * phase-1 of the setFCV protocol.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void downgradeConfigCollectionEntriesToPre49(OperationContext* opCtx);
+    void downgradeMetadataToPre50Phase1(OperationContext* opCtx);
+
+    /**
+     * Patches-up persistent metadata for downgrade from 5.0.
+     *
+     * It shall be called when downgrading from 5.0 to an earlier version, when shards are in
+     * phase-2 of the setFCV protocol.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void downgradeMetadataToPre50Phase2(OperationContext* opCtx);
 
     //
     // For Diagnostics
@@ -575,7 +543,7 @@ private:
      * Retrieve the full chunk description from the config.
      */
     StatusWith<ChunkType> _findChunkOnConfig(OperationContext* opCtx,
-                                             const NamespaceString& nss,
+                                             const NamespaceStringOrUUID& nsOrUUID,
                                              const BSONObj& key);
 
     /**
@@ -586,6 +554,70 @@ private:
                                                       const ReadPreferenceSetting& readPref,
                                                       const std::string& shardName,
                                                       const std::string& zoneName);
+
+    /**
+     * Removes all entries from the config server's config.collections where 'dropped' is true.
+     *
+     * Before 5.0, when a collection was dropped, its entry in config.collections remained, tagged
+     * as 'dropped: true'. As those are no longer needed, this method cleans up the leftover
+     * metadata.
+     *
+     * It shall be called when upgrading to 5.0 or newer versions.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has becomes last-lts.
+     */
+    void _removePre50LegacyMetadata(OperationContext* opCtx);
+
+    /**
+     * Creates a 'version.timestamp' for each one of the entries in the config server's
+     * config.databases where it didn't already exist before.
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _upgradeDatabasesEntriesTo50(OperationContext* opCtx);
+
+    /**
+     * Downgrades the config.databases entries to prior 4.9 version. More specifically, it removes
+     * the 'version.timestamp' field from all the documents in config.databases.
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _downgradeDatabasesEntriesToPre50(OperationContext* opCtx);
+
+    /**
+     * For each one of the entries in config.collections where there is no 'timestamp':
+     * - Patches-up the entries in config.chunks to set their 'collectionUUID' and 'timestamp'
+     * fields.
+     * - Creates a 'timestamp' in its entry in config.collections.
+     * , and builds the uuid_* indexes and drops the ns_* indexes on config.chunks.
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _upgradeCollectionsAndChunksEntriesTo50Phase1(OperationContext* opCtx);
+
+    /**
+     * Unsets the 'ns' field from all documents in config.chunks
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _upgradeCollectionsAndChunksEntriesTo50Phase2(OperationContext* opCtx);
+
+    /**
+     * For each one of the entries in config.collections where there is a 'timestamp':
+     * - Patches-up the entries in config.chunks to set their 'ns' field.
+     * - Unsets the 'timestamp' field from its entry in config.collections.
+     * , and builds the ns_* indexes and drops the uuid_* indexes on config.chunks.
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _downgradeCollectionsAndChunksEntriesToPre50Phase1(OperationContext* opCtx);
+
+    /**
+     * Unsets the 'collectionUUID' and 'timestamp' fields from all documents in config.chunks
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _downgradeCollectionsAndChunksEntriesToPre50Phase2(OperationContext* opCtx);
 
     // The owning service context
     ServiceContext* const _serviceContext;
@@ -606,9 +638,6 @@ private:
 
     Mutex _mutex = MONGO_MAKE_LATCH("ShardingCatalogManager::_mutex");
 
-    // True if shutDown() has been called. False, otherwise.
-    bool _inShutdown{false};  // (M)
-
     // True if startup() has been called.
     bool _started{false};  // (M)
 
@@ -620,13 +649,10 @@ private:
     // _kZoneOpLock
 
     /**
-     * Lock for shard zoning operations. This should be acquired when doing any operations that
-     * can affect the config.tags collection or the tags field of the config.shards collection.
-     * No other locks should be held when locking this. If an operation needs to take database
-     * locks (for example to write to a local collection) those locks should be taken after
-     * taking this.
+     * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
+     * requests).
      */
-    Lock::ResourceMutex _kZoneOpLock;
+    Lock::ResourceMutex _kShardMembershipLock;
 
     /**
      * Lock for chunk split/merge/move operations. This should be acquired when doing split/merge/
@@ -638,16 +664,13 @@ private:
     Lock::ResourceMutex _kChunkOpLock;
 
     /**
-     * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
-     * requests).
+     * Lock for shard zoning operations. This should be acquired when doing any operations that
+     * can affect the config.tags collection or the tags field of the config.shards collection.
+     * No other locks should be held when locking this. If an operation needs to take database
+     * locks (for example to write to a local collection) those locks should be taken after
+     * taking this.
      */
-    Lock::ResourceMutex _kShardMembershipLock;
-
-    /**
-     * Optimization for DDL operations, which might be tried concurrently by multiple threads.
-     * Avoids convoying and timeouts on the database/collection distributed lock.
-     */
-    NamespaceSerializer _namespaceSerializer;
+    Lock::ResourceMutex _kZoneOpLock;
 };
 
 }  // namespace mongo

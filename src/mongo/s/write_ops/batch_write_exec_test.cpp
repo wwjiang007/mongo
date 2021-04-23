@@ -37,6 +37,7 @@
 #include "mongo/db/vector_clock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/mock_ns_targeter.h"
 #include "mongo/s/session_catalog_router.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/stale_exception.h"
@@ -44,7 +45,6 @@
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/mock_ns_targeter.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -92,8 +92,10 @@ BSONObj expectInsertsReturnStaleVersionErrorsBase(const NamespaceString& nss,
         WriteErrorDetail* error = new WriteErrorDetail;
         error->setStatus({ErrorCodes::StaleShardVersion, ""});
         error->setErrInfo([&] {
-            StaleConfigInfo sci(
-                nss, ChunkVersion(1, 0, epoch), ChunkVersion(2, 0, epoch), ShardId(kShardName1));
+            StaleConfigInfo sci(nss,
+                                ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
+                                ChunkVersion(2, 0, epoch, boost::none /* timestamp */),
+                                ShardId(kShardName1));
             BSONObjBuilder builder;
             sci.serialize(&builder);
             return builder.obj();
@@ -278,7 +280,9 @@ public:
 
     MockNSTargeter singleShardNSTargeter{
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, OID::gen())),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, OID::gen(), boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << MAXKEY))}};
 };
@@ -289,9 +293,9 @@ public:
 
 TEST_F(BatchWriteExecTest, SingleOpUnordered) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -319,18 +323,18 @@ TEST_F(BatchWriteExecTest, SingleOpUnordered) {
 TEST_F(BatchWriteExecTest, SingleUpdateTargetsShardWithLet) {
     // Try to update the single doc where a let param is used in the shard key.
     const auto let = BSON("y" << 100);
-    const auto rtc = RuntimeConstants{Date_t::now(), Timestamp(1, 1)};
+    const auto rtc = LegacyRuntimeConstants{Date_t::now(), Timestamp(1, 1)};
     const auto q = BSON("x"
                         << "$$y");
     BatchedCommandRequest updateRequest([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
         updateOp.setLet(let);
-        updateOp.setRuntimeConstants(rtc);
+        updateOp.setLegacyRuntimeConstants(rtc);
         updateOp.setUpdates(std::vector{write_ops::UpdateOpEntry(
             q,
             write_ops::UpdateModification::parseFromClassicUpdate(BSON("Key"
@@ -347,17 +351,23 @@ TEST_F(BatchWriteExecTest, SingleUpdateTargetsShardWithLet) {
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -371,29 +381,31 @@ TEST_F(BatchWriteExecTest, SingleUpdateTargetsShardWithLet) {
     });
 
     // The update will hit the first shard.
-    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
-        ASSERT_EQ(kTestShardHost2, request.target);
+    onCommandForPoolExecutor(
+        [&](const RemoteCommandRequest& request) {
+            ASSERT_EQ(kTestShardHost2, request.target);
 
-        BatchedCommandResponse response;
-        response.setStatus(Status::OK());
-        response.setNModified(1);
+            BatchedCommandResponse response;
+            response.setStatus(Status::OK());
+            response.setNModified(1);
 
-        // Check that let params and runtimeConstants are propigated to shards.
-        const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
-        const auto actualBatchedUpdate(BatchedCommandRequest::parseUpdate(opMsgRequest));
-        ASSERT_BSONOBJ_EQ(let, actualBatchedUpdate.getLet().value_or(BSONObj()));
-        ASSERT_EQUALS(actualBatchedUpdate.getRuntimeConstants()->getLocalNow(), rtc.getLocalNow());
-        ASSERT_EQUALS(actualBatchedUpdate.getRuntimeConstants()->getClusterTime(),
-                      rtc.getClusterTime());
+            // Check that let params and runtimeConstants are propigated to shards.
+            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+            const auto actualBatchedUpdate(BatchedCommandRequest::parseUpdate(opMsgRequest));
+            ASSERT_BSONOBJ_EQ(let, actualBatchedUpdate.getLet().value_or(BSONObj()));
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getLocalNow(),
+                          rtc.getLocalNow());
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getClusterTime(),
+                          rtc.getClusterTime());
 
-        // Check that let params are only forwarded and not evaluated.
-        auto expectedQ = BSON("x"
-                              << "$$y");
-        for (auto&& u : actualBatchedUpdate.getUpdateRequest().getUpdates())
-            ASSERT_BSONOBJ_EQ(expectedQ, u.getQ());
+            // Check that let params are only forwarded and not evaluated.
+            auto expectedQ = BSON("x"
+                                  << "$$y");
+            for (auto&& u : actualBatchedUpdate.getUpdateRequest().getUpdates())
+                ASSERT_BSONOBJ_EQ(expectedQ, u.getQ());
 
-        return response.toBSON();
-    });
+            return response.toBSON();
+        });
 
     auto response = future.default_timed_get();
     ASSERT_OK(response.getTopLevelStatus());
@@ -403,18 +415,18 @@ TEST_F(BatchWriteExecTest, SingleUpdateTargetsShardWithLet) {
 TEST_F(BatchWriteExecTest, SingleDeleteTargetsShardWithLet) {
     // Try to update the single doc where a let param is used in the shard key.
     const auto let = BSON("y" << 100);
-    const auto rtc = RuntimeConstants{Date_t::now(), Timestamp(1, 1)};
+    const auto rtc = LegacyRuntimeConstants{Date_t::now(), Timestamp(1, 1)};
     const auto q = BSON("x"
                         << "$$y");
     BatchedCommandRequest deleteRequest([&] {
-        write_ops::Delete deleteOp(nss);
-        deleteOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::DeleteCommandRequest deleteOp(nss);
+        deleteOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
         deleteOp.setLet(let);
-        deleteOp.setRuntimeConstants(rtc);
+        deleteOp.setLegacyRuntimeConstants(rtc);
         deleteOp.setDeletes(std::vector{write_ops::DeleteOpEntry(q, false)});
         return deleteOp;
     }());
@@ -429,17 +441,23 @@ TEST_F(BatchWriteExecTest, SingleDeleteTargetsShardWithLet) {
     protected:
         std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -453,28 +471,30 @@ TEST_F(BatchWriteExecTest, SingleDeleteTargetsShardWithLet) {
     });
 
     // The update will hit the first shard.
-    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
-        ASSERT_EQ(kTestShardHost2, request.target);
+    onCommandForPoolExecutor(
+        [&](const RemoteCommandRequest& request) {
+            ASSERT_EQ(kTestShardHost2, request.target);
 
-        BatchedCommandResponse response;
-        response.setStatus(Status::OK());
+            BatchedCommandResponse response;
+            response.setStatus(Status::OK());
 
-        // Check that let params are propigated to shards.
-        const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
-        const auto actualBatchedUpdate(BatchedCommandRequest::parseDelete(opMsgRequest));
-        ASSERT_BSONOBJ_EQ(let, actualBatchedUpdate.getLet().value_or(BSONObj()));
-        ASSERT_EQUALS(actualBatchedUpdate.getRuntimeConstants()->getLocalNow(), rtc.getLocalNow());
-        ASSERT_EQUALS(actualBatchedUpdate.getRuntimeConstants()->getClusterTime(),
-                      rtc.getClusterTime());
+            // Check that let params are propigated to shards.
+            const auto opMsgRequest(OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj));
+            const auto actualBatchedUpdate(BatchedCommandRequest::parseDelete(opMsgRequest));
+            ASSERT_BSONOBJ_EQ(let, actualBatchedUpdate.getLet().value_or(BSONObj()));
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getLocalNow(),
+                          rtc.getLocalNow());
+            ASSERT_EQUALS(actualBatchedUpdate.getLegacyRuntimeConstants()->getClusterTime(),
+                          rtc.getClusterTime());
 
-        // Check that let params are only forwarded and not evaluated.
-        auto expectedQ = BSON("x"
-                              << "$$y");
-        for (auto&& u : actualBatchedUpdate.getDeleteRequest().getDeletes())
-            ASSERT_BSONOBJ_EQ(expectedQ, u.getQ());
+            // Check that let params are only forwarded and not evaluated.
+            auto expectedQ = BSON("x"
+                                  << "$$y");
+            for (auto&& u : actualBatchedUpdate.getDeleteRequest().getDeletes())
+                ASSERT_BSONOBJ_EQ(expectedQ, u.getQ());
 
-        return response.toBSON();
-    });
+            return response.toBSON();
+        });
 
     auto response = future.default_timed_get();
     ASSERT_OK(response.getTopLevelStatus());
@@ -491,9 +511,9 @@ TEST_F(BatchWriteExecTest, MultiOpLargeOrdered) {
     }
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -524,9 +544,9 @@ TEST_F(BatchWriteExecTest, SingleOpUnorderedError) {
     errResponse.setStatus({ErrorCodes::UnknownError, "mock error"});
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -565,9 +585,9 @@ TEST_F(BatchWriteExecTest, MultiOpLargeUnorderedWithStaleShardVersionError) {
     }
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -595,9 +615,9 @@ TEST_F(BatchWriteExecTest, MultiOpLargeUnorderedWithStaleShardVersionError) {
 
 TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrite) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -616,18 +636,26 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -661,11 +689,12 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -694,9 +723,9 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
 TEST_F(BatchWriteExecTest,
        RetryableErrorReturnedFromMultiWriteWithShard1AllOKShard2AllStaleShardVersion) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -721,18 +750,26 @@ TEST_F(BatchWriteExecTest,
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -766,11 +803,12 @@ TEST_F(BatchWriteExecTest,
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -782,11 +820,12 @@ TEST_F(BatchWriteExecTest,
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -814,9 +853,9 @@ TEST_F(BatchWriteExecTest,
 
 TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -841,18 +880,26 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -876,11 +923,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName1)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName1)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -902,11 +950,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -945,9 +994,9 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
 
 TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOKShard2FirstOK) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -972,18 +1021,26 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -1007,11 +1064,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName1)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName1)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -1033,11 +1091,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -1076,9 +1135,9 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
 
 TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1099,12 +1158,18 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
             if (targetAll) {
-                return std::vector<ShardEndpoint>{
-                    ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                    ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+                return std::vector{
+                    ShardEndpoint(kShardName1,
+                                  ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                  boost::none),
+                    ShardEndpoint(kShardName2,
+                                  ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                  boost::none)};
             } else {
-                return std::vector<ShardEndpoint>{
-                    ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+                return std::vector{
+                    ShardEndpoint(kShardName2,
+                                  ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                  boost::none)};
             }
         }
 
@@ -1113,10 +1178,14 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -1141,11 +1210,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName1)),
-                                 "Migration happened");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName1)),
+                    "Migration happened");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -1182,9 +1252,9 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
 
 TEST_F(BatchWriteExecTest, StaleShardOp) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1214,9 +1284,9 @@ TEST_F(BatchWriteExecTest, StaleShardOp) {
 
 TEST_F(BatchWriteExecTest, MultiStaleShardOp) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1252,9 +1322,9 @@ TEST_F(BatchWriteExecTest, TooManyStaleShardOp) {
     // singleShardNSTargeter doesn't report progress on refresh). We should report a no progress
     // error for everything in the batch.
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1287,9 +1357,9 @@ TEST_F(BatchWriteExecTest, TooManyStaleShardOp) {
 
 TEST_F(BatchWriteExecTest, StaleDbOp) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1319,9 +1389,9 @@ TEST_F(BatchWriteExecTest, StaleDbOp) {
 
 TEST_F(BatchWriteExecTest, MultiStaleDbOp) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1357,9 +1427,9 @@ TEST_F(BatchWriteExecTest, TooManyStaleDbOp) {
     // singleShardNSTargeter doesn't report progress on refresh). We should report a no progress
     // error for everything in the batch.
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1403,9 +1473,9 @@ TEST_F(BatchWriteExecTest, RetryableWritesLargeBatch) {
     }
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -1438,9 +1508,9 @@ TEST_F(BatchWriteExecTest, RetryableErrorNoTxnNumber) {
     // A retryable error without a txnNumber is not retried.
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -1477,9 +1547,9 @@ TEST_F(BatchWriteExecTest, RetryableErrorTxnNumber) {
     // A retryable error with a txnNumber is automatically retried.
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -1515,9 +1585,9 @@ TEST_F(BatchWriteExecTest, NonRetryableErrorTxnNumber) {
     // A non-retryable error with a txnNumber is not retried.
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -1557,9 +1627,9 @@ TEST_F(BatchWriteExecTest, StaleEpochIsNotRetryable) {
     // A StaleEpoch error is not retried.
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -1647,9 +1717,9 @@ public:
 
 TEST_F(BatchWriteExecTargeterErrorTest, TargetedFailedAndErrorResponse) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1668,18 +1738,26 @@ TEST_F(BatchWriteExecTargeterErrorTest, TargetedFailedAndErrorResponse) {
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -1785,9 +1863,9 @@ private:
 
 TEST_F(BatchWriteExecTransactionTargeterErrorTest, TargetedFailedAndErrorResponseInTransaction) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1806,18 +1884,26 @@ TEST_F(BatchWriteExecTransactionTargeterErrorTest, TargetedFailedAndErrorRespons
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -1926,9 +2012,9 @@ private:
 
 TEST_F(BatchWriteExecTransactionMultiShardTest, TargetedSucceededAndErrorResponseInTransaction) {
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -1947,18 +2033,26 @@ TEST_F(BatchWriteExecTransactionMultiShardTest, TargetedSucceededAndErrorRespons
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -2100,9 +2194,9 @@ private:
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_CommandError) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -2132,9 +2226,9 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_CommandError) {
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_WriteError) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -2162,9 +2256,9 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_WriteError) {
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_WriteErrorOrdered) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(true);
             return writeCommandBase;
         }());
@@ -2192,9 +2286,9 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_WriteErrorOrdered) {
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_TransientTxnError) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -2220,9 +2314,9 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_TransientTxnError) {
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_DispatchError) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());
@@ -2252,9 +2346,9 @@ TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_DispatchError) {
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchSets_TransientDispatchError) {
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase writeCommandBase;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase writeCommandBase;
             writeCommandBase.setOrdered(false);
             return writeCommandBase;
         }());

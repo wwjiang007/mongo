@@ -34,33 +34,35 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/db/repl/replication_coordinator.h"
 
 namespace mongo::sbe {
-IndexScanStage::IndexScanStage(const NamespaceStringOrUUID& name,
-                               std::string_view indexName,
+IndexScanStage::IndexScanStage(CollectionUUID collUuid,
+                               StringData indexName,
                                bool forward,
                                boost::optional<value::SlotId> recordSlot,
                                boost::optional<value::SlotId> recordIdSlot,
+                               boost::optional<value::SlotId> snapshotIdSlot,
                                IndexKeysInclusionSet indexKeysToInclude,
                                value::SlotVector vars,
                                boost::optional<value::SlotId> seekKeySlotLow,
                                boost::optional<value::SlotId> seekKeySlotHigh,
                                PlanYieldPolicy* yieldPolicy,
-                               TrialRunProgressTracker* tracker,
-                               PlanNodeId nodeId)
+                               PlanNodeId nodeId,
+                               LockAcquisitionCallback lockAcquisitionCallback)
     : PlanStage(seekKeySlotLow ? "ixseek"_sd : "ixscan"_sd, yieldPolicy, nodeId),
-      _name(name),
+      _collUuid(collUuid),
       _indexName(indexName),
       _forward(forward),
       _recordSlot(recordSlot),
       _recordIdSlot(recordIdSlot),
+      _snapshotIdSlot(snapshotIdSlot),
       _indexKeysToInclude(indexKeysToInclude),
       _vars(std::move(vars)),
       _seekKeySlotLow(seekKeySlotLow),
       _seekKeySlotHigh(seekKeySlotHigh),
-      _tracker(tracker) {
+      _lockAcquisitionCallback(std::move(lockAcquisitionCallback)) {
     // The valid state is when both boundaries, or none is set, or only low key is set.
     invariant((_seekKeySlotLow && _seekKeySlotHigh) || (!_seekKeySlotLow && !_seekKeySlotHigh) ||
               (_seekKeySlotLow && !_seekKeySlotHigh));
@@ -69,18 +71,19 @@ IndexScanStage::IndexScanStage(const NamespaceStringOrUUID& name,
 }
 
 std::unique_ptr<PlanStage> IndexScanStage::clone() const {
-    return std::make_unique<IndexScanStage>(_name,
+    return std::make_unique<IndexScanStage>(_collUuid,
                                             _indexName,
                                             _forward,
                                             _recordSlot,
                                             _recordIdSlot,
+                                            _snapshotIdSlot,
                                             _indexKeysToInclude,
                                             _vars,
                                             _seekKeySlotLow,
                                             _seekKeySlotHigh,
                                             _yieldPolicy,
-                                            _tracker,
-                                            _commonStats.nodeId);
+                                            _commonStats.nodeId,
+                                            _lockAcquisitionCallback);
 }
 
 void IndexScanStage::prepare(CompileCtx& ctx) {
@@ -90,6 +93,10 @@ void IndexScanStage::prepare(CompileCtx& ctx) {
 
     if (_recordIdSlot) {
         _recordIdAccessor = std::make_unique<value::ViewOfValueAccessor>();
+    }
+
+    if (_snapshotIdSlot) {
+        _snapshotIdAccessor = std::make_unique<value::OwnedValueAccessor>();
     }
 
     _accessors.resize(_vars.size());
@@ -104,6 +111,28 @@ void IndexScanStage::prepare(CompileCtx& ctx) {
     if (_seekKeySlotHigh) {
         _seekKeyHiAccessor = ctx.getAccessor(*_seekKeySlotHigh);
     }
+
+    std::tie(_collName, _catalogEpoch) =
+        acquireCollection(_opCtx, _collUuid, _lockAcquisitionCallback, _coll);
+
+    auto indexCatalog = _coll->getCollection()->getIndexCatalog();
+    auto indexDesc = indexCatalog->findIndexByName(_opCtx, _indexName);
+    tassert(4938500,
+            str::stream() << "could not find index named '" << _indexName << "' in collection '"
+                          << _collName << "'",
+            indexDesc);
+    _weakIndexCatalogEntry = indexCatalog->getEntryShared(indexDesc);
+    auto entry = _weakIndexCatalogEntry.lock();
+    tassert(4938503,
+            str::stream() << "expected IndexCatalogEntry for index named: " << _indexName,
+            static_cast<bool>(entry));
+    _ordering = entry->ordering();
+
+    if (_snapshotIdAccessor) {
+        _snapshotIdAccessor->reset(
+            value::TypeTags::NumberInt64,
+            value::bitcastFrom<uint64_t>(_opCtx->recoveryUnit()->getSnapshotId().toNumber()));
+    }
 }
 
 value::SlotAccessor* IndexScanStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -113,6 +142,10 @@ value::SlotAccessor* IndexScanStage::getAccessor(CompileCtx& ctx, value::SlotId 
 
     if (_recordIdSlot && *_recordIdSlot == slot) {
         return _recordIdAccessor.get();
+    }
+
+    if (_snapshotIdSlot && *_snapshotIdSlot == slot) {
+        return _snapshotIdAccessor.get();
     }
 
     if (auto it = _accessorMap.find(slot); it != _accessorMap.end()) {
@@ -129,6 +162,15 @@ void IndexScanStage::doSaveState() {
 
     _coll.reset();
 }
+
+void IndexScanStage::restoreCollectionAndIndex() {
+    restoreCollection(_opCtx, _collName, _collUuid, _catalogEpoch, _lockAcquisitionCallback, _coll);
+    auto indexCatalogEntry = _weakIndexCatalogEntry.lock();
+    uassert(ErrorCodes::QueryPlanKilled,
+            str::stream() << "query plan killed :: index '" << _indexName << "' dropped",
+            indexCatalogEntry && !indexCatalogEntry->isDropped());
+}
+
 void IndexScanStage::doRestoreState() {
     invariant(_opCtx);
     invariant(!_coll);
@@ -138,10 +180,7 @@ void IndexScanStage::doRestoreState() {
         return;
     }
 
-    _coll.emplace(_opCtx, _name);
-
-    uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-        _opCtx, _coll->getNss(), true));
+    restoreCollectionAndIndex();
 
     if (_cursor) {
         _cursor->restore();
@@ -153,90 +192,91 @@ void IndexScanStage::doDetachFromOperationContext() {
         _cursor->detachFromOperationContext();
     }
 }
-void IndexScanStage::doAttachFromOperationContext(OperationContext* opCtx) {
+
+void IndexScanStage::doAttachToOperationContext(OperationContext* opCtx) {
     if (_cursor) {
         _cursor->reattachToOperationContext(opCtx);
     }
 }
 
+void IndexScanStage::doDetachFromTrialRunTracker() {
+    _tracker = nullptr;
+}
+
+void IndexScanStage::doAttachToTrialRunTracker(TrialRunTracker* tracker) {
+    _tracker = tracker;
+}
+
 void IndexScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
-
     invariant(_opCtx);
-    if (!reOpen) {
-        invariant(!_cursor);
-        invariant(!_coll);
-        _coll.emplace(_opCtx, _name);
 
-        uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-            _opCtx, _coll->getNss(), true));
+    if (_open) {
+        tassert(5071006, "reopened IndexScanStage but reOpen=false", reOpen);
+        tassert(5071007, "IndexScanStage is open but _coll is not held", _coll);
+        tassert(5071008, "IndexScanStage is open but don't have _cursor", _cursor);
     } else {
-        invariant(_cursor);
-        invariant(_coll);
+        tassert(5071009, "first open to IndexScanStage but reOpen=true", !reOpen);
+        if (!_coll) {
+            // We're being opened after 'close()'. We need to re-acquire '_coll' in this case and
+            // make some validity checks (the collection has not been dropped, renamed, etc.).
+            tassert(5071010, "IndexScanStage is not open but have _cursor", !_cursor);
+            restoreCollectionAndIndex();
+        }
     }
 
     _open = true;
     _firstGetNext = true;
 
-    if (const auto& collection = _coll->getCollection()) {
-        auto indexCatalog = collection->getIndexCatalog();
-        auto indexDesc = indexCatalog->findIndexByName(_opCtx, _indexName);
-        if (indexDesc) {
-            _weakIndexCatalogEntry = indexCatalog->getEntryShared(indexDesc);
-        }
-
-        if (auto entry = _weakIndexCatalogEntry.lock()) {
-            if (!_cursor) {
-                _cursor =
-                    entry->accessMethod()->getSortedDataInterface()->newCursor(_opCtx, _forward);
-            }
-
-            if (_seekKeyLowAccessor && _seekKeyHiAccessor) {
-                auto [tagLow, valLow] = _seekKeyLowAccessor->getViewOfValue();
-                const auto msgTagLow = tagLow;
-                uassert(4822851,
-                        str::stream() << "seek key is wrong type: " << msgTagLow,
-                        tagLow == value::TypeTags::ksValue);
-                _seekKeyLow = value::getKeyStringView(valLow);
-
-                auto [tagHi, valHi] = _seekKeyHiAccessor->getViewOfValue();
-                const auto msgTagHi = tagHi;
-                uassert(4822852,
-                        str::stream() << "seek key is wrong type: " << msgTagHi,
-                        tagHi == value::TypeTags::ksValue);
-                _seekKeyHi = value::getKeyStringView(valHi);
-            } else if (_seekKeyLowAccessor) {
-                auto [tagLow, valLow] = _seekKeyLowAccessor->getViewOfValue();
-                const auto msgTagLow = tagLow;
-                uassert(4822853,
-                        str::stream() << "seek key is wrong type: " << msgTagLow,
-                        tagLow == value::TypeTags::ksValue);
-                _seekKeyLow = value::getKeyStringView(valLow);
-                _seekKeyHi = nullptr;
-            } else {
-                auto sdi = entry->accessMethod()->getSortedDataInterface();
-                KeyString::Builder kb(sdi->getKeyStringVersion(),
-                                      sdi->getOrdering(),
-                                      KeyString::Discriminator::kExclusiveBefore);
-                kb.appendDiscriminator(KeyString::Discriminator::kExclusiveBefore);
-                _startPoint = kb.getValueCopy();
-
-                _seekKeyLow = &_startPoint;
-                _seekKeyHi = nullptr;
-            }
-
-            // TODO SERVER-49385: When the 'prepare()' phase takes the collection lock, it will be
-            // possible to intialize '_ordering' there instead of here.
-            _ordering = entry->ordering();
-        } else {
-            _cursor.reset();
-        }
-    } else {
-        _cursor.reset();
+    auto entry = _weakIndexCatalogEntry.lock();
+    tassert(4938502,
+            str::stream() << "expected IndexCatalogEntry for index named: " << _indexName,
+            static_cast<bool>(entry));
+    if (!_cursor) {
+        _cursor = entry->accessMethod()->getSortedDataInterface()->newCursor(_opCtx, _forward);
     }
+
+    if (_seekKeyLowAccessor && _seekKeyHiAccessor) {
+        auto [tagLow, valLow] = _seekKeyLowAccessor->getViewOfValue();
+        const auto msgTagLow = tagLow;
+        uassert(4822851,
+                str::stream() << "seek key is wrong type: " << msgTagLow,
+                tagLow == value::TypeTags::ksValue);
+        _seekKeyLow = value::getKeyStringView(valLow);
+
+        auto [tagHi, valHi] = _seekKeyHiAccessor->getViewOfValue();
+        const auto msgTagHi = tagHi;
+        uassert(4822852,
+                str::stream() << "seek key is wrong type: " << msgTagHi,
+                tagHi == value::TypeTags::ksValue);
+        _seekKeyHi = value::getKeyStringView(valHi);
+    } else if (_seekKeyLowAccessor) {
+        auto [tagLow, valLow] = _seekKeyLowAccessor->getViewOfValue();
+        const auto msgTagLow = tagLow;
+        uassert(4822853,
+                str::stream() << "seek key is wrong type: " << msgTagLow,
+                tagLow == value::TypeTags::ksValue);
+        _seekKeyLow = value::getKeyStringView(valLow);
+        _seekKeyHi = nullptr;
+    } else {
+        auto sdi = entry->accessMethod()->getSortedDataInterface();
+        KeyString::Builder kb(sdi->getKeyStringVersion(),
+                              sdi->getOrdering(),
+                              KeyString::Discriminator::kExclusiveBefore);
+        kb.appendDiscriminator(KeyString::Discriminator::kExclusiveBefore);
+        _startPoint = kb.getValueCopy();
+
+        _seekKeyLow = &_startPoint;
+        _seekKeyHi = nullptr;
+    }
+    ++_specificStats.seeks;
 }
 
 PlanState IndexScanStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (!_cursor) {
         return trackPlanState(PlanState::IS_EOF);
     }
@@ -275,7 +315,7 @@ PlanState IndexScanStage::getNext() {
 
     if (_recordIdAccessor) {
         _recordIdAccessor->reset(value::TypeTags::RecordId,
-                                 value::bitcastFrom<int64_t>(_nextRecord->loc.repr()));
+                                 value::bitcastFrom<int64_t>(_nextRecord->loc.getLong()));
     }
 
     if (_accessors.size()) {
@@ -284,7 +324,7 @@ PlanState IndexScanStage::getNext() {
             _nextRecord->keyString, *_ordering, &_valuesBuffer, &_accessors, _indexKeysToInclude);
     }
 
-    if (_tracker && _tracker->trackProgress<TrialRunProgressTracker::kNumReads>(1)) {
+    if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumReads>(1)) {
         // If we're collecting execution stats during multi-planning and reached the end of the
         // trial period (trackProgress() will return 'true' in this case), then we can reset the
         // tracker. Note that a trial period is executed only once per a PlanStge tree, and once
@@ -296,6 +336,8 @@ PlanState IndexScanStage::getNext() {
 }
 
 void IndexScanStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 
     _cursor.reset();
@@ -309,19 +351,22 @@ std::unique_ptr<PlanStageStats> IndexScanStage::getStats(bool includeDebugInfo) 
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("numReads", _specificStats.numReads);
-        bob.appendNumber("seeks", _specificStats.seeks);
+        bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
+        bob.appendNumber("seeks", static_cast<long long>(_specificStats.seeks));
         if (_recordSlot) {
-            bob.appendIntOrLL("recordSlot", *_recordSlot);
+            bob.appendNumber("recordSlot", static_cast<long long>(*_recordSlot));
         }
         if (_recordIdSlot) {
-            bob.appendIntOrLL("recordIdSlot", *_recordIdSlot);
+            bob.appendNumber("recordIdSlot", static_cast<long long>(*_recordIdSlot));
+        }
+        if (_snapshotIdSlot) {
+            bob.appendNumber("snapshotIdSlot", static_cast<long long>(*_snapshotIdSlot));
         }
         if (_seekKeySlotLow) {
-            bob.appendIntOrLL("seekKeySlotLow", *_seekKeySlotLow);
+            bob.appendNumber("seekKeySlotLow", static_cast<long long>(*_seekKeySlotLow));
         }
         if (_seekKeySlotHigh) {
-            bob.appendIntOrLL("seekKeySlotHigh", *_seekKeySlotHigh);
+            bob.appendNumber("seekKeySlotHigh", static_cast<long long>(*_seekKeySlotHigh));
         }
         bob.append("outputSlots", _vars);
         bob.append("indexKeysToInclude", _indexKeysToInclude.to_string());
@@ -339,18 +384,30 @@ std::vector<DebugPrinter::Block> IndexScanStage::debugPrint() const {
     auto ret = PlanStage::debugPrint();
 
     if (_seekKeySlotLow) {
-
         DebugPrinter::addIdentifier(ret, _seekKeySlotLow.get());
         if (_seekKeySlotHigh) {
             DebugPrinter::addIdentifier(ret, _seekKeySlotHigh.get());
+        } else {
+            DebugPrinter::addIdentifier(ret, DebugPrinter::kNoneKeyword);
         }
     }
+
     if (_recordSlot) {
         DebugPrinter::addIdentifier(ret, _recordSlot.get());
+    } else {
+        DebugPrinter::addIdentifier(ret, DebugPrinter::kNoneKeyword);
     }
 
     if (_recordIdSlot) {
         DebugPrinter::addIdentifier(ret, _recordIdSlot.get());
+    } else {
+        DebugPrinter::addIdentifier(ret, DebugPrinter::kNoneKeyword);
+    }
+
+    if (_snapshotIdSlot) {
+        DebugPrinter::addIdentifier(ret, _snapshotIdSlot.get());
+    } else {
+        DebugPrinter::addIdentifier(ret, DebugPrinter::kNoneKeyword);
     }
 
     ret.emplace_back(DebugPrinter::Block("[`"));
@@ -370,7 +427,7 @@ std::vector<DebugPrinter::Block> IndexScanStage::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block("`]"));
 
     ret.emplace_back("@\"`");
-    DebugPrinter::addIdentifier(ret, _name.toString());
+    DebugPrinter::addIdentifier(ret, _collUuid.toString());
     ret.emplace_back("`\"");
 
     ret.emplace_back("@\"`");

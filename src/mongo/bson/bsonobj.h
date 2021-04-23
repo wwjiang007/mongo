@@ -49,6 +49,7 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/shared_buffer.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -128,8 +129,6 @@ public:
         // Little endian ordering here, but that is ok regardless as BSON is spec'd to be
         // little endian external to the system. (i.e. the rest of the implementation of
         // bson, not this part, fails to support big endian)
-        static const char kEmptyObjectPrototype[] = {/*size*/ kMinBSONLength, 0, 0, 0, /*eoo*/ 0};
-
         _objdata = kEmptyObjectPrototype;
     }
 
@@ -312,7 +311,7 @@ public:
      * replaced.
      */
     BSONObj addFields(const BSONObj& from,
-                      const boost::optional<std::set<std::string>>& fields = boost::none) const;
+                      const boost::optional<StringDataSet>& fields = boost::none) const;
 
     /** remove specified field and return a new object with the remaining fields.
         slowish as builds a full new object
@@ -323,6 +322,7 @@ public:
      * Remove specified fields and return a new object with the remaining fields.
      */
     BSONObj removeFields(const std::set<std::string>& fields) const;
+    BSONObj removeFields(const StringDataSet& fields) const;
 
     /** returns # of top level fields in the object
        note: iterates to count the fields
@@ -448,6 +448,13 @@ public:
     /** @return true if object is empty -- i.e.,  {} */
     bool isEmpty() const {
         return objsize() <= kMinBSONLength;
+    }
+
+    /*
+     * Whether this BSONObj is the "empty prototype" special case.
+     */
+    bool isEmptyPrototype() const {
+        return _objdata == kEmptyObjectPrototype;
     }
 
     /** Alternative output format */
@@ -624,6 +631,8 @@ public:
     }
 
 private:
+    static constexpr char kEmptyObjectPrototype[] = {/*size*/ kMinBSONLength, 0, 0, 0, /*eoo*/ 0};
+
     template <typename Generator>
     BSONObj _jsonStringGenerator(const Generator& g,
                                  int pretty,
@@ -848,8 +857,14 @@ public:
 
     BSONElement next() {
         verify(_fields);
-        if (_cur < _nfields)
-            return BSONElement(_fields[_cur++]);
+        if (_cur < _nfields) {
+            const auto& element = _fields[_cur++];
+            return BSONElement(element.fieldName.rawData() - 1,  // Include type byte
+                               element.fieldName.size() + 1,     // Add null terminator
+                               element.totalSize,
+                               BSONElement::CachedSizeTag{});
+        }
+
         return BSONElement();
     }
 
@@ -859,7 +874,11 @@ protected:
 
 private:
     const int _nfields;
-    const std::unique_ptr<const char*[]> _fields;
+    struct Field {
+        StringData fieldName;
+        int totalSize;
+    };
+    const std::unique_ptr<Field[]> _fields;
     int _cur;
 };
 

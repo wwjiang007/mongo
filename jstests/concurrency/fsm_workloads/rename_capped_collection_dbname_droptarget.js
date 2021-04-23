@@ -7,7 +7,9 @@
  * command against it, specifying a different database name in the namespace.
  * Inserts documents into the "to" namespace and specifies dropTarget=true.
  *
- * @tags: [requires_capped]
+ * @tags: [
+ *   requires_capped,
+ * ]
  */
 
 var $config = (function() {

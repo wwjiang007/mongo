@@ -73,15 +73,16 @@ TEST(BatchedCommandRequest, InsertWithShardVersion) {
 
         ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest().getNamespace().ns());
         ASSERT(insertRequest.hasShardVersion());
-        ASSERT_EQ(ChunkVersion(1, 2, epoch).toString(), insertRequest.getShardVersion().toString());
+        ASSERT_EQ(ChunkVersion(1, 2, epoch, boost::none /* timestamp */).toString(),
+                  insertRequest.getShardVersion().toString());
     }
 }
 
 TEST(BatchedCommandRequest, InsertCloneWithIds) {
     BatchedCommandRequest batchedRequest([&] {
-        write_ops::Insert insertOp(NamespaceString("xyz.abc"));
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(NamespaceString("xyz.abc"));
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(true);
             wcb.setBypassDocumentValidation(true);
             return wcb;
@@ -94,8 +95,8 @@ TEST(BatchedCommandRequest, InsertCloneWithIds) {
     const auto clonedRequest(BatchedCommandRequest::cloneInsertWithIds(std::move(batchedRequest)));
 
     ASSERT_EQ("xyz.abc", clonedRequest.getNS().ns());
-    ASSERT(clonedRequest.getWriteCommandBase().getOrdered());
-    ASSERT(clonedRequest.getWriteCommandBase().getBypassDocumentValidation());
+    ASSERT(clonedRequest.getWriteCommandRequestBase().getOrdered());
+    ASSERT(clonedRequest.getWriteCommandRequestBase().getBypassDocumentValidation());
     ASSERT_BSONOBJ_EQ(BSON("w" << 2), clonedRequest.getWriteConcern());
 
     const auto& insertDocs = clonedRequest.getInsertRequest().getDocuments();

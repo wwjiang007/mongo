@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2020 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -844,6 +844,22 @@ transaction_ops(WT_SESSION *session_arg)
         error_check(
           session->commit_transaction(session, "commit_timestamp=2b,durable_timestamp=2b"));
         /*! [transaction prepare] */
+    }
+
+    {
+        /*! [reset snapshot] */
+        /*
+         * Resets snapshots for snapshot isolation transactions to update their existing snapshot.
+         * It raises an error when this API is used for isolation other than snapshot isolation
+         * mode.
+         */
+        error_check(session->open_cursor(session, "table:mytable", NULL, NULL, &cursor));
+        error_check(session->begin_transaction(session, "isolation=snapshot"));
+        cursor->set_key(cursor, "some-key");
+        error_check(cursor->search(cursor));
+        error_check(session->reset_snapshot(session));
+        error_check(session->commit_transaction(session, NULL));
+        /*! [reset snapshot] */
     }
 
     /*! [session isolation configuration] */

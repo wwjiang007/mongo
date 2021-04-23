@@ -41,6 +41,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_key_util.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_database.h"
@@ -53,6 +54,7 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
+// TODO (SERVER-54879): Remove this command entirely after 5.0 branches
 namespace mongo {
 namespace {
 
@@ -83,7 +85,7 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
             !nss.isSystem() || nss == NamespaceString::kLogicalSessionsNamespace ||
-                nss.isTemporaryReshardingCollection());
+                nss.isTemporaryReshardingCollection() || nss.isTimeseriesBucketsCollection());
 
     // Ensure numInitialChunks is within valid bounds.
     // Cannot have more than 8192 initial chunks per shard. Setting a maximum of 1,000,000
@@ -99,9 +101,6 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
             numChunks >= 0 && numChunks <= maxNumInitialChunksForShards &&
                 numChunks <= maxNumInitialChunksTotal);
 
-    // TODO (SERVER-48639): As of 4.7, this check is also performed on the shard itself, under the
-    // critical section, so the code below should be removed when 5.0 becomes last-lts.
-    //
     // Ensure the collation is valid. Currently we only allow the simple collation.
     bool simpleCollationSpecified = false;
     if (request->getCollation()) {
@@ -241,6 +240,9 @@ public:
         auto request = ConfigsvrShardCollectionRequest::parse(
             IDLParserErrorContext("ConfigsvrShardCollectionRequest"), cmdObj);
 
+        audit::logShardCollection(
+            opCtx->getClient(), nss.ns(), request.getKey(), request.getUnique());
+
         auto const catalogManager = ShardingCatalogManager::get(opCtx);
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
@@ -248,10 +250,10 @@ public:
 
         // Make the distlocks boost::optional so that they can be released by being reset below.
         boost::optional<DistLockManager::ScopedDistLock> dbDistLock(
-            uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            uassertStatusOK(DistLockManager::get(opCtx)->lock(
                 opCtx, nss.db(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
         boost::optional<DistLockManager::ScopedDistLock> collDistLock(
-            uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            uassertStatusOK(DistLockManager::get(opCtx)->lock(
                 opCtx, nss.ns(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
 
         // Ensure sharding is allowed on the database.
@@ -269,8 +271,7 @@ public:
         auto proposedKey(request.getKey().getOwned());
         ShardKeyPattern shardKeyPattern(proposedKey);
 
-        std::vector<ShardId> shardIds;
-        shardRegistry->getAllShardIds(opCtx, &shardIds);
+        auto shardIds = shardRegistry->getAllShardIds(opCtx);
         uassert(ErrorCodes::IllegalOperation,
                 "cannot shard collections before there are shards",
                 !shardIds.empty());
@@ -303,6 +304,9 @@ public:
         // make a connection to the real primary shard for this database.
         const auto primaryShardId = [&] {
             if (nss.db() == NamespaceString::kConfigDb) {
+                // Many tests assume that the primary shard for configDb will be the shard
+                // with the first ID in ascending lexical order
+                std::sort(shardIds.begin(), shardIds.end());
                 return shardIds[0];
             } else {
                 return dbType.getPrimary();

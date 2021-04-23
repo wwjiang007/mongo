@@ -2,9 +2,6 @@ t = db.geo_s2index;
 t.drop();
 
 // We internally drop adjacent duplicate points in lines.
-// @tags: [
-//   sbe_incompatible,
-// ]
 someline = {
     "type": "LineString",
     "coordinates": [[40, 5], [40, 5], [40, 5], [41, 6], [41, 6]]
@@ -143,6 +140,9 @@ res = t.createIndex({loc: "2dsphere"}, {finestIndexedLevel: 30, coarsestIndexedL
 assert.commandWorked(res);
 // Ensure the index actually works at a basic level
 assert.neq(null, t.findOne({loc: {$geoNear: {$geometry: {type: 'Point', coordinates: [0, 0]}}}}));
+let created = t.getIndexes().filter((idx) => idx.hasOwnProperty("2dsphereIndexVersion"))[0];
+assert.eq(created.finestIndexedLevel, 30, created);
+assert.eq(created.coarsestIndexedLevel, 0, created);
 
 t.drop();
 t.save({loc: [0, 0]});

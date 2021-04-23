@@ -45,6 +45,8 @@
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
@@ -57,8 +59,6 @@
 
 namespace mongo {
 namespace {
-
-using namespace unittest;
 
 /**
  * RAII type for operating at a timestamp. Will remove any timestamping when the object destructs.
@@ -85,17 +85,15 @@ private:
 
 class ReshardingOplogFetcherTest : public ShardServerTestFixture {
 public:
-    OperationContext* _opCtx;
-    ServiceContext* _svcCtx;
-    UUID _reshardingUUID = UUID::gen();
-    Timestamp _fetchTimestamp;
-    ShardId _donorShard;
-    ShardId _destinationShard;
-
-    void setUp() {
+    void setUp() override {
         ShardServerTestFixture::setUp();
         _opCtx = operationContext();
         _svcCtx = _opCtx->getServiceContext();
+
+        // Initialize ReshardingMetrics to a recipient state compatible with fetching.
+        _metrics = std::make_unique<ReshardingMetrics>(_svcCtx);
+        _metrics->onStart();
+        _metrics->setRecipientState(RecipientStateEnum::kCloning);
 
         for (const auto& shardId : kTwoShardIdList) {
             auto shardTargeter = RemoteCommandTargeterMock::get(
@@ -104,7 +102,7 @@ public:
             shardTargeter->setFindHostReturnValue(makeHostAndPort(shardId));
         }
 
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+        WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 
         // onStepUp() relies on the storage interface to create the config.transactions table.
         repl::StorageInterface::set(getServiceContext(),
@@ -117,9 +115,13 @@ public:
         _destinationShard = kTwoShardIdList[1];
     }
 
-    void tearDown() {
+    void tearDown() override {
         WaitForMajorityService::get(getServiceContext()).shutDown();
         ShardServerTestFixture::tearDown();
+    }
+
+    auto makeFetcherEnv() {
+        return std::make_unique<ReshardingOplogFetcher::Env>(_svcCtx, &*_metrics);
     }
 
     /**
@@ -128,13 +130,11 @@ public:
      * ShardRegistry reload is done over DBClient, not the NetworkInterface, and there is no
      * DBClientMock analogous to the NetworkInterfaceMock.
      */
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() {
 
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
-            StaticCatalogClient(std::vector<ShardId> shardIds)
-                : ShardingCatalogClientMock(nullptr), _shardIds(std::move(shardIds)) {}
+            StaticCatalogClient(std::vector<ShardId> shardIds) : _shardIds(std::move(shardIds)) {}
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
                 OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -214,7 +214,10 @@ public:
             if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
                 ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
             }
-            invariant(dbRaii.getDb()->createCollection(_opCtx, nss));
+
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(_opCtx);
+            ASSERT(dbRaii.getDb()->createCollection(_opCtx, nss));
             wunit.commit();
         });
     }
@@ -255,7 +258,6 @@ public:
                     ShardId destinedRecipient) {
         create(outputCollectionNss);
         create(dataCollectionNss);
-
         _fetchTimestamp = repl::StorageInterface::get(_svcCtx)->getLatestOplogTimestamp(_opCtx);
 
         AutoGetCollection dataColl(_opCtx, dataCollectionNss, LockMode::MODE_IX);
@@ -287,9 +289,7 @@ public:
                 dataColl.getCollection()->uuid(),
                 BSON("msg" << fmt::format("Writes to {} are temporarily blocked for resharding.",
                                           dataColl.getCollection()->ns().toString())),
-                BSON("type"
-                     << "reshardFinalOp"
-                     << "reshardingUUID" << _reshardingUUID),
+                BSON("type" << kReshardFinalOpLogType << "reshardingUUID" << _reshardingUUID),
                 boost::none,
                 boost::none,
                 boost::none,
@@ -305,8 +305,36 @@ public:
                                 << "off"));
     }
 
+    long long metricsFetchedCount() const {
+        BSONObjBuilder bob;
+        _metrics->serializeCurrentOpMetrics(&bob,
+                                            ReshardingMetrics::ReporterOptions::Role::kRecipient);
+        return bob.obj()["oplogEntriesFetched"_sd].Long();
+    }
+
+    CancelableOperationContextFactory makeCancelableOpCtx() {
+        auto cancelableOpCtxExecutor = std::make_shared<ThreadPool>([] {
+            ThreadPool::Options options;
+            options.poolName = "TestReshardOplogFetcherCancelableOpCtxPool";
+            options.minThreads = 1;
+            options.maxThreads = 1;
+            return options;
+        }());
+
+        return CancelableOperationContextFactory(operationContext()->getCancellationToken(),
+                                                 cancelableOpCtxExecutor);
+    }
+
 protected:
     const std::vector<ShardId> kTwoShardIdList{{"s1"}, {"s2"}};
+
+    OperationContext* _opCtx;
+    ServiceContext* _svcCtx;
+    UUID _reshardingUUID = UUID::gen();
+    Timestamp _fetchTimestamp;
+    ShardId _donorShard;
+    ShardId _destinationShard;
+    std::unique_ptr<ReshardingMetrics> _metrics;
 
 private:
     static HostAndPort makeHostAndPort(const ShardId& shardId) {
@@ -323,23 +351,25 @@ TEST_F(ReshardingOplogFetcherTest, TestBasic) {
     AutoGetCollection dataColl(_opCtx, dataCollectionNss, LockMode::MODE_IX);
     auto fetcherJob = launchAsync([&, this] {
         ThreadClient tc("RefetchRunner", _svcCtx, nullptr);
-        ReshardingOplogFetcher fetcher(_reshardingUUID,
+        ReshardingOplogFetcher fetcher(makeFetcherEnv(),
+                                       _reshardingUUID,
                                        dataColl->uuid(),
                                        {_fetchTimestamp, _fetchTimestamp},
                                        _donorShard,
                                        _destinationShard,
-                                       true,
                                        outputCollectionNss);
         fetcher.useReadConcernForTest(false);
         fetcher.setInitialBatchSizeForTest(2);
 
-        fetcher.iterate(&cc());
+        auto factory = makeCancelableOpCtx();
+        fetcher.iterate(&cc(), factory);
     });
 
     requestPassthroughHandler(fetcherJob);
 
     // Five oplog entries for resharding + the sentinel final oplog entry.
     ASSERT_EQ(6, itcount(outputCollectionNss));
+    ASSERT_EQ(6, metricsFetchedCount()) << " Verify reported metrics";
 }
 
 TEST_F(ReshardingOplogFetcherTest, TestTrackLastSeen) {
@@ -354,18 +384,19 @@ TEST_F(ReshardingOplogFetcherTest, TestTrackLastSeen) {
     auto fetcherJob = launchAsync([&, this] {
         ThreadClient tc("RefetcherRunner", _svcCtx, nullptr);
 
-        ReshardingOplogFetcher fetcher(_reshardingUUID,
+        ReshardingOplogFetcher fetcher(makeFetcherEnv(),
+                                       _reshardingUUID,
                                        dataColl->uuid(),
                                        {_fetchTimestamp, _fetchTimestamp},
                                        _donorShard,
                                        _destinationShard,
-                                       true,
                                        outputCollectionNss);
         fetcher.useReadConcernForTest(false);
         fetcher.setInitialBatchSizeForTest(2);
         fetcher.setMaxBatchesForTest(maxBatches);
 
-        fetcher.iterate(&cc());
+        auto factory = makeCancelableOpCtx();
+        fetcher.iterate(&cc(), factory);
         return fetcher.getLastSeenTimestamp();
     });
 
@@ -373,6 +404,7 @@ TEST_F(ReshardingOplogFetcherTest, TestTrackLastSeen) {
 
     // Two oplog entries due to the batch size.
     ASSERT_EQ(2, itcount(outputCollectionNss));
+    ASSERT_EQ(2, metricsFetchedCount()) << " Verify reported metrics";
     // Assert the lastSeen value has been bumped from the original `_fetchTimestamp`.
     ASSERT_GT(lastSeen.getTs(), _fetchTimestamp);
 }
@@ -389,19 +421,20 @@ TEST_F(ReshardingOplogFetcherTest, TestFallingOffOplog) {
         ThreadClient tc("RefetcherRunner", _svcCtx, nullptr);
 
         const Timestamp doesNotExist(1, 1);
-        ReshardingOplogFetcher fetcher(_reshardingUUID,
+        ReshardingOplogFetcher fetcher(makeFetcherEnv(),
+                                       _reshardingUUID,
                                        dataColl->uuid(),
                                        {doesNotExist, doesNotExist},
                                        _donorShard,
                                        _destinationShard,
-                                       true,
                                        outputCollectionNss);
         fetcher.useReadConcernForTest(false);
 
         // Status has a private default constructor so we wrap it in a boost::optional to placate
         // the Windows compiler.
         try {
-            fetcher.iterate(&cc());
+            auto factory = makeCancelableOpCtx();
+            fetcher.iterate(&cc(), factory);
             // Test failure case.
             return boost::optional<Status>(Status::OK());
         } catch (...) {
@@ -414,6 +447,81 @@ TEST_F(ReshardingOplogFetcherTest, TestFallingOffOplog) {
     // Two oplog entries due to the batch size.
     ASSERT_EQ(0, itcount(outputCollectionNss));
     ASSERT_EQ(ErrorCodes::OplogQueryMinTsMissing, fetcherStatus->code());
+}
+
+TEST_F(ReshardingOplogFetcherTest, TestAwaitInsert) {
+    const NamespaceString outputCollectionNss("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+
+    create(outputCollectionNss);
+    create(dataCollectionNss);
+    _fetchTimestamp = repl::StorageInterface::get(_svcCtx)->getLatestOplogTimestamp(_opCtx);
+
+    const auto& collectionUUID = [&] {
+        AutoGetCollection dataColl(_opCtx, dataCollectionNss, LockMode::MODE_IX);
+        return dataColl->uuid();
+    }();
+
+    ReshardingDonorOplogId startAt{_fetchTimestamp, _fetchTimestamp};
+    ReshardingOplogFetcher fetcher(makeFetcherEnv(),
+                                   _reshardingUUID,
+                                   collectionUUID,
+                                   startAt,
+                                   _donorShard,
+                                   _destinationShard,
+                                   outputCollectionNss);
+
+    // The ReshardingOplogFetcher hasn't inserted a record for
+    // {_id: {clusterTime: _fetchTimestamp, ts: _fetchTimestamp}} so awaitInsert(startAt) won't be
+    // immediately ready.
+    auto hasSeenStartAtFuture = fetcher.awaitInsert(startAt);
+    ASSERT_FALSE(hasSeenStartAtFuture.isReady());
+
+    // iterate() won't lead to any documents being inserted into the output collection (because no
+    // writes have happened to the data collection) so `hasSeenStartAtFuture` still won't be ready.
+    auto fetcherJob = launchAsync([&, this] {
+        ThreadClient tc("RunnerForFetcher", _svcCtx, nullptr);
+        fetcher.useReadConcernForTest(false);
+        fetcher.setInitialBatchSizeForTest(2);
+        auto factory = makeCancelableOpCtx();
+        return fetcher.iterate(&cc(), factory);
+    });
+    ASSERT_TRUE(requestPassthroughHandler(fetcherJob));
+    ASSERT_FALSE(hasSeenStartAtFuture.isReady());
+
+    // Insert a document into the data collection and have it generate an oplog entry with a
+    // "destinedRecipient" field. Only after iterate() is called again and inserts a record into the
+    // output collection will `hasSeenStartAtFuture` have become ready.
+    auto dataWriteTimestamp = [&] {
+        FailPointEnableBlock fp("addDestinedRecipient",
+                                BSON("destinedRecipient" << _destinationShard.toString()));
+
+        AutoGetCollection dataColl(_opCtx, dataCollectionNss, LockMode::MODE_IX);
+        WriteUnitOfWork wuow(_opCtx);
+        insertDocument(dataColl.getCollection(), InsertStatement(BSON("_id" << 1 << "a" << 1)));
+        wuow.commit();
+
+        repl::StorageInterface::get(_opCtx)->waitForAllEarlierOplogWritesToBeVisible(_opCtx);
+        return repl::StorageInterface::get(_svcCtx)->getLatestOplogTimestamp(_opCtx);
+    }();
+    ASSERT_FALSE(hasSeenStartAtFuture.isReady());
+
+    fetcherJob = launchAsync([&, this] {
+        ThreadClient tc("RunnerForFetcher", _svcCtx, nullptr);
+        fetcher.useReadConcernForTest(false);
+        fetcher.setInitialBatchSizeForTest(2);
+        auto factory = makeCancelableOpCtx();
+        return fetcher.iterate(&cc(), factory);
+    });
+    ASSERT_TRUE(requestPassthroughHandler(fetcherJob));
+    ASSERT_TRUE(hasSeenStartAtFuture.isReady());
+
+    // Asking for `startAt` again would return an immediately ready future.
+    ASSERT_TRUE(fetcher.awaitInsert(startAt).isReady());
+
+    // However, asking for `dataWriteTimestamp` wouldn't become ready until the next record is
+    // insert into the output collection.
+    ASSERT_FALSE(fetcher.awaitInsert({dataWriteTimestamp, dataWriteTimestamp}).isReady());
 }
 
 }  // namespace

@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/persistent_task_store.h"
@@ -36,6 +37,7 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
@@ -57,7 +59,7 @@ public:
 
     void setUp() override {
         ShardServerTestFixture::setUp();
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+        WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
         // Set up replication coordinator to be primary and have no replication delay.
         auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext());
         replCoord->setCanAcceptNonLocalWrites(true);
@@ -69,8 +71,12 @@ public:
         });
         repl::ReplicationCoordinator::set(getServiceContext(), std::move(replCoord));
 
-        DBDirectClient client(operationContext());
-        client.createCollection(kNss.ns());
+        {
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(operationContext());
+            uassertStatusOK(createCollection(
+                operationContext(), kNss.db().toString(), BSON("create" << kNss.coll())));
+        }
 
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IX);
         _uuid = autoColl.getCollection()->uuid();
@@ -96,11 +102,13 @@ public:
             nullptr,
             false,
             epoch,
+            boost::none /* timestamp */,
+            boost::none /* timeseriesFields */,
             boost::none,
             true,
             {ChunkType{kNss,
                        ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
-                       ChunkVersion(1, 0, epoch),
+                       ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
                        ShardId("dummyShardId")}});
 
         AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);

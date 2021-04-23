@@ -208,6 +208,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
     // hostManager role actions that target the cluster resource
     hostManagerRoleClusterActions
         << ActionType::applicationMessage  // clusterManager gets this also
+        << ActionType::auditConfigure
         << ActionType::connPoolSync
         << ActionType::dropConnections
         << ActionType::logRotate
@@ -247,6 +248,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::flushRouterConfig  // hostManager gets this also
         << ActionType::cleanupOrphaned
         << ActionType::getDefaultRWConcern // clusterMonitor gets this also
+        << ActionType::runTenantMigration
         << ActionType::setDefaultRWConcern
         << ActionType::setFeatureCompatibilityVersion
         << ActionType::setFreeMonitoring;
@@ -257,9 +259,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::moveChunk
         << ActionType::enableSharding
         << ActionType::splitVector
-        << ActionType::refineCollectionShardKey;
-
-    return Status::OK();
+        << ActionType::refineCollectionShardKey
+        << ActionType::reshardCollection;
 }
 // clang-format on
 
@@ -311,6 +312,7 @@ void addEnableShardingPrivileges(PrivilegeVector* privileges) {
     ActionSet enableShardingActions;
     enableShardingActions.addAction(ActionType::enableSharding);
     enableShardingActions.addAction(ActionType::refineCollectionShardKey);
+    enableShardingActions.addAction(ActionType::reshardCollection);
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), enableShardingActions));
 }
@@ -394,6 +396,8 @@ void addDbAdminAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forCollectionName("system.profile"), profileActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::applyOps));
 }
 
 void addClusterMonitorPrivileges(PrivilegeVector* privileges) {

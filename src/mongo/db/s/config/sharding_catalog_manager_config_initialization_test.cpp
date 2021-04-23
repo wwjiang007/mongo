@@ -41,12 +41,13 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
+#include "mongo/db/s/type_lockpings.h"
+#include "mongo/db/s/type_locks.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_config_version.h"
-#include "mongo/s/catalog/type_lockpings.h"
-#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
@@ -64,10 +65,13 @@ void assertBSONObjsSame(const std::vector<BSONObj>& expectedBSON,
                         const std::vector<BSONObj>& foundBSON) {
     ASSERT_EQUALS(expectedBSON.size(), foundBSON.size());
 
+    auto flags =
+        BSONObj::ComparisonRules::kIgnoreFieldOrder | BSONObj::ComparisonRules::kConsiderFieldName;
+
     for (const auto& expectedObj : expectedBSON) {
         bool wasFound = false;
         for (const auto& foundObj : foundBSON) {
-            if (expectedObj.woCompare(foundObj) == 0) {
+            if (expectedObj.woCompare(foundObj, {}, flags) == 0) {
                 wasFound = true;
                 break;
             }
@@ -283,16 +287,35 @@ TEST_F(ConfigInitializationTest, BuildsNecessaryIndexes) {
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
                   ->initializeConfigDatabaseIfNeeded(operationContext()));
 
-    auto expectedChunksIndexes = std::vector<BSONObj>{
-        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"),
-        BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "min" << 1) << "name"
-                 << "ns_1_min_1"),
-        BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "shard" << 1 << "min" << 1)
-                 << "name"
-                 << "ns_1_shard_1_min_1"),
-        BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "lastmod" << 1) << "name"
-                 << "ns_1_lastmod_1")};
+    std::vector<BSONObj> expectedChunksIndexes;
+    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        expectedChunksIndexes = std::vector<BSONObj>{
+            BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                     << "_id_"),
+            BSON("v" << 2 << "key" << BSON("uuid" << 1 << "min" << 1) << "name"
+                     << "uuid_1_min_1"
+                     << "unique" << true),
+            BSON("v" << 2 << "key" << BSON("uuid" << 1 << "shard" << 1 << "min" << 1) << "name"
+                     << "uuid_1_shard_1_min_1"
+                     << "unique" << true),
+            BSON("v" << 2 << "key" << BSON("uuid" << 1 << "lastmod" << 1) << "name"
+                     << "uuid_1_lastmod_1"
+                     << "unique" << true)};
+    } else {
+        expectedChunksIndexes = std::vector<BSONObj>{
+            BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                     << "_id_"),
+            BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "min" << 1) << "name"
+                     << "ns_1_min_1"),
+            BSON("v" << 2 << "unique" << true << "key"
+                     << BSON("ns" << 1 << "shard" << 1 << "min" << 1) << "name"
+                     << "ns_1_shard_1_min_1"),
+            BSON("v" << 2 << "unique" << true << "key" << BSON("ns" << 1 << "lastmod" << 1)
+                     << "name"
+                     << "ns_1_lastmod_1")};
+    }
+
     auto expectedLockpingsIndexes =
         std::vector<BSONObj>{BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
                                       << "_id_"),
@@ -336,7 +359,8 @@ TEST_F(ConfigInitializationTest, BuildsNecessaryIndexes) {
 
 TEST_F(ConfigInitializationTest, CompatibleIndexAlreadyExists) {
     getConfigShard()
-        ->createIndexOnConfig(operationContext(), ShardType::ConfigNS, BSON("host" << 1), true)
+        ->createIndexOnConfig(
+            operationContext(), ShardType::ConfigNS, BSON("host" << 1), /*unique*/ true)
         .transitional_ignore();
 
     ASSERT_OK(ShardingCatalogManager::get(operationContext())
@@ -357,10 +381,11 @@ TEST_F(ConfigInitializationTest, IncompatibleIndexAlreadyExists) {
     // Make the index non-unique even though its supposed to be unique, make sure initialization
     // fails
     getConfigShard()
-        ->createIndexOnConfig(operationContext(), ShardType::ConfigNS, BSON("host" << 1), false)
+        ->createIndexOnConfig(
+            operationContext(), ShardType::ConfigNS, BSON("host" << 1), /*unique*/ false)
         .transitional_ignore();
 
-    ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
+    ASSERT_EQUALS(ErrorCodes::IndexKeySpecsConflict,
                   ShardingCatalogManager::get(operationContext())
                       ->initializeConfigDatabaseIfNeeded(operationContext()));
 }

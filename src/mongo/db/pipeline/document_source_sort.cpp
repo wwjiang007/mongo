@@ -57,18 +57,15 @@ using std::vector;
 constexpr StringData DocumentSourceSort::kStageName;
 
 DocumentSourceSort::DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-                                       const BSONObj& sortOrder,
+                                       const SortPattern& sortOrder,
                                        uint64_t limit,
                                        uint64_t maxMemoryUsageBytes)
     : DocumentSource(kStageName, pExpCtx),
-      _sortExecutor({{sortOrder, pExpCtx},
-                     limit,
-                     maxMemoryUsageBytes,
-                     pExpCtx->tempDir,
-                     pExpCtx->allowDiskUse}),
+      _sortExecutor(
+          {sortOrder, limit, maxMemoryUsageBytes, pExpCtx->tempDir, pExpCtx->allowDiskUse}),
       // The SortKeyGenerator expects the expressions to be serialized in order to detect a sort
       // by a metadata field.
-      _sortKeyGen({{sortOrder, pExpCtx}, pExpCtx->getCollator()}) {
+      _sortKeyGen({sortOrder, pExpCtx->getCollator()}) {
     uassert(15976,
             "$sort stage must have at least one sort key",
             !_sortExecutor->sortPattern().empty());
@@ -76,7 +73,8 @@ DocumentSourceSort::DocumentSourceSort(const boost::intrusive_ptr<ExpressionCont
 
 REGISTER_DOCUMENT_SOURCE(sort,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceSort::createFromBson);
+                         DocumentSourceSort::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
     if (!_populated) {
@@ -97,15 +95,9 @@ DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
 void DocumentSourceSort::serializeToArray(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
     uint64_t limit = _sortExecutor->getLimit();
-    if (explain) {  // always one Value for combined $sort + $limit
-        array.push_back(Value(DOC(
-            kStageName << DOC("sortKey"
-                              << _sortExecutor->sortPattern().serialize(
-                                     SortPattern::SortKeySerialization::kForExplain)
-                              << "limit"
-                              << (_sortExecutor->hasLimit() ? Value(static_cast<long long>(limit))
-                                                            : Value())))));
-    } else {  // one Value for $sort and maybe a Value for $limit
+
+
+    if (!explain) {  // one Value for $sort and maybe a Value for $limit
         MutableDocument inner(_sortExecutor->sortPattern().serialize(
             SortPattern::SortKeySerialization::kForPipelineSerialization));
         array.push_back(Value(DOC(kStageName << inner.freeze())));
@@ -114,7 +106,26 @@ void DocumentSourceSort::serializeToArray(
             auto limitSrc = DocumentSourceLimit::create(pExpCtx, limit);
             limitSrc->serializeToArray(array);
         }
+        return;
     }
+
+    MutableDocument mutDoc(
+        DOC(kStageName << DOC("sortKey"
+                              << _sortExecutor->sortPattern().serialize(
+                                     SortPattern::SortKeySerialization::kForExplain)
+                              << "limit"
+                              << (_sortExecutor->hasLimit() ? Value(static_cast<long long>(limit))
+                                                            : Value()))));
+
+    if (explain >= ExplainOptions::Verbosity::kExecStats) {
+        auto& stats = _sortExecutor->stats();
+
+        mutDoc["totalDataSizeSortedBytesEstimate"] =
+            Value(static_cast<long long>(stats.totalDataSizeBytes));
+        mutDoc["usedDisk"] = Value(stats.spills > 0 ? true : false);
+    }
+
+    array.push_back(Value(mutDoc.freeze()));
 }
 
 boost::optional<long long> DocumentSourceSort::getLimit() const {
@@ -184,14 +195,14 @@ intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
 
 intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx,
-    BSONObj sortOrder,
+    const SortPattern& sortOrder,
     uint64_t limit,
     boost::optional<uint64_t> maxMemoryUsageBytes) {
     auto resolvedMaxBytes = maxMemoryUsageBytes
         ? *maxMemoryUsageBytes
         : internalQueryMaxBlockingSortMemoryUsageBytes.load();
     intrusive_ptr<DocumentSourceSort> pSort(
-        new DocumentSourceSort(pExpCtx, sortOrder.getOwned(), limit, resolvedMaxBytes));
+        new DocumentSourceSort(pExpCtx, sortOrder, limit, resolvedMaxBytes));
     return pSort;
 }
 

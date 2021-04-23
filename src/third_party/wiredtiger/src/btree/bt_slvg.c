@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -1877,8 +1877,7 @@ __slvg_row_build_leaf(WT_SESSION_IMPL *session, WT_TRACK *trk, WT_REF *ref, WT_S
             ++skip_start;
         }
     if (F_ISSET(trk, WT_TRACK_CHECK_STOP))
-        WT_ROW_FOREACH_REVERSE(page, rip, i)
-        {
+        WT_ROW_FOREACH_REVERSE (page, rip, i) {
             WT_ERR(__wt_row_leaf_key(session, page, rip, key, false));
 
             /*

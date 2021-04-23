@@ -79,7 +79,7 @@ public:
     std::vector<ChunkType> makeChunks(const NamespaceString& nss,
                                       const OID epoch,
                                       std::vector<std::pair<ChunkRange, ShardId>> chunkInfos) {
-        ChunkVersion version(1, 0, epoch);
+        ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
         std::vector<ChunkType> chunks;
         for (auto&& pair : chunkInfos) {
             chunks.emplace_back(nss, pair.first, version, pair.second);
@@ -97,14 +97,7 @@ public:
 
         // Mock the expected config server queries.
         expectGetDatabase(nss);
-        expectGetCollection(nss, epoch, UUID::gen(), shardKey);
-        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-            std::vector<BSONObj> response;
-            for (auto&& chunk : chunkDistribution) {
-                response.push_back(chunk.toConfigBSON());
-            }
-            return response;
-        }());
+        expectCollectionAndChunksAggregation(nss, epoch, UUID::gen(), shardKey, chunkDistribution);
 
         const auto cm = future.default_timed_get();
         ASSERT(cm->isSharded());

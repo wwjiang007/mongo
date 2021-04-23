@@ -1,17 +1,18 @@
 /**
  * Tests that resource consumption metrics are reported in the profiler.
  *
- *  @tags: [
- *    requires_capped,
- *    requires_fcv_47,
- *    requires_replication,
- *    requires_wiredtiger,
- *  ]
+ * @tags: [
+ *   requires_capped,
+ *   requires_fcv_47,
+ *   requires_replication,
+ *   requires_wiredtiger,
+ * ]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/fixture_helpers.js");  // For isReplSet().
+load("jstests/core/timeseries/libs/timeseries.js");
 
 const dbName = jsTestName();
 const collName = 'coll';
@@ -34,11 +35,13 @@ const assertMetricsExist = (profilerEntry) => {
     assert.gte(metrics.docUnitsReturned, 0);
     assert.gte(metrics.cursorSeeks, 0);
 
-    // Every test should perform enough work to be measured as non-zero CPU activity in
-    // nanoseconds.
+    // Even though every test should perform enough work to be measured as non-zero CPU activity in
+    // nanoseconds, the OS is only required to return monotonically-increasing values. That means
+    // the OS may occasionally return the same CPU time between two different reads of the timer,
+    // resulting in the server calculating zero elapsed time.
     // The CPU time metrics are only collected on Linux.
     if (isLinux) {
-        assert.gt(metrics.cpuNanos, 0);
+        assert.gte(metrics.cpuNanos, 0);
     }
     assert.gte(metrics.docBytesWritten, 0);
     assert.gte(metrics.docUnitsWritten, 0);
@@ -121,6 +124,7 @@ const operations = [
             assert.gt(profileDoc.cursorSeeks, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -143,6 +147,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -164,6 +169,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -196,6 +202,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     {
@@ -217,6 +224,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     {
@@ -238,6 +246,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     {
@@ -259,10 +268,11 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
-        name: 'findAndModify',
+        name: 'findAndModifyUpdate',
         command: (db) => {
             assert(db[collName].findAndModify({query: {_id: 1}, update: {$set: {a: 1}}}));
         },
@@ -290,6 +300,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     {
@@ -321,6 +332,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -339,6 +351,7 @@ const operations = [
             assert.eq(profileDoc.docBytesWritten, 0);
             assert.eq(profileDoc.idxEntryBytesWritten, 0);
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -360,6 +373,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     // Clear the profile collection so we can easily identify new operations with similar filters as
@@ -381,6 +395,7 @@ const operations = [
             assert.eq(profileDoc.docBytesWritten, 0);
             assert.eq(profileDoc.idxEntryBytesWritten, 0);
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -401,6 +416,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -422,6 +438,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -455,6 +472,38 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
+        }
+    },
+    resetProfileColl,
+    {
+        name: 'findAndModifyRemove',
+        command: (db) => {
+            assert.commandWorked(db[collName].insert({_id: 3, a: 0}));
+            assert(db[collName].findAndModify({query: {_id: 3}, remove: true}));
+        },
+        profileFilter: {op: 'command', 'command.findandmodify': collName},
+        profileAssert: (db, profileDoc) => {
+            // Should read exactly as many bytes are in the document. Debug builds may perform extra
+            // reads of the _mdb_catalog.
+            if (!isDebugBuild(db)) {
+                assert.eq(profileDoc.docBytesRead, 29);
+                assert.eq(profileDoc.docUnitsRead, 1);
+                assert.eq(profileDoc.cursorSeeks, 3);
+            } else {
+                assert.gte(profileDoc.docBytesRead, 29);
+                assert.gte(profileDoc.docUnitsRead, 1);
+                assert.gte(profileDoc.cursorSeeks, 3);
+            }
+            assert.eq(profileDoc.idxEntryBytesRead, 3);
+            assert.eq(profileDoc.idxEntryUnitsRead, 1);
+            assert.eq(profileDoc.docBytesWritten, 29);
+            assert.eq(profileDoc.docUnitsWritten, 1);
+            assert.eq(profileDoc.idxEntryBytesWritten, 3);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 1);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     {
@@ -482,6 +531,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 1);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -507,6 +557,7 @@ const operations = [
             assert.eq(profileDoc.docUnitsWritten, 1);
             assert.eq(profileDoc.idxEntryBytesWritten, 3);
             assert.eq(profileDoc.idxEntryUnitsWritten, 1);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -528,6 +579,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -555,6 +607,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 5);
         }
     },
     resetProfileColl,
@@ -578,6 +631,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 150);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 10);
         }
     },
     {
@@ -602,6 +656,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -626,6 +681,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -654,6 +710,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 1);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -691,6 +748,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -734,6 +792,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -770,6 +829,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -795,6 +855,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 1);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -817,6 +878,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     resetProfileColl,
@@ -849,6 +911,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         }
     },
     {
@@ -875,6 +938,7 @@ const operations = [
             assert.eq(profileDoc.docUnitsWritten, 1);
             assert.eq(profileDoc.idxEntryBytesWritten, 0);
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -903,6 +967,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 1);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -930,6 +995,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 100);
             assert.eq(profileDoc.keysSorted, 0);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     {
@@ -953,6 +1019,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 100);
         },
     },
     resetProfileColl,
@@ -976,6 +1043,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 100);
         },
     },
     {
@@ -997,6 +1065,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 100);
         },
     },
     resetProfileColl,
@@ -1019,6 +1088,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 1);
         },
     },
     resetProfileColl,
@@ -1041,6 +1111,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 5);
         },
     },
     resetProfileColl,
@@ -1075,6 +1146,7 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 101);
+            assert.eq(profileDoc.docUnitsReturned, 100);
         },
     },
     resetProfileColl,
@@ -1109,6 +1181,7 @@ const operations = [
                 assert.eq(profileDoc.keysSorted, 0);
                 assert.eq(profileDoc.sorterSpills, 0);
             }
+            assert.eq(profileDoc.docUnitsReturned, 10);
         },
     },
     resetProfileColl,
@@ -1132,6 +1205,56 @@ const operations = [
             assert.eq(profileDoc.idxEntryUnitsWritten, 0);
             assert.eq(profileDoc.keysSorted, 100);
             assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 10);
+        },
+    },
+    resetProfileColl,
+    {
+        name: '$out',
+        command: (db) => {
+            db[collName].aggregate([{$out: {db: db.getName(), coll: 'outColl'}}]);
+        },
+        profileFilter: {'command.aggregate': collName},
+        profileAssert: (db, profileDoc) => {
+            // Creating a new collection writes to the durable catalog
+            assert.gte(profileDoc.docBytesRead, 29 * 100);
+            assert.gte(profileDoc.docUnitsRead, 100);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.gte(profileDoc.cursorSeeks, 0);
+            assert.gte(profileDoc.docBytesWritten, 29 * 100);
+            assert.gte(profileDoc.docUnitsWritten, 100);
+            // The key size varies from 2 to 3 bytes.
+            assert.gte(profileDoc.idxEntryBytesWritten, 2 * 100);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 100);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
+        },
+    },
+    resetProfileColl,
+    {
+        name: '$merge',
+        command: (db) => {
+            db['outColl'].drop();
+            db[collName].aggregate([{$merge: {into: 'outColl'}}]);
+        },
+        profileFilter: {'command.aggregate': collName},
+        profileAssert: (db, profileDoc) => {
+            // Creating a new collection writes to the durable catalog
+            assert.gte(profileDoc.docBytesRead, 29 * 100);
+            assert.gte(profileDoc.docUnitsRead, 100);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.gte(profileDoc.cursorSeeks, 0);
+            assert.gte(profileDoc.docBytesWritten, 29 * 100);
+            assert.gte(profileDoc.docUnitsWritten, 100);
+            // The key size varies from 2 to 3 bytes.
+            assert.gte(profileDoc.idxEntryBytesWritten, 2 * 100);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 100);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         },
     },
     {
@@ -1153,6 +1276,7 @@ const operations = [
             assert.eq(profileDoc.docUnitsWritten, 1);
             assert.eq(profileDoc.idxEntryBytesWritten, 2);
             assert.eq(profileDoc.idxEntryUnitsWritten, 1);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -1177,6 +1301,7 @@ const operations = [
             assert.eq(profileDoc.docUnitsWritten, 9);
             assert.eq(profileDoc.idxEntryBytesWritten, 27);
             assert.eq(profileDoc.idxEntryUnitsWritten, 9);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -1189,17 +1314,16 @@ const operations = [
         profileFilter: {op: 'insert', 'command.insert': 'capped'},
         profileAssert: (db, profileDoc) => {
             if (!isDebugBuild(db)) {
-                // Should read exactly as many bytes as are in the document that is being deleted.
+                // Capped deletes will read two documents. The first is the document to be deleted
+                // and the next is to cache the RecordId of the next document.
                 // Debug builds may perform extra reads of the _mdb_catalog.
-                assert.eq(profileDoc.docBytesRead, 29);
-                assert.eq(profileDoc.docUnitsRead, 1);
-                // The first time doing a capped delete, we don't know what the _cappedFirstRecord
-                // should be so we cannot seek to it.
-                assert.eq(profileDoc.cursorSeeks, 0);
+                assert.eq(profileDoc.docBytesRead, 58);
+                assert.eq(profileDoc.docUnitsRead, 2);
+                assert.eq(profileDoc.cursorSeeks, 1);
             } else {
-                assert.gte(profileDoc.docBytesRead, 29);
-                assert.gte(profileDoc.docUnitsRead, 1);
-                assert.gte(profileDoc.cursorSeeks, 0);
+                assert.gte(profileDoc.docBytesRead, 58);
+                assert.gte(profileDoc.docUnitsRead, 2);
+                assert.gte(profileDoc.cursorSeeks, 1);
             }
             assert.eq(profileDoc.idxEntryBytesRead, 0);
             assert.eq(profileDoc.idxEntryUnitsRead, 0);
@@ -1207,6 +1331,7 @@ const operations = [
             assert.eq(profileDoc.docUnitsWritten, 2);
             assert.eq(profileDoc.idxEntryBytesWritten, 5);
             assert.eq(profileDoc.idxEntryUnitsWritten, 2);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
     },
     resetProfileColl,
@@ -1224,17 +1349,15 @@ const operations = [
         profileFilter: {op: 'insert', 'command.insert': 'capped'},
         profileAssert: (db, profileDoc) => {
             if (!isDebugBuild(db)) {
-                // Should read exactly as many bytes as are in the documents that are being deleted.
+                // Capped deletes will read two documents. The first is the document to be deleted
+                // and the next is to cache the RecordId of the next document.
                 // Debug builds may perform extra reads of the _mdb_catalog.
-                assert.eq(profileDoc.docBytesRead, 261);
-                assert.eq(profileDoc.docUnitsRead, 9);
-                // Each capped delete seeks twice if it knows what record to start at. Once at the
-                // start of the delete process and then once again to reposition itself at the first
-                // record to delete after it figures out how many documents must be deleted.
+                assert.eq(profileDoc.docBytesRead, 522);
+                assert.eq(profileDoc.docUnitsRead, 18);
                 assert.eq(profileDoc.cursorSeeks, 18);
             } else {
-                assert.gte(profileDoc.docBytesRead, 261);
-                assert.gte(profileDoc.docUnitsRead, 9);
+                assert.gte(profileDoc.docBytesRead, 522);
+                assert.gte(profileDoc.docUnitsRead, 18);
                 assert.gte(profileDoc.cursorSeeks, 18);
             }
             assert.eq(profileDoc.idxEntryBytesRead, 0);
@@ -1243,11 +1366,164 @@ const operations = [
             assert.eq(profileDoc.docUnitsWritten, 18);
             assert.eq(profileDoc.idxEntryBytesWritten, 54);
             assert.eq(profileDoc.idxEntryUnitsWritten, 18);
+            assert.eq(profileDoc.docUnitsReturned, 0);
         }
-    }
+    },
+    resetProfileColl,
+    {
+        name: 'createTimeseries',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            assert.commandWorked(
+                db.createCollection('ts', {timeseries: {timeField: 't', metaField: 'host'}}));
+        },
+        profileFilter: {op: 'command', 'command.create': 'ts'},
+        profileAssert: (db, profileDoc) => {
+            // The size of the collection document in the _mdb_catalog may not be the same every
+            // test run, so only assert this is non-zero.
+            assert.gt(profileDoc.docBytesRead, 0);
+            assert.gt(profileDoc.docUnitsRead, 0);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.gte(profileDoc.docBytesWritten, 0);
+            assert.gte(profileDoc.docUnitsWritten, 0);
+            assert.gte(profileDoc.idxEntryBytesWritten, 0);
+            assert.gte(profileDoc.idxEntryUnitsWritten, 0);
+            assert.gt(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    {
+        name: 'insertTimeseriesNewBucketOrdered',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            // Inserts a document that creates a new bucket.
+            assert.commandWorked(db.ts.insert({t: new Date(), host: 0}, {ordered: true}));
+        },
+        profileFilter: {op: 'insert', 'command.insert': 'ts', 'command.ordered': true},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 0);
+            assert.eq(profileDoc.docUnitsRead, 0);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 194);
+            assert.eq(profileDoc.docUnitsWritten, 2);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    {
+        name: 'insertTimeseriesNewBucketUnordered',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            // Inserts a document that creates a new bucket.
+            assert.commandWorked(db.ts.insert({t: new Date(), host: 1}, {ordered: false}));
+        },
+        profileFilter: {op: 'insert', 'command.insert': 'ts', 'command.ordered': false},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 0);
+            assert.eq(profileDoc.docUnitsRead, 0);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 194);
+            assert.eq(profileDoc.docUnitsWritten, 2);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    resetProfileColl,
+    {
+        name: 'timeseriesUpdateBucketOrdered',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            // Inserts a document by updating an existing bucket.
+            assert.commandWorked(db.ts.insert({t: new Date(), host: 0}, {ordered: true}));
+        },
+        profileFilter: {op: 'insert', 'command.insert': 'ts', 'command.ordered': true},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 194);
+            assert.eq(profileDoc.docUnitsRead, 2);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 220);
+            assert.eq(profileDoc.docUnitsWritten, 2);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 2);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    {
+        name: 'timeseriesUpdateBucketUnordered',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            // Inserts a document by updating an existing bucket.
+            assert.commandWorked(db.ts.insert({t: new Date(), host: 1}, {ordered: false}));
+        },
+        profileFilter: {op: 'insert', 'command.insert': 'ts', 'command.ordered': false},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 194);
+            assert.eq(profileDoc.docUnitsRead, 2);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 220);
+            assert.eq(profileDoc.docUnitsWritten, 2);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 2);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
+    {
+        name: 'timeseriesQuery',
+        skipTest: (db) => {
+            return !TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo());
+        },
+        command: (db) => {
+            assert.eq(4, db.ts.find().itcount());
+        },
+        profileFilter: {op: 'query', 'command.find': 'ts'},
+        profileAssert: (db, profileDoc) => {
+            assert.eq(profileDoc.docBytesRead, 110 * 4);
+            assert.eq(profileDoc.docUnitsRead, 4);
+            assert.eq(profileDoc.idxEntryBytesRead, 0);
+            assert.eq(profileDoc.idxEntryUnitsRead, 0);
+            assert.eq(profileDoc.docBytesWritten, 0);
+            assert.eq(profileDoc.docUnitsWritten, 0);
+            assert.eq(profileDoc.idxEntryBytesWritten, 0);
+            assert.eq(profileDoc.idxEntryUnitsWritten, 0);
+            assert.eq(profileDoc.cursorSeeks, 0);
+            assert.eq(profileDoc.keysSorted, 0);
+            assert.eq(profileDoc.sorterSpills, 0);
+        }
+    },
 ];
 
 const testOperation = (db, operation) => {
+    if (operation.skipTest && operation.skipTest(db)) {
+        jsTestLog("skipping test case: " + operation.name);
+        return;
+    }
+
     jsTestLog("Testing operation: " + operation.name);
     operation.command(db);
     if (!operation.profileFilter) {
@@ -1271,9 +1547,9 @@ const testOperation = (db, operation) => {
             ", second entry: " + tojson(cursor.next());
     });
 
-    assertMetricsExist(entry);
     if (operation.profileAssert) {
         try {
+            assertMetricsExist(entry);
             operation.profileAssert(db, entry.operationMetrics);
         } catch (e) {
             print("Caught exception while checking profile entry for '" + operation.name +
@@ -1284,7 +1560,7 @@ const testOperation = (db, operation) => {
 };
 
 const setParams = {
-    measureOperationResourceConsumption: true
+    profileOperationResourceConsumptionMetrics: true
 };
 
 const runTest = (db) => {

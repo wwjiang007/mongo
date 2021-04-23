@@ -368,8 +368,14 @@ void ThreadPool::Impl::schedule(Task task) {
 
 void ThreadPool::Impl::waitForIdle() {
     stdx::unique_lock<Latch> lk(_mutex);
-    // True when there are no `_pendingTasks` and all `_threads` are idle.
-    auto isIdle = [this] { return _pendingTasks.empty() && _numIdleThreads >= _threads.size(); };
+    // True when there are no `_pendingTasks` and all `_threads` are idle, or when the ThreadPool
+    // has been shutdown but not yet joined. As mentioned in the header, if waitForIdle() is called
+    // before shutdown(), there is no guarantee that there will still be no pending tasks when the
+    // function returns.
+    auto isIdle = [this] {
+        return (_pendingTasks.empty() && _numIdleThreads >= _threads.size()) ||
+            _state == joinRequired;
+    };
     _poolIsIdle.wait(lk, isIdle);
 }
 
@@ -515,9 +521,16 @@ void ThreadPool::Impl::_doOneTask(stdx::unique_lock<Latch>* lk) noexcept {
     Task task = std::move(_pendingTasks.front());
     _pendingTasks.pop_front();
     --_numIdleThreads;
+
     lk->unlock();
+    // Run the task outside of the lock. Note that if the task throws, the task destructor will run
+    // outside of the lock before the exception hits the noexcept boundary.
     task(Status::OK());
+
+    // Reset the task and run the dtor before we reacquire the lock.
+    task = {};
     lk->lock();
+
     ++_numIdleThreads;
     if (_pendingTasks.empty() && _threads.size() == _numIdleThreads) {
         _poolIsIdle.notify_all();

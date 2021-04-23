@@ -36,6 +36,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/operation_id.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
@@ -45,6 +46,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
@@ -55,7 +57,6 @@
 
 namespace mongo {
 
-class Client;
 class CurOp;
 class ProgressMeter;
 class ServiceContext;
@@ -94,7 +95,14 @@ class OperationContext : public Interruptible, public Decorable<OperationContext
     OperationContext& operator=(const OperationContext&) = delete;
 
 public:
+    static constexpr auto kDefaultOperationContextTimeoutError = ErrorCodes::ExceededTimeLimit;
+
+    /**
+     * Creates an op context with no unique operation ID tracking - prefer using the OperationIdSlot
+     * CTOR if possible to avoid OperationId collisions.
+     */
     OperationContext(Client* client, OperationId opId);
+    OperationContext(Client* client, OperationIdSlot&& opIdSlot);
     virtual ~OperationContext();
 
     bool shouldParticipateInFlowControl() const {
@@ -182,7 +190,7 @@ public:
      * Returns the operation ID associated with this operation.
      */
     OperationId getOpID() const {
-        return _opId;
+        return _opId.getId();
     }
 
     /**
@@ -224,6 +232,15 @@ public:
      */
     boost::optional<TxnNumber> getTxnNumber() const {
         return _txnNumber;
+    }
+
+    /**
+     * Returns a CancellationToken that will be canceled when the OperationContext is killed via
+     * markKilled (including for internal reasons, like the OperationContext deadline being
+     * reached).
+     */
+    CancellationToken getCancellationToken() {
+        return _cancelSource.token();
     }
 
     /**
@@ -286,7 +303,7 @@ public:
      * Returns true if the operation is running lock-free.
      */
     bool isLockFreeReadsOp() const {
-        return _isLockFreeReadsOp;
+        return _lockFreeReadOpCount;
     }
 
     /**
@@ -426,6 +443,29 @@ public:
      */
     void setInMultiDocumentTransaction() {
         _inMultiDocumentTransaction = true;
+    }
+
+    /**
+     * Some operations coming into the system must be validated to ensure they meet constraints,
+     * such as collection namespace length limits or unique index key constraints. However,
+     * operations being performed from a source of truth such as during initial sync and oplog
+     * application often must ignore constraint violations.
+     *
+     * Initial sync and oplog application opt in to relaxed constraint checking by setting this
+     * value to false.
+     */
+    void setEnforceConstraints(bool enforceConstraints) {
+        _enforceConstraints = enforceConstraints;
+    }
+
+    /**
+     * This method can be used to tell if an operation requires validation of constraints. This
+     * should be preferred to alternatives such as checking if a node is primary or if a client is
+     * from a user connection as those have nuances (e.g: primary catch up and client disassociation
+     * due to task executors).
+     */
+    bool isEnforcingConstraints() {
+        return _enforceConstraints;
     }
 
     /**
@@ -587,10 +627,13 @@ private:
     }
 
     /**
-     * Set whether or not the operation is running lock-free.
+     * Increment a count to indicate that the operation is running lock-free.
      */
-    void setIsLockFreeReadsOp(bool isLockFreeReadsOp) {
-        _isLockFreeReadsOp = isLockFreeReadsOp;
+    void incrementLockFreeReadOpCount() {
+        ++_lockFreeReadOpCount;
+    }
+    void decrementLockFreeReadOpCount() {
+        --_lockFreeReadOpCount;
     }
 
     friend class WriteUnitOfWork;
@@ -599,7 +642,7 @@ private:
 
     Client* const _client;
 
-    const OperationId _opId;
+    const OperationIdSlot _opId;
     boost::optional<OperationKey> _opKey;
 
     boost::optional<LogicalSessionId> _lsid;
@@ -620,6 +663,10 @@ private:
     // once from OK to some kill code.
     AtomicWord<ErrorCodes::Error> _killCode{ErrorCodes::OK};
 
+    // Used to cancel all tokens obtained via getCancellationToken() when this OperationContext is
+    // killed.
+    CancellationSource _cancelSource;
+
     BatonHandle _baton;
 
     WriteConcernOptions _writeConcern;
@@ -627,7 +674,7 @@ private:
     // The timepoint at which this operation exceeds its time limit.
     Date_t _deadline = Date_t::max();
 
-    ErrorCodes::Error _timeoutError = ErrorCodes::ExceededTimeLimit;
+    ErrorCodes::Error _timeoutError = kDefaultOperationContextTimeoutError;
     bool _ignoreInterrupts = false;
     bool _hasArtificialDeadline = false;
     bool _markKillOnClientDisconnect = false;
@@ -648,11 +695,19 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
-    bool _isLockFreeReadsOp = false;
     bool _shouldIncrementLatencyStats = true;
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
+    // Commands from user applications must run validations and enforce constraints. Operations from
+    // a trusted source, such as initial sync or consuming an oplog entry generated by a primary
+    // typically desire to ignore constraints.
+    bool _enforceConstraints = true;
+
+    // Counts how many lock-free read operations are running nested.
+    // Necessary to use a counter rather than a boolean because there is existing code that
+    // destructs lock helpers out of order.
+    int _lockFreeReadOpCount = 0;
 
     // If true, this OpCtx will get interrupted during replica set stepUp and stepDown, regardless
     // of what locks it's taken.
@@ -705,20 +760,16 @@ class LockFreeReadsBlock {
     LockFreeReadsBlock& operator=(const LockFreeReadsBlock&) = delete;
 
 public:
-    LockFreeReadsBlock(OperationContext* opCtx)
-        : _opCtx(opCtx), _previousLockFreeReadsSetting(opCtx->isLockFreeReadsOp()) {
-        opCtx->setIsLockFreeReadsOp(true);
+    LockFreeReadsBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+        _opCtx->incrementLockFreeReadOpCount();
     }
 
     ~LockFreeReadsBlock() {
-        _opCtx->setIsLockFreeReadsOp(_previousLockFreeReadsSetting);
+        _opCtx->decrementLockFreeReadOpCount();
     }
 
 private:
     OperationContext* _opCtx;
-
-    // Used to re-set the value on the operation context upon destruction that was originally set.
-    const bool _previousLockFreeReadsSetting;
 };
 
 }  // namespace mongo

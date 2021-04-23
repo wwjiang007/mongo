@@ -619,12 +619,12 @@ BSONObj BSONObj::addField(const BSONElement& field) const {
 }
 
 BSONObj BSONObj::addFields(const BSONObj& from,
-                           const boost::optional<std::set<std::string>>& fields) const {
+                           const boost::optional<StringDataSet>& fields) const {
     BSONObjBuilder bob;
     for (auto&& originalField : *this) {
         auto commonField = from[originalField.fieldNameStringData()];
         // If there is a common field, add the value from 'from' object.
-        if (commonField && (!fields || fields->count(originalField.fieldName()))) {
+        if (commonField && (!fields || fields->count(originalField.fieldNameStringData()))) {
             bob.append(commonField);
         } else {
             bob.append(originalField);
@@ -634,7 +634,7 @@ BSONObj BSONObj::addFields(const BSONObj& from,
     for (auto&& fromField : from) {
         // Ignore the common fields as they are already added earlier.
         if (!hasField(fromField.fieldNameStringData()) &&
-            (!fields || fields->count(fromField.fieldName()))) {
+            (!fields || fields->count(fromField.fieldNameStringData()))) {
             bob.append(fromField);
         }
     }
@@ -657,6 +657,17 @@ BSONObj BSONObj::removeFields(const std::set<std::string>& fields) const {
     BSONObjBuilder bob;
     for (auto&& field : *this) {
         if (fields.count(field.fieldName())) {
+            continue;
+        }
+        bob.append(field);
+    }
+    return bob.obj();
+}
+
+BSONObj BSONObj::removeFields(const StringDataSet& fields) const {
+    BSONObjBuilder bob;
+    for (auto&& field : *this) {
+        if (fields.count(field.fieldNameStringData())) {
             continue;
         }
         bob.append(field);
@@ -787,7 +798,7 @@ StringBuilder& operator<<(StringBuilder& s, const BSONObj& o) {
 class BSONIteratorSorted::ElementFieldCmp {
 public:
     ElementFieldCmp(bool isArray);
-    bool operator()(const char* s1, const char* s2) const;
+    bool operator()(const Field& lhs, const Field& rhs) const;
 
 private:
     str::LexNumCmp _cmp;
@@ -795,18 +806,18 @@ private:
 
 BSONIteratorSorted::ElementFieldCmp::ElementFieldCmp(bool isArray) : _cmp(!isArray) {}
 
-bool BSONIteratorSorted::ElementFieldCmp::operator()(const char* s1, const char* s2) const {
-    // Skip the type byte and compare field names.
-    return _cmp(s1 + 1, s2 + 1);
+bool BSONIteratorSorted::ElementFieldCmp::operator()(const Field& lhs, const Field& rhs) const {
+    // Just compare field names.
+    return _cmp(lhs.fieldName, rhs.fieldName);
 }
 
 BSONIteratorSorted::BSONIteratorSorted(const BSONObj& o, const ElementFieldCmp& cmp)
-    : _nfields(o.nFields()), _fields(new const char*[_nfields]) {
+    : _nfields(o.nFields()), _fields(std::make_unique<Field[]>(_nfields)) {
     int x = 0;
     BSONObjIterator i(o);
     while (i.more()) {
-        _fields[x++] = i.next().rawdata();
-        verify(_fields[x - 1]);
+        auto elem = i.next();
+        _fields[x++] = {elem.fieldNameStringData(), elem.size()};
     }
     verify(x == _nfields);
     std::sort(_fields.get(), _fields.get() + _nfields, cmp);

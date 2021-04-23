@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2020 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -182,6 +182,13 @@ static CONFIG c[] = {
   {"format.major_timeout", "long-running operations timeout (minutes)", C_IGNORE, 0, 0, 1000,
     &g.c_major_timeout, NULL},
 
+  /*
+   * 0%
+   * FIXME-WT-7418 and FIXME-WT-7416: Temporarily disable import until WT_ROLLBACK error and
+   * interaction with backup thread is fixed. Should be 20%
+   */
+  {"import", "import table from newly created database", C_BOOL, 0, 0, 0, &g.c_import, NULL},
+
   /* 50% */
   {"logging", "configure logging", C_BOOL, 50, 0, 0, &g.c_logging, NULL},
 
@@ -300,6 +307,10 @@ static CONFIG c[] = {
   /* 2% */
   {"stress.hs_checkpoint_delay", "stress history store checkpoint delay", C_BOOL, 2, 0, 0,
     &g.c_timing_stress_hs_checkpoint_delay, NULL},
+
+  /* 2% */
+  {"stress.hs_search", "stress history store search", C_BOOL, 2, 0, 0, &g.c_timing_stress_hs_search,
+    NULL},
 
   /* 2% */
   {"stress.hs_sweep", "stress history store sweep", C_BOOL, 2, 0, 0, &g.c_timing_stress_hs_sweep,

@@ -393,6 +393,27 @@ var ShardingTest = function(params) {
         }
     };
 
+    this.stopAllConfigServers = function(opts) {
+        if (this.configRS) {
+            this.configRS.stopSet(undefined, undefined, opts);
+        } else {
+            // Old style config triplet
+            for (var i = 0; i < this._configServers.length; i++) {
+                this.stopConfigServer(i, opts);
+            }
+        }
+    };
+
+    this.stopAllShards = function(opts) {
+        for (var i = 0; i < this._connections.length; i++) {
+            if (this._rs[i]) {
+                this._rs[i].test.stopSet(15, undefined, opts);
+            } else {
+                this.stopMongod(i, opts);
+            }
+        }
+    };
+
     this.stopAllMongos = function(opts) {
         for (var i = 0; i < this._mongos.length; i++) {
             this.stopMongos(i, opts);
@@ -415,25 +436,11 @@ var ShardingTest = function(params) {
         this.stopAllMongos(opts);
 
         let startTime = new Date();  // Measure the execution time of shutting down shards.
-        for (var i = 0; i < this._connections.length; i++) {
-            if (this._rs[i]) {
-                this._rs[i].test.stopSet(15, undefined, opts);
-            } else {
-                this.stopMongod(i, opts);
-            }
-        }
+        this.stopAllShards(opts);
         print("ShardingTest stopped all shards, took " + (new Date() - startTime) + "ms for " +
               this._connections.length + " shards.");
 
-        if (this.configRS) {
-            this.configRS.stopSet(undefined, undefined, opts);
-        } else {
-            // Old style config triplet
-            for (var i = 0; i < this._configServers.length; i++) {
-                this.stopConfigServer(i, opts);
-            }
-        }
-
+        this.stopAllConfigServers(opts);
         if (!opts.noCleanData) {
             print("ShardingTest stop deleting all dbpaths");
             for (var i = 0; i < _alldbpaths.length; i++) {
@@ -463,6 +470,18 @@ var ShardingTest = function(params) {
 
     this.forEachConnection = function(fn) {
         this._connections.forEach(function(conn) {
+            fn(conn);
+        });
+    };
+
+    this.forEachMongos = function(fn) {
+        this._mongos.forEach(function(conn) {
+            fn(conn);
+        });
+    };
+
+    this.forEachConfigServer = function(fn) {
+        this._configServers.forEach(function(conn) {
             fn(conn);
         });
     };
@@ -560,7 +579,16 @@ var ShardingTest = function(params) {
             x[z._id] = 0;
         });
 
-        this.config.chunks.find({ns: dbName + "." + collName}).forEach(function(z) {
+        var coll = this.config.collections.findOne({_id: dbName + "." + collName});
+        var chunksQuery = (function() {
+            if (coll.timestamp != null) {
+                return {uuid: coll.uuid};
+            } else {
+                return {ns: dbName + "." + collName};
+            }
+        }());
+
+        this.config.chunks.find(chunksQuery).forEach(function(z) {
             if (x[z.shard])
                 x[z.shard]++;
             else
@@ -720,6 +748,70 @@ var ShardingTest = function(params) {
         }
 
         assert.commandWorked(result);
+    };
+
+    /**
+     * Wait for sharding to be initialized.
+     */
+    this.waitForShardingInitialized = function(timeoutMs = 60 * 1000) {
+        const getShardVersion = (client, timeout) => {
+            assert.soon(() => {
+                // The choice of namespace (local.fooCollection) does not affect the output.
+                var res = client.adminCommand({getShardVersion: "local.fooCollection"});
+                return res.ok == 1;
+            }, "timeout waiting for sharding to be initialized on mongod", timeout, 0.1);
+        };
+
+        var start = new Date();
+
+        for (var i = 0; i < this._rs.length; ++i) {
+            var replSet = this._rs[i];
+            if (!replSet)
+                continue;
+            nodes = replSet.test.nodes;
+            keyFileUsed = replSet.test.keyFile;
+
+            for (var j = 0; j < nodes.length; ++j) {
+                diff = (new Date()).getTime() - start.getTime();
+                var currNode = nodes[j];
+                // Skip arbiters
+                if (currNode.adminCommand({isMaster: 1}).arbiterOnly) {
+                    continue;
+                }
+
+                const x509AuthRequired = (conn.fullOptions && conn.fullOptions.clusterAuthMode &&
+                                          conn.fullOptions.clusterAuthMode === "x509" &&
+                                          currNode.fullOptions.sslMode === "requireSSL");
+
+                if (keyFileUsed) {
+                    authutil.asCluster(currNode, keyFileUsed, () => {
+                        getShardVersion(currNode, timeoutMs - diff);
+                    });
+                } else if (x509AuthRequired) {
+                    const exitCode = _runMongoProgram(
+                        ...["mongo",
+                            currNode.host,
+                            "--tls",
+                            "--tlsAllowInvalidHostnames",
+                            "--tlsCertificateKeyFile",
+                            currNode.fullOptions.tlsCertificateKeyFile
+                                ? currNode.fullOptions.tlsCertificateKeyFile
+                                : currNode.fullOptions.sslPEMKeyFile,
+                            "--tlsCAFile",
+                            currNode.fullOptions.tlsCAFile ? currNode.fullOptions.tlsCAFile
+                                                           : currNode.fullOptions.sslCAFile,
+                            "--authenticationDatabase=$external",
+                            "--authenticationMechanism=MONGODB-X509",
+                            "--eval",
+                            `(${getShardVersion.toString()})(db.getMongo(), ` +
+                                (timeoutMs - diff).toString() + `)`,
+                    ]);
+                    assert.eq(0, exitCode, "parallel shell for x509 auth failed");
+                } else {
+                    getShardVersion(currNode, timeoutMs - diff);
+                }
+            }
+        }
     };
 
     /**
@@ -1834,28 +1926,44 @@ var ShardingTest = function(params) {
     // on the config server, which auto-shards the collection for the cluster.
     this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
 
-    const x509AuthRequired = (mongosOptions[0] && mongosOptions[0].clusterAuthMode &&
-                              mongosOptions[0].clusterAuthMode === "x509");
-
     // Flushes the routing table cache on connection 'conn'. If 'keyFileLocal' is defined,
-    // authenticates the keyfile user on 'authConn' - a connection or set of connections for
-    // the shard - before executing the flush.
-    const flushRT = function flushRoutingTableAndHandleAuth(conn, authConn, keyFileLocal) {
+    // authenticates the keyfile user.
+    const flushRT = function flushRoutingTableAndHandleAuth(conn, keyFileLocal) {
         // Invokes the actual execution of cache refresh.
         const execFlushRT = (conn) => {
             assert.commandWorked(conn.getDB("admin").runCommand(
                 {_flushRoutingTableCacheUpdates: "config.system.sessions"}));
         };
 
+        const x509AuthRequired = (conn.fullOptions && conn.fullOptions.clusterAuthMode &&
+                                  conn.fullOptions.clusterAuthMode === "x509");
+
         if (keyFileLocal) {
-            authutil.asCluster(authConn, keyFileLocal, () => execFlushRT(conn));
+            authutil.asCluster(conn, keyFileLocal, () => execFlushRT(conn));
+        } else if (x509AuthRequired) {
+            const exitCode = _runMongoProgram(
+                ...["mongo",
+                    conn.host,
+                    "--tls",
+                    "--tlsAllowInvalidHostnames",
+                    "--tlsCertificateKeyFile",
+                    conn.fullOptions.tlsCertificateKeyFile ? conn.fullOptions.tlsCertificateKeyFile
+                                                           : conn.fullOptions.sslPEMKeyFile,
+                    "--tlsCAFile",
+                    conn.fullOptions.tlsCAFile ? conn.fullOptions.tlsCAFile
+                                               : conn.fullOptions.sslCAFile,
+                    "--authenticationDatabase=$external",
+                    "--authenticationMechanism=MONGODB-X509",
+                    "--eval",
+                    `(${execFlushRT.toString()})(db.getMongo())`,
+            ]);
+            assert.eq(0, exitCode, "parallel shell for x509 auth failed");
         } else {
             execFlushRT(conn);
         }
     };
 
-    // TODO SERVER-45108: Enable support for x509 auth for _flushRoutingTableCacheUpdates.
-    if (!otherParams.manualAddShard && !x509AuthRequired) {
+    if (!otherParams.manualAddShard) {
         for (let i = 0; i < numShards; i++) {
             const keyFileLocal =
                 (otherParams.shards && otherParams.shards[i] && otherParams.shards[i].keyFile)
@@ -1864,12 +1972,14 @@ var ShardingTest = function(params) {
 
             if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
                 const rs = this._rs[i].test;
-                flushRT(rs.getPrimary(), rs.nodes, keyFileLocal);
+                flushRT(rs.getPrimary(), keyFileLocal);
             } else {
                 // If specified, use the keyFile for the standalone shard.
-                flushRT(this["shard" + i], this["shard" + i], keyFileLocal);
+                flushRT(this["shard" + i], keyFileLocal);
             }
         }
+
+        self.waitForShardingInitialized();
     }
 };
 

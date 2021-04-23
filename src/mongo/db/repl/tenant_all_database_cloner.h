@@ -42,8 +42,14 @@ namespace repl {
 class TenantAllDatabaseCloner final : public TenantBaseCloner {
 public:
     struct Stats {
+        size_t databasesToClone{0};
         size_t databasesCloned{0};
+        size_t databasesClonedBeforeFailover{0};
         std::vector<TenantDatabaseCloner::Stats> databaseStats;
+        Date_t start;
+
+        long long approxTotalDataSize{0};
+        long long approxTotalBytesCopied{0};
 
         std::string toString() const;
         BSONObj toBSON() const;
@@ -85,9 +91,25 @@ private:
     };
 
     /**
-     * Stage function that retrieves database information from the sync source.
+     * Stage function that retrieves database information from the donor.
      */
     AfterStageBehavior listDatabasesStage();
+
+    /**
+     * Stage function that retrieves information locally on the recipient for databases that are
+     * already cloned.
+     */
+    AfterStageBehavior listExistingDatabasesStage();
+
+    /**
+     * Stage function that initializes several stats before carrying on to the 'postStage'.
+     */
+    AfterStageBehavior initializeStatsStage();
+
+    /**
+     * The preStage sets the start time in _stats.
+     */
+    void preStage() final;
 
     /**
      *
@@ -111,7 +133,9 @@ private:
     // The database name prefix of the tenant associated with this migration.
     std::string _tenantId;  // (R)
 
-    TenantAllDatabaseClonerStage _listDatabasesStage;  // (R)
+    TenantAllDatabaseClonerStage _listDatabasesStage;          // (R)
+    TenantAllDatabaseClonerStage _listExistingDatabasesStage;  // (R)
+    TenantAllDatabaseClonerStage _initializeStatsStage;        // (R)
 
     // The operationTime returned with the listDatabases result.
     Timestamp _operationTime;  // (X)

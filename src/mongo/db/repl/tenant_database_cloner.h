@@ -47,7 +47,10 @@ public:
         Date_t end;
         size_t collections{0};
         size_t clonedCollections{0};
+        size_t clonedCollectionsBeforeFailover{0};
+
         std::vector<TenantCollectionCloner::Stats> collectionStats;
+        long long approxTotalBytesCopied{0};
 
         std::string toString() const;
         BSONObj toBSON() const;
@@ -97,6 +100,12 @@ private:
     AfterStageBehavior listCollectionsStage();
 
     /**
+     * Stage function that retrieves collection information locally for collections that are already
+     * cloned.
+     */
+    AfterStageBehavior listExistingCollectionsStage();
+
+    /**
      * The preStage sets the start time in _stats.
      */
     void preStage() final;
@@ -120,7 +129,8 @@ private:
     std::vector<std::pair<NamespaceString, CollectionOptions>> _collections;  // (X)
     std::unique_ptr<TenantCollectionCloner> _currentCollectionCloner;         // (MX)
 
-    TenantDatabaseClonerStage _listCollectionsStage;  // (R)
+    TenantDatabaseClonerStage _listCollectionsStage;          // (R)
+    TenantDatabaseClonerStage _listExistingCollectionsStage;  // (R)
 
     // The database name prefix of the tenant associated with this migration.
     std::string _tenantId;  // (R)

@@ -150,7 +150,7 @@ protected:
     }
 
     void _recordDurable(const OpTimeAndWallTime& newOpTimeAndWallTime) {
-        // We have to use setMyLastDurableOpTimeAndWallTimeFoward since this thread races with
+        // We have to use setMyLastDurableOpTimeAndWallTimeForward since this thread races with
         // ReplicationExternalStateImpl::onTransitionToPrimary.
         _replCoord->setMyLastDurableOpTimeAndWallTimeForward(newOpTimeAndWallTime);
     }
@@ -394,9 +394,7 @@ void scheduleWritesToOplog(OperationContext* opCtx,
             std::vector<InsertStatement> docs;
             docs.reserve(end - begin);
             for (size_t i = begin; i < end; i++) {
-                // Add as unowned BSON to avoid unnecessary ref-count bumps.
-                // 'ops' will outlive 'docs' so the BSON lifetime will be guaranteed.
-                docs.emplace_back(InsertStatement{ops[i].getRaw(),
+                docs.emplace_back(InsertStatement{ops[i].getEntry().getRaw(),
                                                   ops[i].getOpTime().getTimestamp(),
                                                   ops[i].getOpTime().getTerm()});
             }
@@ -524,6 +522,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
                         // This code path is only executed on secondaries and initial syncing nodes,
                         // so it is safe to exclude any writes from Flow Control.
                         opCtx->setShouldParticipateInFlowControl(false);
+                        opCtx->setEnforceConstraints(false);
 
                         status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
                             return applyOplogBatchPerWorker(opCtx.get(), &writer, &multikeyVector);
@@ -546,8 +545,8 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
                         "{failedWriterThread}: {error}",
                         "Failed to apply batch of operations",
                         "numOperationsInBatch"_attr = ops.size(),
-                        "firstOperation"_attr = redact(ops.front().toBSON()),
-                        "lastOperation"_attr = redact(ops.back().toBSON()),
+                        "firstOperation"_attr = redact(ops.front().toBSONForLogging()),
+                        "lastOperation"_attr = redact(ops.back().toBSONForLogging()),
                         "failedWriterThread"_attr = std::distance(statusVector.cbegin(), it),
                         "error"_attr = redact(status));
                     return status;
@@ -555,13 +554,6 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
             }
         }
     }
-
-    // Tell the storage engine to flush the journal now that a replication batch has completed. This
-    // means that all the writes associated with the oplog entries in the batch are finished and no
-    // new writes with timestamps associated with those oplog entries will show up in the future. We
-    // want to flush the journal as soon as possible in order to free ops waiting with 'j' write
-    // concern.
-    JournalFlusher::get(opCtx)->triggerJournalFlush();
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
     if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {
@@ -624,6 +616,9 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
 
     LogicalSessionIdMap<std::vector<OplogEntry*>> partialTxnOps;
     CachedCollectionProperties collPropertiesCache;
+
+    // Used to serialize writes to the tenant migrations donor and recipient namespaces.
+    boost::optional<uint32_t> tenantMigrationsWriterId;
     for (auto&& op : *ops) {
         // If the operation's optime is before or the same as the beginApplyingOpTime we don't want
         // to apply it, so don't include it in writerVectors.
@@ -705,6 +700,19 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
             continue;
         }
 
+        // Writes to the tenant migration namespaces must be serialized to preserve the order of
+        // migration and access blocker states.
+        if (op.getNss() == NamespaceString::kTenantMigrationDonorsNamespace ||
+            op.getNss() == NamespaceString::kTenantMigrationRecipientsNamespace) {
+            auto writerId = OplogApplierUtils::addToWriterVector(
+                opCtx, &op, writerVectors, &collPropertiesCache, tenantMigrationsWriterId);
+            if (!tenantMigrationsWriterId) {
+                tenantMigrationsWriterId.emplace(writerId);
+            } else {
+                invariant(writerId == *tenantMigrationsWriterId);
+            }
+            continue;
+        }
         OplogApplierUtils::addToWriterVector(opCtx, &op, writerVectors, &collPropertiesCache);
     }
 }

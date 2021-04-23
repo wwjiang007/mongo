@@ -41,6 +41,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_set_config_params_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
@@ -96,6 +97,18 @@ ReplSetConfig ReplSetConfig::parseForInitiate(const BSONObj& cfg, OID newReplica
     return result;
 }
 
+void ReplSetConfig::setDefaultDelayFieldForMember(MemberConfig mem) {
+    // We should only be setting the default values if the config has neither delay field set.
+    if (!mem.hasSecondaryDelaySecs() && !mem.hasSlaveDelay()) {
+        if (feature_flags::gUseSecondaryDelaySecs.isEnabled(
+                serverGlobalParams.featureCompatibility)) {
+            useSecondaryDelaySecsFieldName(mem.getId());
+        } else {
+            useSlaveDelayFieldName(mem.getId());
+        }
+    }
+}
+
 void ReplSetConfig::_setRequiredFields() {
     // The three required fields need to be set to something valid to avoid a potential
     // invariant if the uninitialized object is ever used with toBSON().
@@ -143,6 +156,8 @@ Status ReplSetConfig::_initialize(bool forInitiate,
         // The const_cast is necessary because "non_const_getter" in the IDL doesn't work for
         // arrays.
         const_cast<MemberConfig&>(member).addTagInfo(&_tagConfig);
+
+        setDefaultDelayFieldForMember(member);
     }
 
     //
@@ -175,6 +190,14 @@ Status ReplSetConfig::_initialize(bool forInitiate,
 }
 
 Status ReplSetConfig::validate() const {
+    return _validate(false);
+}
+
+Status ReplSetConfig::validateAllowingSplitHorizonIP() const {
+    return _validate(true);
+}
+
+Status ReplSetConfig::_validate(bool allowSplitHorizonIP) const {
     if (getMembers().size() > kMaxMembers || getMembers().empty()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Replica set configuration contains " << getMembers().size()
@@ -205,7 +228,7 @@ Status ReplSetConfig::validate() const {
         const MemberConfig& memberI = getMembers()[i];
 
         // Check that no horizon mappings contain IP addresses
-        if (!disableSplitHorizonIPCheck) {
+        if (!disableSplitHorizonIPCheck && !allowSplitHorizonIP) {
             for (auto&& mapping : memberI.getHorizonMappings()) {
                 // Ignore the default horizon -- this can be an IP
                 if (mapping.first == SplitHorizon::kDefaultHorizon) {
@@ -249,6 +272,12 @@ Status ReplSetConfig::validate() const {
             for (const auto& mapping : memberI.getHorizonMappings()) {
                 ++horizonHostNameCounts[mapping.second];
             }
+        }
+
+        if (memberI.hasSlaveDelay() && memberI.hasSecondaryDelaySecs()) {
+            return Status(ErrorCodes::BadValue,
+                          "Cannot specify both secondaryDelaySecs and slaveDelay as fields in "
+                          "member configuration.");
         }
 
         if (memberI.getHostAndPort().isLocalHost()) {
@@ -376,10 +405,10 @@ Status ReplSetConfig::validate() const {
                               "Members in replica set configurations being used for config "
                               "servers must build indexes");
             }
-            if (mem->getSlaveDelay() != Seconds(0)) {
+            if (mem->getSecondaryDelay() != Seconds(0)) {
                 return Status(ErrorCodes::BadValue,
                               "Members in replica set configurations being used for config "
-                              "servers cannot have a non-zero slaveDelay");
+                              "servers cannot have a non-zero secondaryDelaySecs");
             }
         }
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
@@ -691,6 +720,14 @@ MutableReplSetConfig ReplSetConfig::getMutable() const {
     return *static_cast<const MutableReplSetConfig*>(this);
 }
 
+bool ReplSetConfig::isImplicitDefaultWriteConcernMajority() const {
+    // Only set defaultWC to majority when writable voting members are strictly more than voting
+    // majority. This will prevent arbiters from keeping the primary elected while no majority write
+    // can be fulfilled.
+    auto arbiters = _totalVotingMembers - _writableVotingMembersCount;
+    return arbiters == 0 || _writableVotingMembersCount > _majorityVoteCount;
+}
+
 MemberConfig* MutableReplSetConfig::_findMemberByID(MemberId id) {
     for (auto it = getMembers().begin(); it != getMembers().end(); ++it) {
         if (it->getId() == id) {
@@ -706,6 +743,24 @@ void MutableReplSetConfig::addNewlyAddedFieldForMember(MemberId memberId) {
 
 void MutableReplSetConfig::removeNewlyAddedFieldForMember(MemberId memberId) {
     _findMemberByID(memberId)->setNewlyAdded(boost::none);
+}
+
+void MutableReplSetConfig::useSecondaryDelaySecsFieldName(MemberId memberId) {
+    auto mem = _findMemberByID(memberId);
+    if (mem->hasSecondaryDelaySecs()) {
+        return;
+    }
+    mem->setSecondaryDelaySecs(mem->hasSlaveDelay() ? mem->getSlaveDelaySecs() : 0LL);
+    mem->setSlaveDelaySecs(boost::none);
+}
+
+void MutableReplSetConfig::useSlaveDelayFieldName(MemberId memberId) {
+    auto mem = _findMemberByID(memberId);
+    if (mem->hasSlaveDelay()) {
+        return;
+    }
+    mem->setSlaveDelaySecs(mem->hasSecondaryDelaySecs() ? mem->getSecondaryDelaySecs() : 0LL);
+    mem->setSecondaryDelaySecs(boost::none);
 }
 
 }  // namespace repl

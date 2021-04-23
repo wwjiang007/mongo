@@ -30,11 +30,12 @@
 #pragma once
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/collection_helpers.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/trial_period_utils.h"
-#include "mongo/db/exec/trial_run_progress_tracker.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
+#include "mongo/db/query/shard_filterer_factory_interface.h"
 #include "mongo/db/query/stage_builder.h"
 
 namespace mongo::stage_builder {
@@ -43,7 +44,9 @@ namespace mongo::stage_builder {
  * new environment.
  */
 std::unique_ptr<sbe::RuntimeEnvironment> makeRuntimeEnvironment(
-    OperationContext* opCtx, sbe::value::SlotIdGenerator* slotIdGenerator);
+    const CanonicalQuery& cq,
+    OperationContext* opCtx,
+    sbe::value::SlotIdGenerator* slotIdGenerator);
 
 class PlanStageReqs;
 
@@ -57,6 +60,9 @@ public:
     static constexpr StringData kRecordId = "recordId"_sd;
     static constexpr StringData kReturnKey = "returnKey"_sd;
     static constexpr StringData kOplogTs = "oplogTs"_sd;
+    static constexpr StringData kSnapshotId = "snapshotId"_sd;
+    static constexpr StringData kIndexId = "indexId"_sd;
+    static constexpr StringData kIndexKey = "indexKey"_sd;
 
     PlanStageSlots() = default;
 
@@ -115,8 +121,8 @@ public:
 private:
     StringMap<sbe::value::SlotId> _slots;
 
-    // When an index scan produces parts of an index key for a covered projection, this is where
-    // the slots for the produced values are stored.
+    // When an index scan produces parts of an index key for a covered plan, this is where the
+    // slots for the produced values are stored.
     boost::optional<sbe::value::SlotVector> _indexKeySlots;
 };
 
@@ -225,19 +231,21 @@ struct PlanStageData {
     // This holds the output slots produced by SBE plan (resultSlot, recordIdSlot, etc).
     PlanStageSlots outputs;
 
+    // Map from index name to IAM.
+    StringMap<const IndexAccessMethod*> iamMap;
+
     // The CompileCtx object owns the RuntimeEnvironment. The RuntimeEnvironment owns various
     // SlotAccessors which are accessed when the SBE plan is executed.
     sbe::RuntimeEnvironment* env{nullptr};
     sbe::CompileCtx ctx;
 
-    // Used during the trial run of the runtime planner to track progress of the work done so far.
-    // Some PlanStages hold pointers to the TrialRunProgressTracker object and call methods on it
-    // when the SBE plan is executed.
-    std::unique_ptr<TrialRunProgressTracker> trialRunProgressTracker;
-
     bool shouldTrackLatestOplogTimestamp{false};
     bool shouldTrackResumeToken{false};
     bool shouldUseTailableScan{false};
+
+    // If this execution tree was built as a result of replanning of the cached plan, this string
+    // will include the reason for replanning.
+    std::optional<std::string> replanReason;
 };
 
 /**
@@ -249,13 +257,16 @@ public:
     static constexpr StringData kRecordId = PlanStageSlots::kRecordId;
     static constexpr StringData kReturnKey = PlanStageSlots::kReturnKey;
     static constexpr StringData kOplogTs = PlanStageSlots::kOplogTs;
+    static constexpr StringData kSnapshotId = PlanStageSlots::kSnapshotId;
+    static constexpr StringData kIndexId = PlanStageSlots::kIndexId;
+    static constexpr StringData kIndexKey = PlanStageSlots::kIndexKey;
 
     SlotBasedStageBuilder(OperationContext* opCtx,
                           const CollectionPtr& collection,
                           const CanonicalQuery& cq,
                           const QuerySolution& solution,
                           PlanYieldPolicySBE* yieldPolicy,
-                          bool needsTrialRunProgressTracker);
+                          ShardFiltererFactoryInterface* shardFilterer);
 
     std::unique_ptr<sbe::PlanStage> build(const QuerySolutionNode* root) final;
 
@@ -306,7 +317,7 @@ private:
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildOr(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
-    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildText(
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildTextMatch(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildReturnKey(
@@ -315,14 +326,42 @@ private:
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildEof(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildAndHash(
+        const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildAndSorted(
+        const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
     std::tuple<sbe::value::SlotId, sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>
     makeLoopJoinForFetch(std::unique_ptr<sbe::PlanStage> inputStage,
                          sbe::value::SlotId recordIdSlot,
+                         sbe::value::SlotId snapshotIdSlot,
+                         sbe::value::SlotId indexIdSlot,
+                         sbe::value::SlotId keyStringSlot,
+                         StringMap<const IndexAccessMethod*> iamMap,
                          PlanNodeId planNodeId,
                          sbe::value::SlotVector slotsToForward = {});
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> makeUnionForTailableCollScan(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildShardFilter(
+        const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    /**
+     * Constructs an optimized SBE plan for 'filterNode' in the case that the fields of the
+     * 'shardKeyPattern' are provided by 'childIxscan'. In this case, the SBE plan for the child
+     * index scan node will fill out slots for the necessary components of the index key. These
+     * slots can be read directly in order to determine the shard key that should be passed to the
+     * 'shardFilterer'.
+     */
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildShardFilterCovered(
+        const ShardingFilterNode* filterNode,
+        std::unique_ptr<ShardFilterer> shardFilterer,
+        BSONObj shardKeyPattern,
+        BSONObj indexKeyPattern,
+        const QuerySolutionNode* child,
+        PlanStageReqs childReqs);
 
     sbe::value::SlotIdGenerator _slotIdGenerator;
     sbe::value::FrameIdGenerator _frameIdGenerator;
@@ -335,5 +374,13 @@ private:
     PlanStageData _data;
 
     bool _buildHasStarted{false};
+    bool _shouldProduceRecordIdSlot{true};
+
+    // A factory to construct shard filters.
+    ShardFiltererFactoryInterface* _shardFiltererFactory;
+
+    // A callback that should be installed on "scan" and "ixscan" nodes. It will get invoked when
+    // these data access stages acquire their AutoGet*.
+    const sbe::LockAcquisitionCallback _lockAcquisitionCallback;
 };
 }  // namespace mongo::stage_builder

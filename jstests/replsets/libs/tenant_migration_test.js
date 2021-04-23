@@ -5,8 +5,7 @@
 "use strict";
 
 load("jstests/aggregation/extras/utils.js");
-load("jstests/replsets/rslib.js");
-load('jstests/libs/fail_point_util.js');
+load("jstests/replsets/libs/tenant_migration_util.js");
 
 /**
  * This fixture allows the user to optionally pass in a custom ReplSetTest for the donor and
@@ -16,43 +15,71 @@ load('jstests/libs/fail_point_util.js');
  * instead, with all nodes running the latest version.
  *
  * @param {string} [name] the name of the replica sets
+ * @param {boolean} [enableRecipientTesting] whether recipient would actually migrate tenant data
  * @param {Object} [donorRst] the ReplSetTest instance to adopt for the donor
  * @param {Object} [recipientRst] the ReplSetTest instance to adopt for the recipient
+ * @param {Object} [sharedOptions] an object that can contain 'nodes' <number>, the number of nodes
+ *     each RST will contain, and 'setParameter' <object>, an object with various server parameters.
+ * @param {boolean} [allowDonorReadAfterMigration] whether donor would allow reads after a committed
+ *     migration.
  */
-function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientRst}) {
+function TenantMigrationTest({
+    name = "TenantMigrationTest",
+    enableRecipientTesting = true,
+    donorRst,
+    recipientRst,
+    sharedOptions = {},
+    // Default this to true so it is easier for data consistency checks.
+    allowStaleReadsOnDonor = true,
+}) {
     const donorPassedIn = (donorRst !== undefined);
     const recipientPassedIn = (recipientRst !== undefined);
+
+    const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+    const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
+
+    const nodes = sharedOptions.nodes || 2;
+    let setParameterOpts = sharedOptions.setParameter || {};
 
     donorRst = donorPassedIn ? donorRst : performSetUp(true /* isDonor */);
     recipientRst = recipientPassedIn ? recipientRst : performSetUp(false /* isDonor */);
 
-    donorRst.getPrimary();
-    donorRst.awaitReplication();
+    donorRst.asCluster(donorRst.nodes, () => {
+        donorRst.getPrimary();
+        donorRst.awaitReplication();
+        TenantMigrationUtil.createTenantMigrationRecipientRoleIfNotExist(donorRst);
+    });
 
-    recipientRst.getPrimary();
-    recipientRst.awaitReplication();
+    recipientRst.asCluster(recipientRst.nodes, () => {
+        recipientRst.getPrimary();
+        recipientRst.awaitReplication();
+        TenantMigrationUtil.createTenantMigrationDonorRoleIfNotExist(recipientRst);
+    });
 
     /**
-     * Creates a ReplSetTest instance. The repl set will have 2 nodes.
+     * Creates a ReplSetTest instance. The repl set will have 2 nodes if not otherwise specified.
      */
     function performSetUp(isDonor) {
-        let setParameterOpts = {};
         if (TestData.logComponentVerbosity) {
             setParameterOpts["logComponentVerbosity"] =
                 tojsononeline(TestData.logComponentVerbosity);
         }
 
-        // TODO: SERVER-51734: Remove setting this failpoint.
-        if (!isDonor) {
+        if (!(isDonor || enableRecipientTesting)) {
             setParameterOpts["failpoint.returnResponseOkForRecipientSyncDataCmd"] =
                 tojson({mode: 'alwaysOn'});
         }
 
-        let nodeOptions = {};
+        if (allowStaleReadsOnDonor) {
+            setParameterOpts["failpoint.tenantMigrationDonorAllowsNonTimestampedReads"] =
+                tojson({mode: 'alwaysOn'});
+        }
+
+        let nodeOptions = isDonor ? migrationX509Options.donor : migrationX509Options.recipient;
         nodeOptions["setParameter"] = setParameterOpts;
 
         const rstName = `${name}_${(isDonor ? "donor" : "recipient")}`;
-        const rst = new ReplSetTest({name: rstName, nodes: 2, nodeOptions});
+        const rst = new ReplSetTest({name: rstName, nodes, nodeOptions});
         rst.startSet();
         rst.initiateWithHighElectionTimeout();
 
@@ -60,19 +87,66 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
     }
 
     /**
+     * Creates a role for running find command against config.external_validation_keys if it
+     * doesn't exist.
+     */
+    function createFindExternalClusterTimeKeysRoleIfNotExist(rst) {
+        const adminDB = rst.getPrimary().getDB("admin");
+
+        if (TenantMigrationUtil.roleExists(adminDB, "findExternalClusterTimeKeysRole")) {
+            return;
+        }
+
+        assert.commandWorked(adminDB.runCommand({
+            createRole: "findExternalClusterTimeKeysRole",
+            privileges: [{
+                resource: {db: "config", collection: "external_validation_keys"},
+                actions: ["find"]
+            }],
+            roles: []
+        }));
+    }
+
+    /**
+     * Gives the current admin database user the privilege to run find commands against
+     * config.external_validation_keys if it does not have that privilege. Used by
+     * 'assertNoDuplicatedExternalKeyDocs' below.
+     */
+    function grantFindExternalClusterTimeKeysPrivilegeIfNeeded(rst) {
+        const adminDB = rst.getPrimary().getDB("admin");
+        const users = assert.commandWorked(adminDB.runCommand({connectionStatus: 1}))
+                          .authInfo.authenticatedUsers;
+
+        if (users.length === 0 || users[0].user === "__system" || users[0].db != "admin") {
+            return;
+        }
+
+        const userRoles = adminDB.getUser(users[0].user).roles;
+
+        if (userRoles.includes("findExternalClusterTimeKeysRole")) {
+            return;
+        }
+
+        createFindExternalClusterTimeKeysRoleIfNotExist(rst);
+        userRoles.push("findExternalClusterTimeKeysRole");
+        assert.commandWorked(adminDB.runCommand({updateUser: users[0].user, roles: userRoles}));
+    }
+
+    /**
      * Returns whether tenant migration commands are supported.
      */
     this.isFeatureFlagEnabled = function() {
-        const donorPrimary = this.getDonorPrimary();
-        const recipientPrimary = this.getRecipientPrimary();
-
-        function supportsTenantMigrations(conn) {
-            return assert
-                .commandWorked(conn.adminCommand({getParameter: 1, featureFlagTenantMigrations: 1}))
-                .featureFlagTenantMigrations.value;
+        function supportsTenantMigrations(rst) {
+            const conn = rst.getPrimary();
+            return rst.asCluster(conn, () => {
+                return assert
+                    .commandWorked(
+                        conn.adminCommand({getParameter: 1, featureFlagTenantMigrations: 1}))
+                    .featureFlagTenantMigrations.value;
+            });
         }
-        const retVal =
-            (supportsTenantMigrations(donorPrimary) && supportsTenantMigrations(recipientPrimary));
+        const retVal = (supportsTenantMigrations(this.getDonorRst()) &&
+                        supportsTenantMigrations(this.getRecipientRst()));
         if (!retVal) {
             jsTestLog("At least one of the donor or recipient replica sets do not support tenant " +
                       "migration commands. Terminating any replica sets started by the " +
@@ -91,13 +165,24 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
      * returns the command response containing the migration state on the donor after the migration
      * has completed.
      */
-    this.runMigration = function(migrationOpts, retryOnRetryableErrors = false) {
-        const res = this.startMigration(migrationOpts, retryOnRetryableErrors);
-        if (!res.ok) {
-            return res;
+    this.runMigration = function(
+        migrationOpts, retryOnRetryableErrors = false, automaticForgetMigration = true) {
+        const startRes = this.startMigration(migrationOpts, retryOnRetryableErrors);
+        if (!startRes.ok) {
+            return startRes;
         }
 
-        return this.waitForMigrationToComplete(migrationOpts, retryOnRetryableErrors);
+        const completeRes = this.waitForMigrationToComplete(migrationOpts, retryOnRetryableErrors);
+
+        if (automaticForgetMigration &&
+            (completeRes.state === TenantMigrationTest.State.kCommitted ||
+             completeRes.state === TenantMigrationTest.State.kAborted)) {
+            jsTestLog(`Automatically forgetting ${completeRes.state} migration with migrationId: ${
+                migrationOpts.migrationIdString}`);
+            this.forgetMigration(migrationOpts.migrationIdString);
+        }
+
+        return completeRes;
     };
 
     /**
@@ -142,6 +227,8 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
         tenantId,
         recipientConnectionString = recipientRst.getURL(),
         readPreference = {mode: "primary"},
+        donorCertificateForRecipient = migrationCertificates.donorCertificateForRecipient,
+        recipientCertificateForDonor = migrationCertificates.recipientCertificateForDonor,
     },
                                            waitForMigrationToComplete,
                                            retryOnRetryableErrors) {
@@ -151,42 +238,24 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
             migrationId: UUID(migrationIdString),
             recipientConnectionString,
             readPreference,
+            donorCertificateForRecipient,
+            recipientCertificateForDonor
         };
 
-        let donorPrimary = this.getDonorPrimary();
-        let stateRes;
+        const stateRes = TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj,
+            this.getDonorRst(),
+            retryOnRetryableErrors,
+            stateRes => (!waitForMigrationToComplete ||
+                         TenantMigrationUtil.isMigrationCompleted(stateRes)));
 
-        assert.soon(() => {
-            try {
-                stateRes = donorPrimary.adminCommand(cmdObj);
+        // If the migration has been successfully committed, check the db hashes for the tenantId
+        // between the donor and recipient.
+        if (stateRes.state === TenantMigrationTest.State.kCommitted) {
+            TenantMigrationUtil.checkTenantDBHashes(
+                this.getDonorRst(), this.getRecipientRst(), tenantId);
+        }
 
-                if (!stateRes.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(stateRes.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                    return true;
-                }
-
-                // The command has been successfully executed. If we don't need to wait for the
-                // migration to complete, exit the loop.
-                if (!waitForMigrationToComplete) {
-                    return true;
-                }
-
-                return (stateRes.state === TenantMigrationTest.State.kCommitted ||
-                        stateRes.state === TenantMigrationTest.State.kAborted);
-            } catch (e) {
-                // If the thrown error is network related and we are allowing retryable errors,
-                // continue issuing commands.
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
-            }
-        });
         return stateRes;
     };
 
@@ -197,47 +266,86 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
      * NotPrimary or network error.
      */
     this.forgetMigration = function(migrationIdString, retryOnRetryableErrors = false) {
-        let donorPrimary = this.getDonorPrimary();
+        const cmdObj = {donorForgetMigration: 1, migrationId: UUID(migrationIdString)};
+        const res = TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, this.getDonorRst(), retryOnRetryableErrors);
 
-        let res;
+        // If the command succeeded, we expect that the migration is marked garbage collectable on
+        // the donor and the recipient. Check the state docs for expireAt, check that the oplog
+        // buffer collection has been dropped, and external keys have ttlExpiresAt.
+        if (res.ok) {
+            const donorPrimary = this.getDonorPrimary();
+            const recipientPrimary = this.getRecipientPrimary();
 
-        assert.soon(() => {
-            try {
-                res = donorPrimary.adminCommand(
-                    {donorForgetMigration: 1, migrationId: UUID(migrationIdString)});
+            const donorStateDoc =
+                donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
+                    _id: UUID(migrationIdString)
+                });
+            const recipientStateDoc =
+                recipientPrimary.getCollection(TenantMigrationTest.kConfigRecipientsNS).findOne({
+                    _id: UUID(migrationIdString)
+                });
 
-                if (!res.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                }
-
-                return true;
-            } catch (e) {
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
+            if (donorStateDoc) {
+                assert(donorStateDoc.expireAt);
             }
-        });
+            if (recipientStateDoc) {
+                assert(recipientStateDoc.expireAt);
+            }
+
+            const configDBCollections = recipientPrimary.getDB('config').getCollectionNames();
+            assert(!configDBCollections.includes('repl.migration.oplog_' + migrationIdString),
+                   configDBCollections);
+
+            this.getDonorRst().asCluster(donorPrimary, () => {
+                const donorKeys =
+                    TenantMigrationUtil.getExternalKeys(donorPrimary, UUID(migrationIdString));
+                if (donorKeys.length) {
+                    donorKeys.forEach(key => {
+                        assert(key.hasOwnProperty("ttlExpiresAt"), tojson(key));
+                    });
+                }
+            });
+
+            this.getRecipientRst().asCluster(recipientPrimary, () => {
+                const recipientKeys =
+                    TenantMigrationUtil.getExternalKeys(recipientPrimary, UUID(migrationIdString));
+                if (recipientKeys.length) {
+                    recipientKeys.forEach(key => {
+                        assert(key.hasOwnProperty("ttlExpiresAt"), tojson(key));
+                    });
+                }
+            });
+        }
+
         return res;
+    };
+
+    /**
+     * Runs the donorAbortMigration command with the given migration options and returns the
+     * response.
+     */
+    this.tryAbortMigration = function(migrationOpts, retryOnRetryableErrors = false) {
+        const cmdObj = {
+            donorAbortMigration: 1,
+            migrationId: UUID(migrationOpts.migrationIdString),
+        };
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, this.getDonorRst(), retryOnRetryableErrors);
     };
 
     /**
      * Asserts that durable and in-memory state for the migration 'migrationId' and 'tenantId' is
      * eventually deleted from the given nodes.
      */
-    this.waitForMigrationGarbageCollection = function(nodes, migrationId, tenantId) {
-        nodes.forEach(node => {
-            const configDonorsColl = node.getCollection("config.tenantMigrationDonors");
-            assert.soon(() => 0 === configDonorsColl.count({_id: migrationId}));
+    this.waitForMigrationGarbageCollection = function(
+        migrationId, tenantId, donorNodes, recipientNodes) {
+        donorNodes = donorNodes || donorRst.nodes;
+        recipientNodes = recipientNodes || recipientRst.nodes;
 
-            assert.soon(() => 0 ===
-                            assert.commandWorked(node.adminCommand({serverStatus: 1}))
-                                .repl.primaryOnlyServices.TenantMigrationDonorService);
+        donorNodes.forEach(node => {
+            const configDonorsColl = node.getCollection(TenantMigrationTest.kConfigDonorsNS);
+            assert.soon(() => 0 === configDonorsColl.count({_id: migrationId}), tojson(node));
 
             let mtabs;
             assert.soon(() => {
@@ -246,26 +354,32 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
                 return !mtabs || !mtabs[tenantId];
             }, tojson(mtabs));
         });
+
+        recipientNodes.forEach(node => {
+            const configRecipientsColl =
+                node.getCollection(TenantMigrationTest.kConfigRecipientsNS);
+            assert.soon(() => 0 === configRecipientsColl.count({_id: migrationId}));
+        });
     };
 
     /**
      * Asserts that the migration 'migrationId' and 'tenantId' eventually goes to the
-     * expected state on all the given nodes.
+     * expected state on all the given donor nodes.
      */
-    this.waitForNodesToReachState = function(nodes, migrationId, tenantId, expectedState) {
+    this.waitForDonorNodesToReachState = function(nodes, migrationId, tenantId, expectedState) {
         nodes.forEach(node => {
-            assert.soon(() =>
-                            this.isNodeInExpectedState(node, migrationId, tenantId, expectedState));
+            assert.soon(
+                () => this.isDonorNodeInExpectedState(node, migrationId, tenantId, expectedState));
         });
     };
 
     /**
      * Asserts that the migration 'migrationId' and 'tenantId' is in the expected state on all the
-     * given nodes.
+     * given donor nodes.
      */
-    this.assertNodesInExpectedState = function(nodes, migrationId, tenantId, expectedState) {
+    this.assertDonorNodesInExpectedState = function(nodes, migrationId, tenantId, expectedState) {
         nodes.forEach(node => {
-            assert(this.isNodeInExpectedState(node, migrationId, tenantId, expectedState));
+            assert(this.isDonorNodeInExpectedState(node, migrationId, tenantId, expectedState));
         });
     };
 
@@ -273,16 +387,57 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
      * Returns true if the durable and in-memory state for the migration 'migrationId' and
      * 'tenantId' is in the expected state, and false otherwise.
      */
-    this.isNodeInExpectedState = function(node, migrationId, tenantId, expectedState) {
+    this.isDonorNodeInExpectedState = function(node, migrationId, tenantId, expectedState) {
         const configDonorsColl =
-            this.getDonorPrimary().getCollection("config.tenantMigrationDonors");
+            this.getDonorPrimary().getCollection(TenantMigrationTest.kConfigDonorsNS);
         if (configDonorsColl.findOne({_id: migrationId}).state !== expectedState) {
             return false;
         }
 
         const expectedAccessState = (expectedState === TenantMigrationTest.State.kCommitted)
-            ? TenantMigrationTest.AccessState.kReject
-            : TenantMigrationTest.AccessState.kAborted;
+            ? TenantMigrationTest.DonorAccessState.kReject
+            : TenantMigrationTest.DonorAccessState.kAborted;
+        const mtabs =
+            assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrationAccessBlocker;
+        return (mtabs[tenantId].state === expectedAccessState);
+    };
+
+    /**
+     * Asserts that the migration 'migrationId' and 'tenantId' eventually goes to the expected state
+     * on all the given recipient nodes.
+     */
+    this.waitForRecipientNodesToReachState = function(
+        nodes, migrationId, tenantId, expectedState, expectedAccessState) {
+        nodes.forEach(node => {
+            assert.soon(() => this.isRecipientNodeInExpectedState(
+                            node, migrationId, tenantId, expectedState, expectedAccessState));
+        });
+    };
+
+    /**
+     * Asserts that the migration 'migrationId' and 'tenantId' is in the expected state on all the
+     * given recipient nodes.
+     */
+    this.assertRecipientNodesInExpectedState = function(
+        nodes, migrationId, tenantId, expectedState, expectedAccessState) {
+        nodes.forEach(node => {
+            assert(this.isRecipientNodeInExpectedState(
+                node, migrationId, tenantId, expectedState, expectedAccessState));
+        });
+    };
+
+    /**
+     * Returns true if the durable and in-memory state for the migration 'migrationId' and
+     * 'tenantId' is in the expected state, and false otherwise.
+     */
+    this.isRecipientNodeInExpectedState = function(
+        node, migrationId, tenantId, expectedState, expectedAccessState) {
+        const configRecipientsColl =
+            this.getRecipientPrimary().getCollection("config.tenantMigrationRecipients");
+        if (configRecipientsColl.findOne({_id: migrationId}).state !== expectedState) {
+            return false;
+        }
+
         const mtabs =
             assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrationAccessBlocker;
         return (mtabs[tenantId].state === expectedAccessState);
@@ -305,16 +460,16 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
         const db = this.getDonorPrimary().getDB(dbName);
         const coll = db.getCollection(collName);
 
-        assert.commandWorked(coll.insertMany(data));
+        assert.commandWorked(coll.insertMany(data, {writeConcern: {w: 'majority'}}));
     };
 
     /**
      * Verifies that the documents on the recipient primary are correct.
      */
-    this.verifyReceipientDB = function(tenantId, dbName, collName, data = loadDummyData()) {
-        // TODO (SERVER-51734): Uncomment this line.
-        // const shouldMigrate = this.isNamespaceForTenant(tenantId, dbName);
-        const shouldMigrate = false;
+    this.verifyRecipientDB = function(
+        tenantId, dbName, collName, migrationCommitted = true, data = loadDummyData()) {
+        const shouldMigrate =
+            migrationCommitted && TenantMigrationUtil.isNamespaceForTenant(tenantId, dbName);
 
         jsTestLog(`Verifying that data in collection ${collName} of DB ${dbName} was ${
             (shouldMigrate ? "" : "not")} migrated to the recipient`);
@@ -359,19 +514,57 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
     };
 
     /**
-     * Determines if a database name belongs to the given tenant.
-     */
-    this.isNamespaceForTenant = function(tenantId, dbName) {
-        return dbName.startsWith(`${tenantId}_`);
-    };
-
-    /**
-     * Returns the TenantMigrationAccessBlocker associated with given the tenantId on the
+     * Returns the TenantMigrationAccessBlocker associated with the given tenantId on the
      * node.
      */
     this.getTenantMigrationAccessBlocker = function(node, tenantId) {
         return assert.commandWorked(node.adminCommand({serverStatus: 1}))
             .tenantMigrationAccessBlocker[tenantId];
+    };
+
+    /**
+     * Returns the TenantMigrationStats on the node.
+     */
+    this.getTenantMigrationStats = function(node) {
+        return assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrations;
+    };
+
+    /**
+     * Awaits the condition when every stats counter reaches the specified count.
+     */
+    this.awaitTenantMigrationStatsCounts = function(node, {
+        currentMigrationsDonating = 0,
+        currentMigrationsReceiving = 0,
+        totalSuccessfulMigrationsDonated = 0,
+        totalSuccessfulMigrationsReceived = 0,
+        totalFailedMigrationsDonated = 0,
+        totalFailedMigrationsReceived = 0
+    }) {
+        const check = function(expectedVal, stats, fieldName) {
+            if (expectedVal == stats[fieldName]) {
+                return true;  // Condition reached, true means the counter reached the target.
+            }
+            assert.gt(expectedVal,
+                      stats[fieldName],
+                      `Stat ${fieldName} value ${stats[fieldName]} exceeded the target`);
+            return false;
+        };
+        let stats;
+        assert.soon(() => {
+            stats = this.getTenantMigrationStats(node);
+            if (check(currentMigrationsDonating, stats, "currentMigrationsDonating") &&
+                check(currentMigrationsReceiving, stats, "currentMigrationsReceiving") &&
+                check(
+                    totalSuccessfulMigrationsDonated, stats, "totalSuccessfulMigrationsDonated") &&
+                check(totalSuccessfulMigrationsReceived,
+                      stats,
+                      "totalSuccessfulMigrationsReceived") &&
+                check(totalFailedMigrationsDonated, stats, "totalFailedMigrationsDonated") &&
+                check(totalFailedMigrationsReceived, stats, "totalFailedMigrationsReceived")) {
+                return true;  // Done.
+            }
+            return false;
+        }, `Awaiting for tenant migration stats to reach target, got ${tojson(stats)}`);
     };
 
     /**
@@ -422,14 +615,23 @@ function TenantMigrationTest({name = "TenantMigrationTest", donorRst, recipientR
     };
 }
 
-TenantMigrationTest.State = {
+TenantMigrationTest.DonorState = {
     kCommitted: "committed",
     kAborted: "aborted",
     kDataSync: "data sync",
     kBlocking: "blocking",
+    kAbortingIndexBuilds: "aborting index builds",
 };
 
-TenantMigrationTest.AccessState = {
+TenantMigrationTest.RecipientState = {
+    kStarted: "started",
+    kConsistent: "consistent",
+    kDone: "done",
+};
+
+TenantMigrationTest.State = TenantMigrationTest.DonorState;
+
+TenantMigrationTest.DonorAccessState = {
     kAllow: "allow",
     kBlockWrites: "blockWrites",
     kBlockWritesAndReads: "blockWritesAndReads",
@@ -437,4 +639,10 @@ TenantMigrationTest.AccessState = {
     kAborted: "aborted",
 };
 
+TenantMigrationTest.RecipientAccessState = {
+    kReject: "reject",
+    kRejectBefore: "rejectBefore"
+};
+
 TenantMigrationTest.kConfigDonorsNS = "config.tenantMigrationDonors";
+TenantMigrationTest.kConfigRecipientsNS = "config.tenantMigrationRecipients";

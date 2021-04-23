@@ -35,17 +35,16 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 
 namespace mongo {
+
 class IndexConsistency;
 class CollectionCatalog;
+
 class CollectionImpl final : public Collection {
 public:
-    enum ValidationAction { WARN, ERROR_V };
-    enum ValidationLevel { OFF, MODERATE, STRICT_V };
-
     explicit CollectionImpl(OperationContext* opCtx,
                             const NamespaceString& nss,
                             RecordId catalogId,
-                            UUID uuid,
+                            const CollectionOptions& options,
                             std::unique_ptr<RecordStore> recordStore);
 
     ~CollectionImpl();
@@ -57,7 +56,7 @@ public:
         std::shared_ptr<Collection> make(OperationContext* opCtx,
                                          const NamespaceString& nss,
                                          RecordId catalogId,
-                                         CollectionUUID uuid,
+                                         const CollectionOptions& options,
                                          std::unique_ptr<RecordStore> rs) const final;
     };
 
@@ -275,32 +274,43 @@ public:
      */
     void setValidator(OperationContext* opCtx, Validator validator) final;
 
-    Status setValidationLevel(OperationContext* opCtx, StringData newLevel) final;
-    Status setValidationAction(OperationContext* opCtx, StringData newAction) final;
+    Status setValidationLevel(OperationContext* opCtx, ValidationLevelEnum newLevel) final;
+    Status setValidationAction(OperationContext* opCtx, ValidationActionEnum newAction) final;
 
-    StringData getValidationLevel() const final;
-    StringData getValidationAction() const final;
+    boost::optional<ValidationLevelEnum> getValidationLevel() const final;
+    boost::optional<ValidationActionEnum> getValidationAction() const final;
 
     /**
-     * Sets the validator to exactly what's provided. If newLevel or newAction are empty, this
-     * sets them to the defaults. Any error Status returned by this function should be considered
-     * fatal.
+     * Sets the validator to exactly what's provided. Any error Status returned by this function
+     * should be considered fatal.
      */
     Status updateValidator(OperationContext* opCtx,
                            BSONObj newValidator,
-                           StringData newLevel,
-                           StringData newAction) final;
+                           boost::optional<ValidationLevelEnum> newLevel,
+                           boost::optional<ValidationActionEnum> newAction) final;
+
+    /**
+     * Returns non-OK status if the collection validator does not comply with stable API
+     * requirements.
+     */
+    Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const final;
 
     bool getRecordPreImages() const final;
     void setRecordPreImages(OperationContext* opCtx, bool val) final;
 
     bool isTemporary(OperationContext* opCtx) const final;
 
+    bool isClustered() const final;
+
+    Status updateCappedSize(OperationContext* opCtx, long long newCappedSize) final;
+
     //
     // Stats
     //
 
     bool isCapped() const final;
+    long long getCappedMaxDocs() const final;
+    long long getCappedMaxSize() const final;
 
     CappedCallback* getCappedCallback() final;
     const CappedCallback* getCappedCallback() const final;
@@ -313,9 +323,9 @@ public:
      */
     std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier() const final;
 
-    uint64_t numRecords(OperationContext* opCtx) const final;
+    long long numRecords(OperationContext* opCtx) const final;
 
-    uint64_t dataSize(OperationContext* opCtx) const final;
+    long long dataSize(OperationContext* opCtx) const final;
 
     /**
      * Currently fast counts are prone to false negative as it is not tolerant to unclean shutdowns.
@@ -355,6 +365,8 @@ public:
      */
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
+    boost::optional<TimeseriesOptions> getTimeseriesOptions() const final;
+
     /**
      * Get a pointer to the collection's default collator. The pointer must not be used after this
      * Collection is destroyed.
@@ -374,7 +386,7 @@ public:
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) final;
-    void onDeregisterFromCatalog() final;
+    void onDeregisterFromCatalog(OperationContext* opCtx) final;
 
 private:
     /**
@@ -382,17 +394,24 @@ private:
      */
     Status checkValidation(OperationContext* opCtx, const BSONObj& document) const;
 
-    /**
-     * same semantics as insertDocument, but doesn't do:
-     *  - some user error checks
-     *  - adjust padding
-     */
-    Status _insertDocument(OperationContext* opCtx, const BSONObj& doc);
-
     Status _insertDocuments(OperationContext* opCtx,
                             std::vector<InsertStatement>::const_iterator begin,
                             std::vector<InsertStatement>::const_iterator end,
-                            OpDebug* opDebug) const;
+                            OpDebug* opDebug,
+                            bool fromMigrate) const;
+
+    /**
+     * Checks whether the collection is capped and if the current data size or number of records
+     * exceeds _cappedMaxSize or _cappedMaxDocs respectively.
+     */
+    bool _cappedAndNeedDelete(OperationContext* opCtx) const;
+
+
+    /**
+     * Deletes records from this capped collection while _cappedMaxDocs or _cappedMaxSize is
+     * exceeded. Generates oplog entries for the deleted records in FCV >= 5.0.
+     */
+    void _cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted) const;
 
     /**
      * Holder of shared state between CollectionImpl clones. Also implements CappedCallback, a
@@ -401,7 +420,9 @@ private:
      * on CollectionImpl instances.
      */
     struct SharedState : public CappedCallback {
-        SharedState(CollectionImpl* collection, std::unique_ptr<RecordStore> recordStore);
+        SharedState(CollectionImpl* collection,
+                    std::unique_ptr<RecordStore> recordStore,
+                    const CollectionOptions& options);
         ~SharedState();
 
         /**
@@ -448,13 +469,24 @@ private:
         const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
 
         const bool _needCappedLock;
-    };
 
+        AtomicWord<bool> _committed{true};
+
+        // Capped information.
+        const bool _isCapped;
+        const long long _cappedMaxDocs;
+        long long _cappedMaxSize;
+
+        // Only one operation can do capped deletes at a time and protects the state below.
+        mutable Mutex _cappedDeleterMutex =
+            MONGO_MAKE_LATCH("CollectionImpl::SharedState::_cappedDeleterMutex");
+        RecordId _cappedFirstRecord;
+    };
 
     NamespaceString _ns;
     RecordId _catalogId;
     UUID _uuid;
-    bool _committed = true;
+    bool _cachedCommitted = true;
     std::shared_ptr<SharedState> _shared;
 
     clonable_ptr<IndexCatalog> _indexCatalog;
@@ -462,10 +494,14 @@ private:
     // The validator is using shared state internally. Collections share validator until a new
     // validator is set in setValidator which sets a new instance.
     Validator _validator;
-    // The default values match the defaults of the functions that parse the validation action and
-    // level.
-    ValidationAction _validationAction = ERROR_V;
-    ValidationLevel _validationLevel = STRICT_V;
+    boost::optional<ValidationActionEnum> _validationAction;
+    boost::optional<ValidationLevelEnum> _validationLevel;
+
+    // Whether or not this collection is clustered on _id values.
+    bool _clustered = false;
+
+    // If this is a time-series buckets collection, the metadata for this collection.
+    boost::optional<TimeseriesOptions> _timeseriesOptions;
 
     bool _recordPreImages = false;
 

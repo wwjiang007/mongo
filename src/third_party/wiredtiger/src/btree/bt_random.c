@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -290,10 +290,11 @@ __random_leaf(WT_CURSOR_BTREE *cbt)
         return (__cursor_kv_return(cbt, cbt->upd_value));
 
     /*
-     * Try again if there are at least a few hundred disk-based entries: this may be a normal leaf
-     * page with big items.
+     * Try again if there are at least a few hundred disk-based entries or this is a page as we read
+     * it from disk, it might be a normal leaf page with big items.
      */
-    if (cbt->ref->page->entries > WT_RANDOM_DISK_ENOUGH / 2) {
+    if (cbt->ref->page->entries > WT_RANDOM_DISK_ENOUGH / 5 ||
+      (cbt->ref->page->dsk != NULL && cbt->ref->page->modify == NULL)) {
         WT_RET(__random_leaf_disk(cbt, &valid));
         if (valid)
             return (__cursor_kv_return(cbt, cbt->upd_value));
@@ -489,8 +490,7 @@ __wt_btcur_next_random(WT_CURSOR_BTREE *cbt)
     if (btree->type != BTREE_ROW)
         WT_RET_MSG(session, ENOTSUP, "WT_CURSOR.next_random only supported by row-store tables");
 
-    WT_STAT_CONN_INCR(session, cursor_next);
-    WT_STAT_DATA_INCR(session, cursor_next);
+    WT_STAT_CONN_DATA_INCR(session, cursor_next);
 
     F_CLR(cursor, WT_CURSTD_KEY_SET | WT_CURSTD_VALUE_SET);
 

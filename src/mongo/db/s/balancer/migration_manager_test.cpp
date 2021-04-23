@@ -29,14 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include <memory>
-
 #include "mongo/db/commands.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/s/balancer/migration_manager.h"
 #include "mongo/db/s/balancer/migration_test_fixture.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 
 namespace mongo {
@@ -117,17 +115,18 @@ TEST_F(MigrationManagerTest, OneCollectionTwoMigrations) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(2, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up two chunks in the metadata.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
     version.incMinor();
-    ChunkType chunk2 =
-        setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
+    ChunkType chunk2 = setUpChunk(
+        collName, collUUID, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     // Going to request that these two chunks get migrated.
     const std::vector<MigrateInfo> migrationRequests{{kShardId1,
@@ -174,26 +173,28 @@ TEST_F(MigrationManagerTest, TwoCollectionsTwoMigrationsEach) {
     // Set up a database and two collections as sharded in the metadata.
     std::string dbName = "foo";
     const NamespaceString collName1(dbName, "bar");
+    const auto collUUID1 = UUID::gen();
     const NamespaceString collName2(dbName, "baz");
-    ChunkVersion version1(2, 0, OID::gen());
-    ChunkVersion version2(2, 0, OID::gen());
+    const auto collUUID2 = UUID::gen();
+    ChunkVersion version1(2, 0, OID::gen(), Timestamp(12));
+    ChunkVersion version2(2, 0, OID::gen(), Timestamp(24));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName1, version1);
-    setUpCollection(collName2, version2);
+    setUpCollection(collName1, collUUID1, version1);
+    setUpCollection(collName2, collUUID2, version2);
 
     // Set up two chunks in the metadata for each collection.
-    ChunkType chunk1coll1 =
-        setUpChunk(collName1, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version1);
+    ChunkType chunk1coll1 = setUpChunk(
+        collName1, collUUID1, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version1);
     version1.incMinor();
-    ChunkType chunk2coll1 =
-        setUpChunk(collName1, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version1);
+    ChunkType chunk2coll1 = setUpChunk(
+        collName1, collUUID1, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version1);
 
-    ChunkType chunk1coll2 =
-        setUpChunk(collName2, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version2);
+    ChunkType chunk1coll2 = setUpChunk(
+        collName2, collUUID2, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version2);
     version2.incMinor();
-    ChunkType chunk2coll2 =
-        setUpChunk(collName2, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version2);
+    ChunkType chunk2coll2 = setUpChunk(
+        collName2, collUUID2, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version2);
 
     // Going to request that these four chunks get migrated.
     const std::vector<MigrateInfo> migrationRequests{{kShardId1,
@@ -252,17 +253,18 @@ TEST_F(MigrationManagerTest, SourceShardNotFound) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(2, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up two chunks in the metadata.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
     version.incMinor();
-    ChunkType chunk2 =
-        setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
+    ChunkType chunk2 = setUpChunk(
+        collName, collUUID, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     // Going to request that these two chunks get migrated.
     const std::vector<MigrateInfo> migrationRequests{{kShardId1,
@@ -309,14 +311,15 @@ TEST_F(MigrationManagerTest, JumboChunkResponseBackwardsCompatibility) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(2, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up a single chunk in the metadata.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
 
     // Going to request that this chunk gets migrated.
     const std::vector<MigrateInfo> migrationRequests{{kShardId1,
@@ -354,14 +357,15 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(2, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up a single chunk in the metadata.
-    ChunkType chunk =
-        setUpChunk(collName, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
+    ChunkType chunk = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
 
     auto future = launchAsync([&] {
         ThreadClient tc("Test", getServiceContext());
@@ -450,14 +454,15 @@ TEST_F(MigrationManagerTest, RestartMigrationManager) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(2, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up a single chunk in the metadata.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
 
     // Go through the lifecycle of the migration manager
     _migrationManager->interruptAndDisableMigrations();
@@ -501,18 +506,19 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(1, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(1, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up two chunks in the metadata and set up two fake active migrations by writing documents
     // to the config.migrations collection.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
     version.incMinor();
-    ChunkType chunk2 =
-        setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
+    ChunkType chunk2 = setUpChunk(
+        collName, collUUID, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     _migrationManager->interruptAndDisableMigrations();
     _migrationManager->drainActiveMigrations();
@@ -521,8 +527,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     setUpMigration(chunk2, kShardId3.toString());
 
     // Mimic all config distlocks being released on config server stepup to primary.
-    auto distLockManager = catalogClient()->getDistLockManager();
-    distLockManager->unlockAll(operationContext(), distLockManager->getProcessID());
+    DistLockManager::get(operationContext())->unlockAll(operationContext());
 
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
 
@@ -556,17 +561,18 @@ TEST_F(MigrationManagerTest, FailMigrationRecovery) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(1, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(1, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up two chunks in the metadata.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
     version.incMinor();
-    ChunkType chunk2 =
-        setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
+    ChunkType chunk2 = setUpChunk(
+        collName, collUUID, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     _migrationManager->interruptAndDisableMigrations();
     _migrationManager->drainActiveMigrations();
@@ -588,12 +594,11 @@ TEST_F(MigrationManagerTest, FailMigrationRecovery) {
     // Take the distributed lock for the collection, which should be released during recovery when
     // it fails. Any dist lock held by the config server will be released via proccessId, so the
     // session ID used here doesn't matter.
-    ASSERT_OK(catalogClient()->getDistLockManager()->lockWithSessionID(
-        operationContext(),
-        collName.ns(),
-        "MigrationManagerTest",
-        OID::gen(),
-        DistLockManager::kSingleLockAttemptTimeout));
+    ASSERT_OK(DistLockManager::get(operationContext())
+                  ->lockDirect(operationContext(),
+                               collName.ns(),
+                               "MigrationManagerTest",
+                               DistLockManager::kSingleLockAttemptTimeout));
 
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
     _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
@@ -615,17 +620,18 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(1, 0, OID::gen());
+    const auto collUUID = UUID::gen();
+    ChunkVersion version(1, 0, OID::gen(), Timestamp(42));
 
     setUpDatabase(dbName, kShardId0);
-    setUpCollection(collName, version);
+    setUpCollection(collName, collUUID, version);
 
     // Set up two chunks in the metadata.
-    ChunkType chunk1 =
-        setUpChunk(collName, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
+    ChunkType chunk1 = setUpChunk(
+        collName, collUUID, kKeyPattern.globalMin(), BSON(kPattern << 49), kShardId0, version);
     version.incMinor();
-    ChunkType chunk2 =
-        setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
+    ChunkType chunk2 = setUpChunk(
+        collName, collUUID, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     // Going to request that these two chunks get migrated.
     const std::vector<MigrateInfo> migrationRequests{{kShardId1,

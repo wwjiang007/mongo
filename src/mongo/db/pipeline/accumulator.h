@@ -97,7 +97,7 @@ public:
     /// The name of the op as used in a serialization of the pipeline.
     virtual const char* getOpName() const = 0;
 
-    int memUsageForSorter() const {
+    int getMemUsage() const {
         dassert(_memUsageBytes != 0);  // This would mean subclass didn't set it
         return _memUsageBytes;
     }
@@ -252,8 +252,8 @@ private:
 class AccumulatorMinMax : public AccumulatorState {
 public:
     enum Sense : int {
-        MIN = 1,
-        MAX = -1,  // Used to "scale" comparison.
+        kMin = 1,
+        kMax = -1,  // Used to "scale" comparison.
     };
 
     AccumulatorMinMax(ExpressionContext* const expCtx, Sense sense);
@@ -278,13 +278,15 @@ private:
 
 class AccumulatorMax final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMax(ExpressionContext* const expCtx) : AccumulatorMinMax(expCtx, MAX) {}
+    explicit AccumulatorMax(ExpressionContext* const expCtx)
+        : AccumulatorMinMax(expCtx, Sense::kMax) {}
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
 class AccumulatorMin final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMin(ExpressionContext* const expCtx) : AccumulatorMinMax(expCtx, MIN) {}
+    explicit AccumulatorMin(ExpressionContext* const expCtx)
+        : AccumulatorMinMax(expCtx, Sense::kMin) {}
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
@@ -376,6 +378,25 @@ public:
 
 private:
     MutableDocument _output;
+};
+
+class AccumulatorExpMovingAvg : public AccumulatorState {
+public:
+    AccumulatorExpMovingAvg(ExpressionContext* const expCtx, Decimal128 alpha);
+
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool toBeMerged) final;
+    const char* getOpName() const final;
+    void reset() final;
+
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx,
+                                                         Decimal128 alpha);
+
+private:
+    Decimal128 _alpha;
+    Decimal128 _currentResult;
+    bool _init = false;
+    bool _isDecimal = false;
 };
 
 }  // namespace mongo

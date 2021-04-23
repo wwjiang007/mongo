@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2019 MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/stdx/variant.h"
 
@@ -46,8 +47,12 @@ namespace mongo {
  */
 class OptionalBool {
 public:
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     static OptionalBool parseFromBSON(BSONElement element) {
-        uassert(ErrorCodes::BadValue,
+        uassert(ErrorCodes::TypeMismatch,
                 str::stream() << "Field '" << element.fieldNameStringData()
                               << "' should be a boolean value, but found: " << element.type(),
                 !element || element.type() == BSONType::Bool);
@@ -75,6 +80,9 @@ public:
 
     /**
      * Serialize this object as a field in a document. If _value is empty, omit the field.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
      */
     void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
         if (_value) {
@@ -84,6 +92,9 @@ public:
 
     /**
      * Serialize this object as an element of a BSON array. If _value is empty, omit the entry.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
      */
     void serializeToBSON(BSONArrayBuilder* builder) const {
         if (_value) {
@@ -111,6 +122,10 @@ private:
  */
 class IDLAnyType {
 public:
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     static IDLAnyType parseFromBSON(const BSONElement& element) {
         return IDLAnyType(element);
     }
@@ -118,10 +133,18 @@ public:
     IDLAnyType() = default;
     IDLAnyType(const BSONElement& element) : _element(element) {}
 
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
         builder->appendAs(_element, fieldName);
     }
 
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     void serializeToBSON(BSONArrayBuilder* builder) const {
         builder->append(_element);
     }
@@ -130,9 +153,37 @@ public:
         return _element;
     }
 
-private:
+protected:
     BSONElement _element;
 };
+
+/**
+ * Class to represent a BSON element with any type from IDL. Unlike IDLAnyType, here the caller
+ * does not need to ensure the backing BSON stays alive; it is handled by the class.
+ */
+class IDLAnyTypeOwned : public IDLAnyType {
+public:
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
+    static IDLAnyTypeOwned parseFromBSON(const BSONElement& element) {
+        return IDLAnyTypeOwned(element);
+    }
+
+    IDLAnyTypeOwned() = default;
+    IDLAnyTypeOwned(const BSONElement& element) {
+        _obj = element.wrap();
+        _element = _obj.firstElement();
+    }
+    // This constructor can be used to avoid copying the contents of 'element'.
+    IDLAnyTypeOwned(const BSONElement& element, BSONObj owningBSONObj)
+        : IDLAnyType(element), _obj(std::move(owningBSONObj)) {}
+
+private:
+    BSONObj _obj;
+};
+
 class WriteConcernW {
 public:
     static WriteConcernW deserializeWriteConcernW(BSONElement wEl) {
@@ -147,14 +198,14 @@ public:
         uasserted(ErrorCodes::FailedToParse, "w has to be a number or string");
     }
 
-    void serializeWriteConcernW(BSONObjBuilder* builder) const {
+    void serializeWriteConcernW(StringData fieldName, BSONObjBuilder* builder) const {
         if (auto stringVal = stdx::get_if<std::string>(&_w)) {
-            builder->append("w", *stringVal);
+            builder->append(fieldName, *stringVal);
             return;
         }
         auto intVal = stdx::get_if<std::int64_t>(&_w);
         invariant(intVal);
-        builder->appendIntOrLL("w", *intVal);
+        builder->appendNumber(fieldName, static_cast<long long>(*intVal));
     }
 
     WriteConcernW() : _w{1}, _usedDefault{true} {};

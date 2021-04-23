@@ -54,9 +54,8 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
-#include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -102,7 +101,7 @@ boost::optional<long long> _parseDroppedCollectionCount(const OplogEntry& oplogE
         LOGV2_WARNING(21634,
                       "Unable to get collection count from oplog entry without the o2 field",
                       "type"_attr = desc,
-                      "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                      "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         return boost::none;
     }
 
@@ -114,7 +113,7 @@ boost::optional<long long> _parseDroppedCollectionCount(const OplogEntry& oplogE
                       "Failed to parse oplog entry for collection count",
                       "type"_attr = desc,
                       "error"_attr = status,
-                      "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                      "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         return boost::none;
     }
 
@@ -123,7 +122,7 @@ boost::optional<long long> _parseDroppedCollectionCount(const OplogEntry& oplogE
                       "Invalid collection count found in oplog entry",
                       "type"_attr = desc,
                       "count"_attr = count,
-                      "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                      "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         return boost::none;
     }
 
@@ -132,7 +131,7 @@ boost::optional<long long> _parseDroppedCollectionCount(const OplogEntry& oplogE
                 "Parsed collection count of oplog entry",
                 "count"_attr = count,
                 "type"_attr = desc,
-                "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
     return count;
 }
 
@@ -552,7 +551,7 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
     // rollback.
     _correctRecordStoreCounts(opCtx);
 
-    tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+    tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers(opCtx);
 
     // Reconstruct prepared transactions after counts have been adjusted. Since prepared
     // transactions were aborted (i.e. the in-memory counts were rolled-back) before computing
@@ -631,7 +630,7 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                               "namespace"_attr = nss.ns(),
                               "uuid"_attr = uuid.toString(),
                               "ident"_attr = ident,
-                              "error"_attr = exec->statestr(state));
+                              "error"_attr = exec->stateToStr(state));
                 continue;
             }
             newCount = countFromScan;
@@ -822,7 +821,7 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
         const auto uuid = oplogEntry.getUuid();
         invariant(uuid,
                   str::stream() << "Oplog entry to roll back is unexpectedly missing a UUID: "
-                                << redact(oplogEntry.toBSON()));
+                                << redact(oplogEntry.toBSONForLogging()));
         const auto idElem = oplogEntry.getIdElement();
         if (!idElem.eoo()) {
             // We call BSONElement::wrap() on each _id element to create a new BSONObj with an owned
@@ -844,7 +843,7 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
             LOGV2_WARNING(21641,
                           "Shard identity document rollback detected. oplog op: {oplogEntry}",
                           "Shard identity document rollback detected",
-                          "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                          "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
                    opNss == VersionType::ConfigNS) {
             // Check if the creation of the config server config version document is being rolled
@@ -853,7 +852,7 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
             LOGV2_WARNING(21642,
                           "Config version document rollback detected. oplog op: {oplogEntry}",
                           "Config version document rollback detected",
-                          "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                          "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         }
 
         // Rolling back an insert must decrement the count by 1.
@@ -877,7 +876,7 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
                     invariant(UUID::parse(catalogEntry["md"]["options"]["uuid"]),
                               str::stream() << "Oplog entry to roll back is unexpectedly missing "
                                                "import collection UUID: "
-                                            << redact(oplogEntry.toBSON()));
+                                            << redact(oplogEntry.toBSONForLogging()));
                 // If we roll back an import, then we do not need to change the size of that uuid.
                 _countDiffs.erase(importTargetUUID);
                 _pendingDrops.erase(importTargetUUID);
@@ -893,7 +892,7 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
             const auto uuid = oplogEntry.getUuid().get();
             invariant(_countDiffs.find(uuid) == _countDiffs.end(),
                       str::stream() << "Unexpected existing count diff for " << uuid.toString()
-                                    << " op: " << redact(oplogEntry.toBSON()));
+                                    << " op: " << redact(oplogEntry.toBSONForLogging()));
             if (auto countResult = _parseDroppedCollectionCount(oplogEntry)) {
                 PendingDropInfo info;
                 info.count = *countResult;
@@ -917,11 +916,11 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
                 UUID::parse(oplogEntry.getObject()[kDropTargetFieldName]),
                 str::stream()
                     << "Oplog entry to roll back is unexpectedly missing dropTarget UUID: "
-                    << redact(oplogEntry.toBSON()));
+                    << redact(oplogEntry.toBSONForLogging()));
             invariant(_countDiffs.find(dropTargetUUID) == _countDiffs.end(),
                       str::stream()
                           << "Unexpected existing count diff for " << dropTargetUUID.toString()
-                          << " op: " << redact(oplogEntry.toBSON()));
+                          << " op: " << redact(oplogEntry.toBSONForLogging()));
             if (auto countResult = _parseDroppedCollectionCount(oplogEntry)) {
                 PendingDropInfo info;
                 info.count = *countResult;
@@ -977,7 +976,6 @@ Status RollbackImpl::_processRollbackOpForApplyOps(OperationContext* opCtx,
                 return subStatus;
             }
         }
-        return Status::OK();
     } catch (DBException& e) {
         return e.toStatus();
     }
@@ -1065,11 +1063,11 @@ Status RollbackImpl::_checkAgainstTimeLimit(
         return Status(ErrorCodes::OplogStartMissing, "no oplog during rollback");
     }
     const auto topOfOplogBSON = topOfOplogSW.getValue().first;
-    const auto topOfOplog = uassertStatusOK(OplogEntry::parse(topOfOplogBSON));
+    const auto topOfOplogOpAndWallTime = OpTimeAndWallTime::parse(topOfOplogBSON);
 
-    _rollbackStats.lastLocalOptime = topOfOplog.getOpTime();
+    _rollbackStats.lastLocalOptime = topOfOplogOpAndWallTime.opTime;
 
-    auto topOfOplogWallTime = topOfOplog.getWallClockTime();
+    auto topOfOplogWallTime = topOfOplogOpAndWallTime.wallTime;
     // We check the difference between the top of the oplog and the first oplog entry after the
     // common point when computing the rollback time limit.
     auto firstOpWallClockTimeAfterCommonPoint =
@@ -1227,8 +1225,12 @@ Status RollbackImpl::_triggerOpObserver(OperationContext* opCtx) {
 
 void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
     invariant(opCtx);
-    invariant(_replicationCoordinator->getMemberState() == MemberState(MemberState::RS_ROLLBACK));
 
+    // It is possible that this node has actually been removed due to a reconfig via
+    // heartbeat during rollback. But it should be fine to transition to SECONDARY
+    // and this won't change how the node reports its member state since topology
+    // coordinator will always check if the node exists in its local config when
+    // returning member state.
     LOGV2(21611, "Transition to SECONDARY");
 
     ReplicationStateTransitionLockGuard transitionGuard(opCtx, MODE_X);

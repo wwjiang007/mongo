@@ -170,46 +170,77 @@ Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx,
  */
 OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss, boost::optional<UUID> uuid) {
     BSONObj oField = BSON("_id" << t << "a" << t);
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kInsert,         // op type
-                      nss,                         // namespace
-                      uuid,                        // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t() + Seconds(t),       // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none,   // ShardId of resharding recipient
-                      boost::none);  // _id
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              boost::none,                 // hash
+                              OpTypeEnum::kInsert,         // op type
+                              nss,                         // namespace
+                              uuid,                        // uuid
+                              boost::none,                 // fromMigrate
+                              OplogEntry::kOplogVersion,   // version
+                              oField,                      // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none)};  // _id
+}
+
+/**
+ * Generates an update oplog entry with the given number used for the timestamp, and the given
+ * pre- and post- image optimes.
+ */
+OplogEntry makeUpdateOplogEntry(int t,
+                                const NamespaceString& nss,
+                                boost::optional<UUID> uuid,
+                                boost::optional<OpTime> preImageOpTime,
+                                boost::optional<OpTime> postImageOpTime) {
+    BSONObj oField = BSON("_id" << t << "a" << t);
+    BSONObj o2Field = BSON("_id" << t);
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              boost::none,                 // hash
+                              OpTypeEnum::kUpdate,         // op type
+                              nss,                         // namespace
+                              uuid,                        // uuid
+                              boost::none,                 // fromMigrate
+                              OplogEntry::kOplogVersion,   // version
+                              oField,                      // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              boost::none,  // optime of previous write within same transaction
+                              preImageOpTime,
+                              postImageOpTime,
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none)};  // _id
 }
 
 OplogEntry makeNoopOplogEntry(int t, const StringData& msg) {
     BSONObj oField = BSON("msg" << msg << "count" << t);
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kNoop,           // op type
-                      NamespaceString(""),         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t() + Seconds(t),       // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none,   // ShardId of resharding recipient
-                      boost::none);  // _id
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              boost::none,                 // hash
+                              OpTypeEnum::kNoop,           // op type
+                              NamespaceString(""),         // namespace
+                              boost::none,                 // uuid
+                              boost::none,                 // fromMigrate
+                              OplogEntry::kOplogVersion,   // version
+                              oField,                      // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none)};  // _id
 }
 
 /**
@@ -226,24 +257,24 @@ OplogEntry makeApplyOpsOplogEntry(int t, bool prepare, const std::vector<OplogEn
     if (prepare) {
         oField.append("prepare", true);
     }
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kCommand,        // op type
-                      nss,                         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField.obj(),                // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t() + Seconds(t),       // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none,   // ShardId of resharding recipient
-                      boost::none);  // _id
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              boost::none,                 // hash
+                              OpTypeEnum::kCommand,        // op type
+                              nss,                         // namespace
+                              boost::none,                 // uuid
+                              boost::none,                 // fromMigrate
+                              OplogEntry::kOplogVersion,   // version
+                              oField.obj(),                // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none)};  // _id
 }
 
 /**
@@ -260,24 +291,24 @@ OplogEntry makeCommitTransactionOplogEntry(int t, StringData dbName, bool prepar
     } else {
         oField = BSON("applyOps" << BSONArray() << "count" << count);
     }
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kCommand,        // op type
-                      nss,                         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t() + Seconds(t),       // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none,   // post-image optime
-                      boost::none,   // ShardId of resharding recipient
-                      boost::none);  // _id
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              boost::none,                 // hash
+                              OpTypeEnum::kCommand,        // op type
+                              nss,                         // namespace
+                              boost::none,                 // uuid
+                              boost::none,                 // fromMigrate
+                              OplogEntry::kOplogVersion,   // version
+                              oField,                      // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              boost::none,    // optime of previous write within same transaction
+                              boost::none,    // pre-image optime
+                              boost::none,    // post-image optime
+                              boost::none,    // ShardId of resharding recipient
+                              boost::none)};  // _id
 }
 
 /**
@@ -321,24 +352,24 @@ OplogEntry makeLargeTransactionOplogEntries(int t,
         }
         oField = oFieldBuilder.obj();
     }
-    return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      boost::none,                 // hash
-                      OpTypeEnum::kCommand,        // op type
-                      nss,                         // namespace
-                      boost::none,                 // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      oField,                      // o
-                      boost::none,                 // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t() + Seconds(t),       // wall clock time
-                      boost::none,                 // statement id
-                      prevWriteOpTime,  // optime of previous write within same transaction
-                      boost::none,      // pre-image optime
-                      boost::none,      // post-image optime
-                      boost::none,      // ShardId of resharding recipient
-                      boost::none);     // _id
+    return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
+                              boost::none,                 // hash
+                              OpTypeEnum::kCommand,        // op type
+                              nss,                         // namespace
+                              boost::none,                 // uuid
+                              boost::none,                 // fromMigrate
+                              OplogEntry::kOplogVersion,   // version
+                              oField,                      // o
+                              boost::none,                 // o2
+                              {},                          // sessionInfo
+                              boost::none,                 // upsert
+                              Date_t() + Seconds(t),       // wall clock time
+                              {},                          // statement ids
+                              prevWriteOpTime,  // optime of previous write within same transaction
+                              boost::none,      // pre-image optime
+                              boost::none,      // post-image optime
+                              boost::none,      // ShardId of resharding recipient
+                              boost::none)};    // _id
 }
 
 /**
@@ -386,7 +417,7 @@ std::string toString(const std::vector<OplogEntry>& ops) {
     StringBuilder sb;
     sb << "[";
     for (const auto& op : ops) {
-        sb << " " << op.toString();
+        sb << " " << op.toStringForLogging();
     }
     sb << " ]";
     return sb.str();

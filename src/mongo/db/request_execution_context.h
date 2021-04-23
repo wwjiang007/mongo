@@ -55,7 +55,9 @@ class RequestExecutionContext {
 public:
     RequestExecutionContext() = delete;
     RequestExecutionContext(const RequestExecutionContext&) = delete;
+    RequestExecutionContext& operator=(const RequestExecutionContext&) = delete;
     RequestExecutionContext(RequestExecutionContext&&) = delete;
+    RequestExecutionContext& operator=(RequestExecutionContext&&) = delete;
 
     RequestExecutionContext(OperationContext* opCtx, Message message)
         : _opCtx(opCtx),
@@ -104,15 +106,6 @@ public:
         return _replyBuilder.get();
     }
 
-    void setResponse(DbResponse response) {
-        invariant(_isOnClientThread());
-        _response = std::move(response);
-    }
-    DbResponse& getResponse() {
-        invariant(_isOnClientThread());
-        return _response;
-    }
-
 private:
     bool _isOnClientThread() const {
         return _opCtx != nullptr && Client::getCurrent() == _opCtx->getClient();
@@ -124,7 +117,6 @@ private:
     boost::optional<OpMsgRequest> _request;
     Command* _command = nullptr;
     std::unique_ptr<rpc::ReplyBuilderInterface> _replyBuilder;
-    DbResponse _response;
 };
 
 }  // namespace mongo

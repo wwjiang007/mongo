@@ -45,13 +45,11 @@ class OpTime;
 /**
  * Renames the collection from "source" to "target" and drops the existing collection if
  * "dropTarget" is true. "stayTemp" indicates whether a collection should maintain its
- * temporariness. "skipSourceCollectionShardedCheck" indicates the "source" collection sharding
- * state shouldn't be checked.
+ * temporariness.
  */
 struct RenameCollectionOptions {
     bool dropTarget = false;
     bool stayTemp = false;
-    bool skipSourceCollectionShardedCheck = false;
 };
 
 void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
@@ -88,9 +86,17 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
 Status renameCollectionForRollback(OperationContext* opCtx,
                                    const NamespaceString& target,
                                    const UUID& uuid);
+
+/**
+ * Performs validation checks to ensure source and target namespaces are eligible for rename.
+ */
+void validateNamespacesForRenameCollection(OperationContext* opCtx,
+                                           const NamespaceString& source,
+                                           const NamespaceString& target);
+
 /**
  * Runs renameCollection() with preliminary validation checks to ensure source
- * and target namespaces are elligible for rename.
+ * and target namespaces are eligible for rename.
  */
 void validateAndRunRenameCollection(OperationContext* opCtx,
                                     const NamespaceString& source,

@@ -38,6 +38,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/views/durable_view_catalog.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -45,6 +46,7 @@ namespace mongo {
 using std::string;
 
 namespace {
+
 /**
  * Validates the nesting depth of 'obj', returning a non-OK status if it exceeds the limit.
  */
@@ -176,7 +178,13 @@ StatusWith<BSONObj> fixDocumentForInsert(OperationContext* opCtx, const BSONObj&
     return StatusWith<BSONObj>(b.obj());
 }
 
-Status userAllowedWriteNS(const NamespaceString& ns) {
+Status userAllowedWriteNS(OperationContext* opCtx, const NamespaceString& ns) {
+    if (!opCtx->isEnforcingConstraints()) {
+        // Mechanisms like oplog application call into `userAllowedCreateNS`. Relax constraints for
+        // those circumstances.
+        return Status::OK();
+    }
+
     // TODO (SERVER-49545): Remove the FCV check when 5.0 becomes last-lts.
     if (ns.isSystemDotProfile() ||
         (ns.isSystemDotViews() && serverGlobalParams.featureCompatibility.isVersionInitialized() &&
@@ -186,10 +194,16 @@ Status userAllowedWriteNS(const NamespaceString& ns) {
          repl::ReplicationCoordinator::get(getGlobalServiceContext())->isReplEnabled())) {
         return Status(ErrorCodes::InvalidNamespace, str::stream() << "cannot write to " << ns);
     }
-    return userAllowedCreateNS(ns);
+    return userAllowedCreateNS(opCtx, ns);
 }
 
-Status userAllowedCreateNS(const NamespaceString& ns) {
+Status userAllowedCreateNS(OperationContext* opCtx, const NamespaceString& ns) {
+    if (!opCtx->isEnforcingConstraints()) {
+        // Mechanisms like oplog application call into `userAllowedCreateNS`. Relax constraints for
+        // those circumstances.
+        return Status::OK();
+    }
+
     if (!ns.isValid(NamespaceString::DollarInDbNameBehavior::Disallow)) {
         return Status(ErrorCodes::InvalidNamespace, str::stream() << "Invalid namespace: " << ns);
     }
@@ -209,7 +223,7 @@ Status userAllowedCreateNS(const NamespaceString& ns) {
         return Status::OK();
     }
 
-    if (ns.isSystem() && !ns.isLegalClientSystemNS()) {
+    if (ns.isSystem() && !ns.isLegalClientSystemNS(serverGlobalParams.featureCompatibility)) {
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "Invalid system namespace: " << ns);
     }
@@ -227,11 +241,11 @@ Status userAllowedCreateNS(const NamespaceString& ns) {
         // 'config.system.sessions', there will be a corresponding persisted chunk metadata
         // collection 'config.cache.chunks.config.system.sessions'. We wish to allow writes to this
         // collection.
-        if (ns.coll().find(".system.sessions") != std::string::npos) {
+        if (ns.isConfigDotCacheDotChunks()) {
             return Status::OK();
         }
 
-        if (ns.isConfigDB() && ns.isLegalClientSystemNS()) {
+        if (ns.isConfigDB() && ns.isLegalClientSystemNS(serverGlobalParams.featureCompatibility)) {
             return Status::OK();
         }
 

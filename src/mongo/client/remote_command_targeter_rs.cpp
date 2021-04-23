@@ -64,16 +64,14 @@ ConnectionString RemoteCommandTargeterRS::connectionString() {
     return uassertStatusOK(ConnectionString::parse(_rsMonitor->getServerAddress()));
 }
 
-SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHostWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    // TODO (SERVER-51296): Add CancelationToken support to the RemoteCommandTargeter API.
-    return _rsMonitor->getHostOrRefresh(readPref, CancelationToken::uncancelable());
+SemiFuture<HostAndPort> RemoteCommandTargeterRS::findHost(const ReadPreferenceSetting& readPref,
+                                                          const CancellationToken& cancelToken) {
+    return _rsMonitor->getHostOrRefresh(readPref, cancelToken);
 }
 
-SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHostsWithMaxWait(
-    const ReadPreferenceSetting& readPref, Milliseconds maxWait) {
-    // TODO (SERVER-51296): Add CancelationToken support to the RemoteCommandTargeter API.
-    return _rsMonitor->getHostsOrRefresh(readPref, CancelationToken::uncancelable());
+SemiFuture<std::vector<HostAndPort>> RemoteCommandTargeterRS::findHosts(
+    const ReadPreferenceSetting& readPref, const CancellationToken& cancelToken) {
+    return _rsMonitor->getHostsOrRefresh(readPref, cancelToken);
 }
 
 StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCtx,
@@ -83,14 +81,10 @@ StatusWith<HostAndPort> RemoteCommandTargeterRS::findHost(OperationContext* opCt
         return interruptStatus;
     }
 
-    // Enforce a 20-second ceiling on the time spent looking for a host. This conforms with the
-    // behavior used throughout mongos prior to version 3.4, but is not fundamentally desirable.
-    // See comment in remote_command_targeter.h for details.
-    bool maxTimeMsLesser = (opCtx->getRemainingMaxTimeMillis() < Milliseconds(Seconds(20)));
-    // TODO (SERVER-51296): Add CancelationToken support to the RemoteCommandTargeter. In this case
-    // we would pass the CancelationToken attached to the OperationContext to getHostOrRefresh.
+    bool maxTimeMsLesser =
+        (opCtx->getRemainingMaxTimeMillis() < ReplicaSetMonitorInterface::kDefaultFindHostTimeout);
     auto swHostAndPort =
-        _rsMonitor->getHostOrRefresh(readPref, CancelationToken::uncancelable()).getNoThrow(opCtx);
+        _rsMonitor->getHostOrRefresh(readPref, opCtx->getCancellationToken()).getNoThrow(opCtx);
 
     if (maxTimeMsLesser && swHostAndPort.getStatus() == ErrorCodes::FailedToSatisfyReadPreference) {
         return Status(ErrorCodes::MaxTimeMSExpired, "operation timed out");

@@ -55,7 +55,6 @@ using namespace fmt::literals;
 MONGO_INITIALIZER(ThreadPoolCommonTests)(InitializerContext*) {
     addTestsForThreadPool("ThreadPoolCommon",
                           []() { return std::make_unique<ThreadPool>(ThreadPool::Options()); });
-    return Status::OK();
 }
 
 class ThreadPoolTest : public unittest::Test {
@@ -307,6 +306,26 @@ TEST(ThreadPoolTest, JoinAllRetiredThreads) {
     const auto expectedRetiredThreads = options.maxThreads - options.minThreads;
     ASSERT_EQ(retiredThreads.load(), expectedRetiredThreads);
     ASSERT_EQ(pool.getStats().numIdleThreads, 0);
+}
+
+TEST(ThreadPoolTest, SafeToCallWaitForIdleBeforeShutdown) {
+    ThreadPool::Options options;
+    options.minThreads = 1;
+    options.maxThreads = 1;
+    ThreadPool pool(options);
+    unittest::Barrier barrier(2);
+    pool.schedule([&](Status) {
+        barrier.countDownAndWait();
+        // We can't guarantee that ThreadPool::waitForIdle() is always called before
+        // ThreadPool::shutdown(). Introducing the following sleep increases the chances of such an
+        // ordering. However, this is a best-effort, and ThreadPool::shutdown() may still precede
+        // ThreadPool::waitForIdle on slow machines.
+        sleepmillis(10);
+    });
+    pool.schedule([&](Status) { pool.shutdown(); });
+    pool.startup();
+    barrier.countDownAndWait();
+    pool.waitForIdle();
 }
 
 }  // namespace

@@ -1,7 +1,11 @@
-// Test the distinct command with views.
-// @tags: [
-//   sbe_incompatible,
-// ]
+/**
+ * Test the distinct command with views.
+ *
+ * @tags: [
+ *   assumes_unsharded_collection,
+ * ]
+ */
+
 (function() {
 "use strict";
 

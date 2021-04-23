@@ -1,12 +1,15 @@
+/**
+ * @tags: [
+ *     does_not_support_stepdowns,
+ * ]
+ */
+
 t = db.borders;
 t.drop();
 
 epsilon = 0.0001;
 
 // For these tests, *required* that step ends exactly on max
-// @tags: [
-//   sbe_incompatible,
-// ]
 min = -1;
 max = 1;
 step = 1;

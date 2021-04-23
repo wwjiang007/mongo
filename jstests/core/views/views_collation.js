@@ -1,8 +1,8 @@
 // @tags: [
+//   assumes_unsharded_collection,
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_non_retryable_commands,
-//   sbe_incompatible,
 // ]
 
 /**

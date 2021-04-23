@@ -43,50 +43,6 @@ namespace repl {
 
 namespace {
 
-OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
-    StringData commandString(objectField.firstElementFieldName());
-    if (commandString == "create") {
-        return OplogEntry::CommandType::kCreate;
-    } else if (commandString == "renameCollection") {
-        return OplogEntry::CommandType::kRenameCollection;
-    } else if (commandString == "drop") {
-        return OplogEntry::CommandType::kDrop;
-    } else if (commandString == "collMod") {
-        return OplogEntry::CommandType::kCollMod;
-    } else if (commandString == "applyOps") {
-        return OplogEntry::CommandType::kApplyOps;
-    } else if (commandString == "dbCheck") {
-        return OplogEntry::CommandType::kDbCheck;
-    } else if (commandString == "dropDatabase") {
-        return OplogEntry::CommandType::kDropDatabase;
-    } else if (commandString == "emptycapped") {
-        return OplogEntry::CommandType::kEmptyCapped;
-    } else if (commandString == "createIndexes") {
-        return OplogEntry::CommandType::kCreateIndexes;
-    } else if (commandString == "startIndexBuild") {
-        return OplogEntry::CommandType::kStartIndexBuild;
-    } else if (commandString == "commitIndexBuild") {
-        return OplogEntry::CommandType::kCommitIndexBuild;
-    } else if (commandString == "abortIndexBuild") {
-        return OplogEntry::CommandType::kAbortIndexBuild;
-    } else if (commandString == "dropIndexes") {
-        return OplogEntry::CommandType::kDropIndexes;
-    } else if (commandString == "deleteIndexes") {
-        return OplogEntry::CommandType::kDropIndexes;
-    } else if (commandString == "commitTransaction") {
-        return OplogEntry::CommandType::kCommitTransaction;
-    } else if (commandString == "abortTransaction") {
-        return OplogEntry::CommandType::kAbortTransaction;
-    } else if (commandString == "importCollection") {
-        return OplogEntry::CommandType::kImportCollection;
-    } else {
-        uasserted(ErrorCodes::BadValue,
-                  str::stream() << "Unknown oplog entry command type: " << commandString
-                                << " Object field: " << redact(objectField));
-    }
-    MONGO_UNREACHABLE;
-}
-
 /**
  * Returns a document representing an oplog entry with the given fields.
  */
@@ -102,7 +58,7 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const OperationSessionInfo& sessionInfo,
                           const boost::optional<bool>& isUpsert,
                           const mongo::Date_t& wallClockTime,
-                          const boost::optional<StmtId>& statementId,
+                          const std::vector<StmtId>& statementIds,
                           const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                           const boost::optional<OpTime>& preImageOpTime,
                           const boost::optional<OpTime>& postImageOpTime,
@@ -136,8 +92,10 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
         invariant(o2Field);
         builder.append(OplogEntryBase::kUpsertFieldName, isUpsert.get());
     }
-    if (statementId) {
-        builder.append(OplogEntryBase::kStatementIdFieldName, statementId.get());
+    if (statementIds.size() == 1) {
+        builder.append(OplogEntryBase::kStatementIdsFieldName, statementIds.front());
+    } else if (!statementIds.empty()) {
+        builder.append(OplogEntryBase::kStatementIdsFieldName, statementIds);
     }
     if (prevWriteOpTimeInTransaction) {
         const BSONObj localObject = prevWriteOpTimeInTransaction.get().toBSON();
@@ -160,7 +118,49 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
 
 }  // namespace
 
-const int MutableOplogEntry::kOplogVersion = 2;
+DurableOplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
+    StringData commandString(objectField.firstElementFieldName());
+    if (commandString == "create") {
+        return DurableOplogEntry::CommandType::kCreate;
+    } else if (commandString == "renameCollection") {
+        return DurableOplogEntry::CommandType::kRenameCollection;
+    } else if (commandString == "drop") {
+        return DurableOplogEntry::CommandType::kDrop;
+    } else if (commandString == "collMod") {
+        return DurableOplogEntry::CommandType::kCollMod;
+    } else if (commandString == "applyOps") {
+        return DurableOplogEntry::CommandType::kApplyOps;
+    } else if (commandString == "dbCheck") {
+        return DurableOplogEntry::CommandType::kDbCheck;
+    } else if (commandString == "dropDatabase") {
+        return DurableOplogEntry::CommandType::kDropDatabase;
+    } else if (commandString == "emptycapped") {
+        return DurableOplogEntry::CommandType::kEmptyCapped;
+    } else if (commandString == "createIndexes") {
+        return DurableOplogEntry::CommandType::kCreateIndexes;
+    } else if (commandString == "startIndexBuild") {
+        return DurableOplogEntry::CommandType::kStartIndexBuild;
+    } else if (commandString == "commitIndexBuild") {
+        return DurableOplogEntry::CommandType::kCommitIndexBuild;
+    } else if (commandString == "abortIndexBuild") {
+        return DurableOplogEntry::CommandType::kAbortIndexBuild;
+    } else if (commandString == "dropIndexes") {
+        return DurableOplogEntry::CommandType::kDropIndexes;
+    } else if (commandString == "deleteIndexes") {
+        return DurableOplogEntry::CommandType::kDropIndexes;
+    } else if (commandString == "commitTransaction") {
+        return DurableOplogEntry::CommandType::kCommitTransaction;
+    } else if (commandString == "abortTransaction") {
+        return DurableOplogEntry::CommandType::kAbortTransaction;
+    } else if (commandString == "importCollection") {
+        return DurableOplogEntry::CommandType::kImportCollection;
+    } else {
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "Unknown oplog entry command type: " << commandString
+                                << " Object field: " << redact(objectField));
+    }
+    MONGO_UNREACHABLE;
+}
 
 // Static
 ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
@@ -277,21 +277,21 @@ OpTime MutableOplogEntry::getOpTime() const {
     return OpTime(getTimestamp(), term);
 }
 
-size_t OplogEntry::getDurableReplOperationSize(const DurableReplOperation& op) {
+size_t DurableOplogEntry::getDurableReplOperationSize(const DurableReplOperation& op) {
     return sizeof(op) + op.getNss().size() + op.getObject().objsize() +
         (op.getObject2() ? op.getObject2()->objsize() : 0);
 }
 
-StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
+StatusWith<DurableOplogEntry> DurableOplogEntry::parse(const BSONObj& object) {
     try {
-        return OplogEntry(object);
+        return DurableOplogEntry(object);
     } catch (...) {
         return exceptionToStatus();
     }
     MONGO_UNREACHABLE;
 }
 
-OplogEntry::OplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
+DurableOplogEntry::DurableOplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
     _raw = _raw.getOwned();
 
     parseProtected(IDLParserErrorContext("OplogEntryBase"), _raw);
@@ -302,49 +302,49 @@ OplogEntry::OplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
     }
 }
 
-OplogEntry::OplogEntry(OpTime opTime,
-                       const boost::optional<int64_t> hash,
-                       OpTypeEnum opType,
-                       const NamespaceString& nss,
-                       const boost::optional<UUID>& uuid,
-                       const boost::optional<bool>& fromMigrate,
-                       int version,
-                       const BSONObj& oField,
-                       const boost::optional<BSONObj>& o2Field,
-                       const OperationSessionInfo& sessionInfo,
-                       const boost::optional<bool>& isUpsert,
-                       const mongo::Date_t& wallClockTime,
-                       const boost::optional<StmtId>& statementId,
-                       const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
-                       const boost::optional<OpTime>& preImageOpTime,
-                       const boost::optional<OpTime>& postImageOpTime,
-                       const boost::optional<ShardId>& destinedRecipient,
-                       const boost::optional<Value>& idField)
-    : OplogEntry(makeOplogEntryDoc(opTime,
-                                   hash,
-                                   opType,
-                                   nss,
-                                   uuid,
-                                   fromMigrate,
-                                   version,
-                                   oField,
-                                   o2Field,
-                                   sessionInfo,
-                                   isUpsert,
-                                   wallClockTime,
-                                   statementId,
-                                   prevWriteOpTimeInTransaction,
-                                   preImageOpTime,
-                                   postImageOpTime,
-                                   destinedRecipient,
-                                   idField)) {}
+DurableOplogEntry::DurableOplogEntry(OpTime opTime,
+                                     const boost::optional<int64_t> hash,
+                                     OpTypeEnum opType,
+                                     const NamespaceString& nss,
+                                     const boost::optional<UUID>& uuid,
+                                     const boost::optional<bool>& fromMigrate,
+                                     int version,
+                                     const BSONObj& oField,
+                                     const boost::optional<BSONObj>& o2Field,
+                                     const OperationSessionInfo& sessionInfo,
+                                     const boost::optional<bool>& isUpsert,
+                                     const mongo::Date_t& wallClockTime,
+                                     const std::vector<StmtId>& statementIds,
+                                     const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
+                                     const boost::optional<OpTime>& preImageOpTime,
+                                     const boost::optional<OpTime>& postImageOpTime,
+                                     const boost::optional<ShardId>& destinedRecipient,
+                                     const boost::optional<Value>& idField)
+    : DurableOplogEntry(makeOplogEntryDoc(opTime,
+                                          hash,
+                                          opType,
+                                          nss,
+                                          uuid,
+                                          fromMigrate,
+                                          version,
+                                          oField,
+                                          o2Field,
+                                          sessionInfo,
+                                          isUpsert,
+                                          wallClockTime,
+                                          statementIds,
+                                          prevWriteOpTimeInTransaction,
+                                          preImageOpTime,
+                                          postImageOpTime,
+                                          destinedRecipient,
+                                          idField)) {}
 
-bool OplogEntry::isCommand() const {
+bool DurableOplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;
 }
 
 // static
-bool OplogEntry::isCrudOpType(OpTypeEnum opType) {
+bool DurableOplogEntry::isCrudOpType(OpTypeEnum opType) {
     switch (opType) {
         case OpTypeEnum::kInsert:
         case OpTypeEnum::kDelete:
@@ -357,16 +357,16 @@ bool OplogEntry::isCrudOpType(OpTypeEnum opType) {
     MONGO_UNREACHABLE;
 }
 
-bool OplogEntry::isCrudOpType() const {
+bool DurableOplogEntry::isCrudOpType() const {
     return isCrudOpType(getOpType());
 }
 
-bool OplogEntry::shouldPrepare() const {
+bool DurableOplogEntry::shouldPrepare() const {
     return getCommandType() == CommandType::kApplyOps &&
         getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
 }
 
-bool OplogEntry::isSingleOplogEntryTransaction() const {
+bool DurableOplogEntry::isSingleOplogEntryTransaction() const {
     if (getCommandType() != CommandType::kApplyOps || !getTxnNumber() || !getSessionId() ||
         getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe()) {
         return false;
@@ -379,7 +379,7 @@ bool OplogEntry::isSingleOplogEntryTransaction() const {
     return prevOptimeOpt->isNull();
 }
 
-bool OplogEntry::isEndOfLargeTransaction() const {
+bool DurableOplogEntry::isEndOfLargeTransaction() const {
     if (getCommandType() != CommandType::kApplyOps) {
         // If the oplog entry is neither commit nor abort, then it must be an applyOps. Otherwise,
         // it cannot be a termainal oplog entry of a large transaction.
@@ -397,7 +397,7 @@ bool OplogEntry::isEndOfLargeTransaction() const {
     return !prevOptimeOpt->isNull() && !isPartialTransaction();
 }
 
-bool OplogEntry::isSingleOplogEntryTransactionWithCommand() const {
+bool DurableOplogEntry::isSingleOplogEntryTransactionWithCommand() const {
     if (!isSingleOplogEntryTransaction()) {
         return false;
     }
@@ -416,7 +416,7 @@ bool OplogEntry::isSingleOplogEntryTransactionWithCommand() const {
     return false;
 }
 
-bool OplogEntry::isIndexCommandType() const {
+bool DurableOplogEntry::isIndexCommandType() const {
     return getOpType() == OpTypeEnum::kCommand &&
         ((getCommandType() == CommandType::kCreateIndexes) ||
          (getCommandType() == CommandType::kStartIndexBuild) ||
@@ -425,7 +425,7 @@ bool OplogEntry::isIndexCommandType() const {
          (getCommandType() == CommandType::kDropIndexes));
 }
 
-BSONElement OplogEntry::getIdElement() const {
+BSONElement DurableOplogEntry::getIdElement() const {
     invariant(isCrudOpType());
     if (getOpType() == OpTypeEnum::kUpdate) {
         // We cannot use getObjectContainingDocumentKey() here because the BSONObj will go out
@@ -437,11 +437,11 @@ BSONElement OplogEntry::getIdElement() const {
     }
 }
 
-BSONObj OplogEntry::getOperationToApply() const {
+BSONObj DurableOplogEntry::getOperationToApply() const {
     return getObject();
 }
 
-BSONObj OplogEntry::getObjectContainingDocumentKey() const {
+BSONObj DurableOplogEntry::getObjectContainingDocumentKey() const {
     invariant(isCrudOpType());
     if (getOpType() == OpTypeEnum::kUpdate) {
         fassert(31081, getObject2() != boost::none);
@@ -451,24 +451,293 @@ BSONObj OplogEntry::getObjectContainingDocumentKey() const {
     }
 }
 
-OplogEntry::CommandType OplogEntry::getCommandType() const {
+DurableOplogEntry::CommandType DurableOplogEntry::getCommandType() const {
     return _commandType;
 }
 
-int OplogEntry::getRawObjSizeBytes() const {
+int DurableOplogEntry::getRawObjSizeBytes() const {
     return _raw.objsize();
 }
 
-std::string OplogEntry::toString() const {
+std::string DurableOplogEntry::toString() const {
     return _raw.toString();
 }
 
-std::ostream& operator<<(std::ostream& s, const OplogEntry& o) {
+std::ostream& operator<<(std::ostream& s, const DurableOplogEntry& o) {
     return s << o.toString();
+}
+
+std::ostream& operator<<(std::ostream& s, const OplogEntry& o) {
+    return s << o.toStringForLogging();
 }
 
 std::ostream& operator<<(std::ostream& s, const ReplOperation& o) {
     return s << o.toBSON().toString();
+}
+
+OplogEntry::OplogEntry(DurableOplogEntry entry) : _entry(std::move(entry)) {}
+
+OplogEntry::OplogEntry(const BSONObj& entry)
+    : OplogEntry(uassertStatusOK(DurableOplogEntry::parse(entry))) {}
+void OplogEntry::setEntry(DurableOplogEntry entry) {
+    _entry = std::move(entry);
+}
+
+bool operator==(const OplogEntry& lhs, const OplogEntry& rhs) {
+    if (lhs.isForCappedCollection() != rhs.isForCappedCollection()) {
+        return false;
+    }
+
+    return lhs.getEntry() == rhs.getEntry();
+}
+
+StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
+    auto parseStatus = DurableOplogEntry::parse(object);
+
+    if (!parseStatus.isOK()) {
+        return parseStatus;
+    }
+
+    return OplogEntry(std::move(parseStatus.getValue()));
+}
+std::string OplogEntry::toStringForLogging() const {
+    return toBSONForLogging().toString();
+}
+BSONObj OplogEntry::toBSONForLogging() const {
+    BSONObjBuilder builder;
+    auto entry = _entry.toBSON();
+    auto estimatedTotalSize = entry.objsize();
+
+    const auto sizeTooBig = 0.9 * BSONObj::DefaultSizeTrait::MaxSize;
+
+    builder.append("oplogEntry", entry);
+
+    if (_isForCappedCollection) {
+        builder.append("isForCappedCollection", _isForCappedCollection);
+    }
+
+    if (_isForReshardingSessionApplication) {
+        builder.append("isForReshardingSessionApplication", _isForReshardingSessionApplication);
+    }
+
+    if (_preImageOp) {
+        auto op = _preImageOp->toBSON();
+        if (estimatedTotalSize + op.objsize() > sizeTooBig) {
+            builder.append("preImageOp", "<too large to display>");
+        } else {
+            builder.append("preImageOp", op);
+            estimatedTotalSize += op.objsize();
+        }
+    }
+
+    if (_postImageOp) {
+        auto op = _postImageOp->toBSON();
+        if (estimatedTotalSize + op.objsize() > sizeTooBig) {
+            builder.append("postImageOp", "<too large to display>");
+        } else {
+            builder.append("postImageOp", op);
+            estimatedTotalSize += op.objsize();
+        }
+    }
+
+    return builder.obj();
+}
+
+bool OplogEntry::isForCappedCollection() const {
+    return _isForCappedCollection;
+}
+
+void OplogEntry::setIsForCappedCollection(bool isForCappedCollection) {
+    _isForCappedCollection = isForCappedCollection;
+}
+
+std::shared_ptr<DurableOplogEntry> OplogEntry::getPreImageOp() const {
+    return _preImageOp;
+}
+
+void OplogEntry::setPreImageOp(std::shared_ptr<DurableOplogEntry> preImageOp) {
+    _preImageOp = std::move(preImageOp);
+}
+
+void OplogEntry::setPreImageOp(const BSONObj& preImageOp) {
+    setPreImageOp(
+        std::make_shared<DurableOplogEntry>(uassertStatusOK(DurableOplogEntry::parse(preImageOp))));
+}
+
+std::shared_ptr<DurableOplogEntry> OplogEntry::getPostImageOp() const {
+    return _postImageOp;
+}
+
+void OplogEntry::setPostImageOp(std::shared_ptr<DurableOplogEntry> postImageOp) {
+    _postImageOp = std::move(postImageOp);
+}
+
+void OplogEntry::setPostImageOp(const BSONObj& postImageOp) {
+    setPostImageOp(std::make_shared<DurableOplogEntry>(
+        uassertStatusOK(DurableOplogEntry::parse(postImageOp))));
+}
+
+bool OplogEntry::isForReshardingSessionApplication() const {
+    return _isForReshardingSessionApplication;
+}
+
+void OplogEntry::setIsForReshardingSessionApplication(bool isForReshardingSessionApplication) {
+    _isForReshardingSessionApplication = isForReshardingSessionApplication;
+}
+
+const boost::optional<mongo::Value>& OplogEntry::get_id() const& {
+    return _entry.get_id();
+}
+
+std::vector<StmtId> OplogEntry::getStatementIds() const& {
+    return _entry.getStatementIds();
+}
+
+const OperationSessionInfo& OplogEntry::getOperationSessionInfo() const {
+    return _entry.getOperationSessionInfo();
+}
+const boost::optional<mongo::LogicalSessionId>& OplogEntry::getSessionId() const {
+    return _entry.getSessionId();
+}
+
+const boost::optional<std::int64_t> OplogEntry::getTxnNumber() const {
+    return _entry.getTxnNumber();
+}
+
+const DurableReplOperation& OplogEntry::getDurableReplOperation() const {
+    return _entry.getDurableReplOperation();
+}
+
+mongo::repl::OpTypeEnum OplogEntry::getOpType() const {
+    return _entry.getOpType();
+}
+
+const mongo::NamespaceString& OplogEntry::getNss() const {
+    return _entry.getNss();
+}
+
+const boost::optional<mongo::UUID>& OplogEntry::getUuid() const {
+    return _entry.getUuid();
+}
+
+const mongo::BSONObj& OplogEntry::getObject() const {
+    return _entry.getObject();
+}
+
+const boost::optional<mongo::BSONObj>& OplogEntry::getObject2() const {
+    return _entry.getObject2();
+}
+
+const boost::optional<bool> OplogEntry::getUpsert() const {
+    return _entry.getUpsert();
+}
+
+const boost::optional<mongo::repl::OpTime>& OplogEntry::getPreImageOpTime() const {
+    return _entry.getPreImageOpTime();
+}
+
+const boost::optional<mongo::ShardId>& OplogEntry::getDestinedRecipient() const {
+    return _entry.getDestinedRecipient();
+}
+
+const mongo::Timestamp& OplogEntry::getTimestamp() const {
+    return _entry.getTimestamp();
+}
+
+const boost::optional<std::int64_t> OplogEntry::getTerm() const {
+    return _entry.getTerm();
+}
+
+const mongo::Date_t& OplogEntry::getWallClockTime() const {
+    return _entry.getWallClockTime();
+}
+
+const boost::optional<std::int64_t> OplogEntry::getHash() const& {
+    return _entry.getHash();
+}
+
+std::int64_t OplogEntry::getVersion() const {
+    return _entry.getVersion();
+}
+
+const boost::optional<bool> OplogEntry::getFromMigrate() const& {
+    return _entry.getFromMigrate();
+}
+
+const boost::optional<mongo::UUID>& OplogEntry::getFromTenantMigration() const& {
+    return _entry.getFromTenantMigration();
+}
+
+const boost::optional<mongo::repl::OpTime>& OplogEntry::getPrevWriteOpTimeInTransaction() const& {
+    return _entry.getPrevWriteOpTimeInTransaction();
+}
+
+const boost::optional<mongo::repl::OpTime>& OplogEntry::getPostImageOpTime() const& {
+    return _entry.getPostImageOpTime();
+}
+
+OpTime OplogEntry::getOpTime() const {
+    return _entry.getOpTime();
+}
+
+bool OplogEntry::isCommand() const {
+    return _entry.isCommand();
+}
+
+bool OplogEntry::isPartialTransaction() const {
+    return _entry.isPartialTransaction();
+}
+
+bool OplogEntry::isEndOfLargeTransaction() const {
+    return _entry.isEndOfLargeTransaction();
+}
+
+bool OplogEntry::isPreparedCommit() const {
+    return _entry.isPreparedCommit();
+}
+
+bool OplogEntry::isTerminalApplyOps() const {
+    return _entry.isTerminalApplyOps();
+}
+
+bool OplogEntry::isSingleOplogEntryTransaction() const {
+    return _entry.isSingleOplogEntryTransaction();
+}
+
+bool OplogEntry::isSingleOplogEntryTransactionWithCommand() const {
+    return _entry.isSingleOplogEntryTransactionWithCommand();
+}
+
+bool OplogEntry::isCrudOpType() const {
+    return _entry.isCrudOpType();
+}
+
+bool OplogEntry::isIndexCommandType() const {
+    return _entry.isIndexCommandType();
+}
+
+bool OplogEntry::shouldPrepare() const {
+    return _entry.shouldPrepare();
+}
+
+BSONElement OplogEntry::getIdElement() const {
+    return _entry.getIdElement();
+}
+
+BSONObj OplogEntry::getOperationToApply() const {
+    return _entry.getOperationToApply();
+}
+
+BSONObj OplogEntry::getObjectContainingDocumentKey() const {
+    return _entry.getObjectContainingDocumentKey();
+}
+
+OplogEntry::CommandType OplogEntry::getCommandType() const {
+    return _entry.getCommandType();
+}
+
+int OplogEntry::getRawObjSizeBytes() const {
+    return _entry.getRawObjSizeBytes();
 }
 
 }  // namespace repl

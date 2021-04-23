@@ -98,7 +98,7 @@ StatusWith<size_t> validateTCMallocValue(StringData name, const BSONElement& new
         OperationContext*, BSONObjBuilder& b, const std::string& name) {             \
         auto swValue = getProperty(k##cls##PropertyName);                            \
         if (swValue.isOK()) {                                                        \
-            b.appendNumber(name, swValue.getValue());                                \
+            b.appendNumber(name, static_cast<long long>(swValue.getValue()));        \
         }                                                                            \
     }                                                                                \
     Status TCMalloc##cls##ServerParameter::set(const BSONElement& newValueElement) { \
@@ -123,14 +123,12 @@ TCMALLOC_SP_METHODS(AggressiveMemoryDecommit)
 
 namespace {
 
-MONGO_INITIALIZER_GENERAL(TcmallocConfigurationDefaults,
-                          MONGO_NO_PREREQUISITES,
-                          ("BeginStartupOptionHandling"))
+MONGO_INITIALIZER_GENERAL(TcmallocConfigurationDefaults, (), ("BeginStartupOptionHandling"))
 (InitializerContext*) {
     // Before processing the command line options, if the user has not specified a value in via
     // the environment, set tcmalloc.max_total_thread_cache_bytes to its default value.
     if (getenv("TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES")) {
-        return Status::OK();
+        return;
     }
 
     ProcessInfo pi;
@@ -140,7 +138,7 @@ MONGO_INITIALIZER_GENERAL(TcmallocConfigurationDefaults,
         (systemMemorySizeMB / 8) * 1024 * 1024;  // 1/8 of system memory in bytes
     size_t cacheSize = std::min(defaultTcMallocCacheSize, derivedTcMallocCacheSize);
 
-    return setProperty(kMaxTotalThreadCacheBytesPropertyName, cacheSize);
+    uassertStatusOK(setProperty(kMaxTotalThreadCacheBytesPropertyName, cacheSize));
 }
 
 }  // namespace

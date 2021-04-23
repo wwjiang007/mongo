@@ -56,11 +56,15 @@ value::SlotAccessor* UniqueStage::getAccessor(CompileCtx& ctx, value::SlotId slo
 }
 
 void UniqueStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     ++_commonStats.opens;
     _children[0]->open(reOpen);
 }
 
 PlanState UniqueStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     while (_children[0]->getNext() == PlanState::ADVANCED) {
         value::MaterializedRow key{_inKeyAccessors.size()};
         size_t idx = 0;
@@ -73,17 +77,21 @@ PlanState UniqueStage::getNext() {
         auto [it, inserted] = _seen.emplace(std::move(key));
         if (inserted) {
             const_cast<value::MaterializedRow&>(*it).makeOwned();
-            return PlanState::ADVANCED;
+            return trackPlanState(PlanState::ADVANCED);
         } else {
             // This row has been seen already, so we skip it.
             ++_specificStats.dupsDropped;
         }
     }
 
-    return PlanState::IS_EOF;
+    return trackPlanState(PlanState::IS_EOF);
 }
 
 void UniqueStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+    _commonStats.closes++;
+
+    _seen.clear();
     _children[0]->close();
 }
 
@@ -93,8 +101,8 @@ std::unique_ptr<PlanStageStats> UniqueStage::getStats(bool includeDebugInfo) con
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("dupsTested", _specificStats.dupsTested);
-        bob.appendNumber("dupsDropped", _specificStats.dupsDropped);
+        bob.appendNumber("dupsTested", static_cast<long long>(_specificStats.dupsTested));
+        bob.appendNumber("dupsDropped", static_cast<long long>(_specificStats.dupsDropped));
         bob.append("keySlots", _keySlots);
         ret->debugInfo = bob.obj();
     }

@@ -454,9 +454,19 @@ Status makeConnectError(Status status, const HostAndPort& peer, const WrappedEnd
 }
 
 
-StatusWith<SessionHandle> TransportLayerASIO::connect(HostAndPort peer,
-                                                      ConnectSSLMode sslMode,
-                                                      Milliseconds timeout) {
+StatusWith<SessionHandle> TransportLayerASIO::connect(
+    HostAndPort peer,
+    ConnectSSLMode sslMode,
+    Milliseconds timeout,
+    boost::optional<TransientSSLParams> transientSSLParams) {
+    if (transientSSLParams) {
+        uassert(ErrorCodes::InvalidSSLConfiguration,
+                "Specified transient SSL params but connection SSL mode is not set",
+                sslMode == kEnableSSL);
+        LOGV2_DEBUG(
+            5270701, 2, "Connecting to peer using transient SSL connection", "peer"_attr = peer);
+    }
+
     std::error_code ec;
     GenericSocket sock(*_egressReactor);
     WrappedResolver resolver(*_egressReactor);
@@ -473,7 +483,7 @@ StatusWith<SessionHandle> TransportLayerASIO::connect(HostAndPort peer,
     }
 
     auto endpoints = std::move(swEndpoints.getValue());
-    auto sws = _doSyncConnect(endpoints.front(), peer, timeout);
+    auto sws = _doSyncConnect(endpoints.front(), peer, timeout, transientSSLParams);
     if (!sws.isOK()) {
         return sws.getStatus();
     }
@@ -515,7 +525,10 @@ StatusWith<SessionHandle> TransportLayerASIO::connect(HostAndPort peer,
 
 template <typename Endpoint>
 StatusWith<TransportLayerASIO::ASIOSessionHandle> TransportLayerASIO::_doSyncConnect(
-    Endpoint endpoint, const HostAndPort& peer, const Milliseconds& timeout) {
+    Endpoint endpoint,
+    const HostAndPort& peer,
+    const Milliseconds& timeout,
+    boost::optional<TransientSSLParams> transientSSLParams) {
     GenericSocket sock(*_egressReactor);
     std::error_code ec;
 
@@ -563,7 +576,16 @@ StatusWith<TransportLayerASIO::ASIOSessionHandle> TransportLayerASIO::_doSyncCon
 
     sock.non_blocking(false);
     try {
-        return std::make_shared<ASIOSession>(this, std::move(sock), false, *endpoint);
+        std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext;
+#ifdef MONGO_CONFIG_SSL
+        if (transientSSLParams) {
+            auto statusOrContext = createTransientSSLContext(transientSSLParams.get());
+            uassertStatusOK(statusOrContext.getStatus());
+            transientSSLContext = std::move(statusOrContext.getValue());
+        }
+#endif
+        return std::make_shared<ASIOSession>(
+            this, std::move(sock), false, *endpoint, transientSSLContext);
     } catch (const DBException& e) {
         return e.toStatus();
     }
@@ -575,6 +597,13 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(
     const ReactorHandle& reactor,
     Milliseconds timeout,
     std::shared_ptr<const SSLConnectionContext> transientSSLContext) {
+    if (transientSSLContext) {
+        uassert(ErrorCodes::InvalidSSLConfiguration,
+                "Specified transient SSL context but connection SSL mode is not set",
+                sslMode == kEnableSSL);
+        LOGV2_DEBUG(
+            5270601, 2, "Connecting to peer using transient SSL connection", "peer"_attr = peer);
+    }
 
     struct AsyncConnectState {
         AsyncConnectState(HostAndPort peer,
@@ -1200,8 +1229,7 @@ SSLParams::SSLModes TransportLayerASIO::_sslMode() const {
 Status TransportLayerASIO::rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
                                               bool asyncOCSPStaple) {
 
-    auto contextOrStatus =
-        _createSSLContext(manager, _sslMode(), TransientSSLParams(), asyncOCSPStaple);
+    auto contextOrStatus = _createSSLContext(manager, _sslMode(), asyncOCSPStaple);
     if (!contextOrStatus.isOK()) {
         return contextOrStatus.getStatus();
     }
@@ -1212,7 +1240,6 @@ Status TransportLayerASIO::rotateCertificates(std::shared_ptr<SSLManagerInterfac
 StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
 TransportLayerASIO::_createSSLContext(std::shared_ptr<SSLManagerInterface>& manager,
                                       SSLParams::SSLModes sslMode,
-                                      TransientSSLParams transientEgressSSLParams,
                                       bool asyncOCSPStaple) const {
 
     std::shared_ptr<SSLConnectionContext> newSSLContext = std::make_shared<SSLConnectionContext>();
@@ -1225,7 +1252,6 @@ TransportLayerASIO::_createSSLContext(std::shared_ptr<SSLManagerInterface>& mana
         Status status = newSSLContext->manager->initSSLContext(
             newSSLContext->ingress->native_handle(),
             sslParams,
-            TransientSSLParams(),  // Ingress is not using transient params, they are egress.
             SSLManagerInterface::ConnectionDirection::kIncoming);
         if (!status.isOK()) {
             return status;
@@ -1246,31 +1272,31 @@ TransportLayerASIO::_createSSLContext(std::shared_ptr<SSLManagerInterface>& mana
         Status status = newSSLContext->manager->initSSLContext(
             newSSLContext->egress->native_handle(),
             sslParams,
-            transientEgressSSLParams,
             SSLManagerInterface::ConnectionDirection::kOutgoing);
         if (!status.isOK()) {
             return status;
         }
-        if (!transientEgressSSLParams.sslClusterPEMPayload.empty()) {
-            if (transientEgressSSLParams.targetedClusterConnectionString) {
-                newSSLContext->targetClusterURI =
-                    transientEgressSSLParams.targetedClusterConnectionString.toString();
-            }
+        if (newSSLContext->manager->isTransient()) {
+            newSSLContext->targetClusterURI =
+                newSSLContext->manager->getTargetedClusterConnectionString();
         }
     }
     return newSSLContext;
 }
 
 StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
-TransportLayerASIO::createTransientSSLContext(const TransientSSLParams& transientSSLParams,
-                                              const SSLManagerInterface* optionalManager) {
-
-    auto manager = getSSLManager();
+TransportLayerASIO::createTransientSSLContext(const TransientSSLParams& transientSSLParams) {
+    auto coordinator = SSLManagerCoordinator::get();
+    if (!coordinator) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      "SSLManagerCoordinator is not initialized");
+    }
+    auto manager = coordinator->createTransientSSLManager(transientSSLParams);
     if (!manager) {
         return Status(ErrorCodes::InvalidSSLConfiguration, "TransportLayerASIO has no SSL manager");
     }
 
-    return _createSSLContext(manager, _sslMode(), transientSSLParams, true /* asyncOCSPStaple */);
+    return _createSSLContext(manager, _sslMode(), true /* asyncOCSPStaple */);
 }
 
 #endif

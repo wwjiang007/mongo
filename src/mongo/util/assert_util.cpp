@@ -52,6 +52,10 @@
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/str.h"
 
+#define TRIPWIRE_ASSERTION_ID 4457000
+#define STR(x) #x
+#define XSTR(x) STR(x)
+
 namespace mongo {
 
 AssertionCount assertionCount;
@@ -269,44 +273,36 @@ MONGO_COMPILER_NOINLINE void msgassertedWithLocation(const Status& status,
     error_details::throwExceptionForStatus(status);
 }
 
-void iassertWithLocation(SourceLocationHolder loc, const Status& status) {
-    if (status.isOK())
-        return;
-    LOGV2_DEBUG(4892201, 3, "Internal assertion", "error"_attr = status, "location"_attr = loc);
+void iassertFailed(const Status& status, SourceLocation loc) {
+    LOGV2_DEBUG(4892201,
+                3,
+                "Internal assertion",
+                "error"_attr = status,
+                "location"_attr = SourceLocationHolder(std::move(loc)));
     error_details::throwExceptionForStatus(status);
 }
 
-void tassertFailedWithLocation(SourceLocationHolder loc, const Status& status) {
+void tassertFailed(const Status& status, SourceLocation loc) {
     assertionCount.condrollover(assertionCount.tripwire.addAndFetch(1));
-    LOGV2(4457000, "Tripwire assertion", "error"_attr = status, "location"_attr = loc);
+    LOGV2(TRIPWIRE_ASSERTION_ID,
+          "Tripwire assertion",
+          "error"_attr = status,
+          "location"_attr = SourceLocationHolder(std::move(loc)));
     breakpoint();
     error_details::throwExceptionForStatus(status);
 }
 
-void tassertWithLocation(SourceLocationHolder loc, const Status& status) {
-    if (status.isOK())
-        return;
-    tassertFailedWithLocation(std::move(loc), status);
+bool haveTripwireAssertionsOccurred() {
+    return assertionCount.tripwire.load() != 0;
 }
 
-void checkForTripwireAssertions(int code) {
-    auto tripwireOccurrences = assertionCount.tripwire.load();
-    if (tripwireOccurrences == 0) {
-        return;
-    }
-    if (code == EXIT_CLEAN) {
-        LOGV2_FATAL_NOTRACE(
-            4457001,
-            "Aborting process during clean exit due to prior failed tripwire assertions, "
-            "please check your logs for \"Tripwire assertion\" entries with log id 4457000.",
-            "occurrences"_attr = tripwireOccurrences,
-            "exitCode"_attr = code);
-    } else {
+void warnIfTripwireAssertionsOccurred() {
+    if (haveTripwireAssertionsOccurred()) {
         LOGV2(4457002,
-              "Detected prior failed tripwire assertions during unclean exit, please check your "
-              "logs for \"Tripwire assertion\" entries with log id 4457000.",
-              "occurrences"_attr = tripwireOccurrences,
-              "exitCode"_attr = code);
+              "Detected prior failed tripwire assertions, "
+              "please check your logs for \"Tripwire assertion\" entries with log "
+              "id " XSTR(TRIPWIRE_ASSERTION_ID) ".",
+              "occurrences"_attr = assertionCount.tripwire.load());
     }
 }
 

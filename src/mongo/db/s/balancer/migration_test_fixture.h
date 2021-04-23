@@ -37,10 +37,8 @@
 #include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
-#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 
@@ -74,13 +72,16 @@ protected:
      * Inserts a document into the config.collections collection to indicate that "collName" is
      * sharded with version "version". The shard key pattern defaults to "_id".
      */
-    void setUpCollection(const NamespaceString& collName, ChunkVersion version);
+    void setUpCollection(const NamespaceString& collName,
+                         const UUID& collUUID,
+                         ChunkVersion version);
 
     /**
      * Inserts a document into the config.chunks collection so that the chunk defined by the
      * parameters exists. Returns a ChunkType defined by the parameters.
      */
     ChunkType setUpChunk(const NamespaceString& collName,
+                         const UUID& collUUID,
                          const BSONObj& chunkMin,
                          const BSONObj& chunkMax,
                          const ShardId& shardId,

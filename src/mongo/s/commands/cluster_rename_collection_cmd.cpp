@@ -45,7 +45,6 @@ namespace {
 class RenameCollectionCmd final : public TypedCommand<RenameCollectionCmd> {
 public:
     using Request = RenameCollectionCommand;
-    using Response = RenameCollectionResponse;
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -59,7 +58,7 @@ public:
     public:
         using InvocationBase::InvocationBase;
 
-        Response typedRun(OperationContext* opCtx) {
+        void typedRun(OperationContext* opCtx) {
             auto fromNss = ns();
             auto toNss = request().getTo();
 
@@ -71,11 +70,13 @@ public:
                     str::stream() << "Invalid target namespace: " << toNss.ns(),
                     toNss.isValid());
 
+            RenameCollectionRequest renameCollReq(request().getTo());
+            renameCollReq.setDropTarget(request().getDropTarget());
+            renameCollReq.setStayTemp(request().getStayTemp());
+
             ShardsvrRenameCollection renameCollRequest(fromNss);
             renameCollRequest.setDbName(fromNss.db());
-            renameCollRequest.setDropTarget(request().getDropTarget());
-            renameCollRequest.setStayTemp(request().getStayTemp());
-            renameCollRequest.setTo(request().getTo());
+            renameCollRequest.setRenameCollectionRequest(renameCollReq);
 
             auto catalogCache = Grid::get(opCtx)->catalogCache();
             const auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, fromNss.db()));
@@ -88,10 +89,8 @@ public:
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 fromNss.db().toString(),
-                applyReadWriteConcern(opCtx,
-                                      this,
-                                      appendDbVersionIfPresent(renameCollRequest.toBSON({}),
-                                                               dbInfo.databaseVersion())),
+                CommandHelpers::appendMajorityWriteConcern(appendDbVersionIfPresent(
+                    renameCollRequest.toBSON({}), dbInfo.databaseVersion())),
                 Shard::RetryPolicy::kNoRetry));
 
             uassertStatusOK(cmdResponse.commandStatus);
@@ -104,8 +103,6 @@ public:
                 toNss, renameCollResp.getCollectionVersion(), dbInfo.primaryId());
 
             catalogCache->invalidateCollectionEntry_LINEARIZABLE(fromNss);
-
-            return renameCollResp;
         }
 
         NamespaceString ns() const override {

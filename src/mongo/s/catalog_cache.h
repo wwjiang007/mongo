@@ -40,16 +40,19 @@
 
 namespace mongo {
 
-class BSONObjBuilder;
-
 static constexpr int kMaxNumStaleVersionRetries = 10;
 
+using DatabaseTypeCache = ReadThroughCache<std::string, DatabaseType, ComparableDatabaseVersion>;
+using DatabaseTypeValueHandle = DatabaseTypeCache::ValueHandle;
+
 /**
- * Constructed exclusively by the CatalogCache, contains a reference to the cached information for
- * the specified database.
+ * Constructed exclusively by the CatalogCache,
+ * contains a reference to the cached information for the specified database.
  */
 class CachedDatabaseInfo {
 public:
+    DatabaseType getDatabaseType() const;
+
     const ShardId& primaryId() const;
 
     bool shardingEnabled() const;
@@ -59,9 +62,9 @@ public:
 private:
     friend class CatalogCache;
 
-    CachedDatabaseInfo(DatabaseType dbt);
+    CachedDatabaseInfo(DatabaseTypeValueHandle&& dbt);
 
-    DatabaseType _dbt;
+    DatabaseTypeValueHandle _dbt;
 };
 
 /**
@@ -124,6 +127,15 @@ public:
      */
     StatusWith<ChunkManager> getCollectionRoutingInfoWithRefresh(OperationContext* opCtx,
                                                                  const NamespaceString& nss);
+
+
+    /**
+     * Same as getCollectionRoutingInfo above, but throws NamespaceNotSharded error if the namespace
+     * is not sharded.
+     */
+    ChunkManager getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                 const NamespaceString& nss);
+
 
     /**
      * Same as getCollectionRoutingInfoWithRefresh above, but in addition returns a
@@ -199,6 +211,14 @@ public:
      */
     void checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx, mongo::LogicalOp opType);
 
+
+    /**
+     * Non-blocking method that marks the current database entry for the dbName as needing
+     * refresh. Will cause all further targetting attempts to block on a catalog cache refresh,
+     * even if they do not require causal consistency.
+     */
+    void invalidateDatabaseEntry_LINEARIZABLE(const StringData& dbName);
+
     /**
      * Non-blocking method that marks the current collection entry for the namespace as needing
      * refresh. Will cause all further targetting attempts to block on a catalog cache refresh,
@@ -207,8 +227,7 @@ public:
     void invalidateCollectionEntry_LINEARIZABLE(const NamespaceString& nss);
 
 private:
-    class DatabaseCache
-        : public ReadThroughCache<std::string, DatabaseType, ComparableDatabaseVersion> {
+    class DatabaseCache : public DatabaseTypeCache {
     public:
         DatabaseCache(ServiceContext* service,
                       ThreadPoolInterface& threadPool,
@@ -217,6 +236,7 @@ private:
     private:
         LookupResult _lookupDatabase(OperationContext* opCtx,
                                      const std::string& dbName,
+                                     const ValueHandle& dbType,
                                      const ComparableDatabaseVersion& previousDbVersion);
 
         CatalogCacheLoader& _catalogCacheLoader;

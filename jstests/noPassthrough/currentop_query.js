@@ -1,7 +1,10 @@
 /**
  * Confirms inclusion of query, command object and planSummary in currentOp() for CRUD operations.
  * This test should not be run in the parallel suite as it sets fail points.
- * @tags: [requires_replication, requires_sharding]
+ * @tags: [
+ *    requires_replication,
+ *    requires_sharding,
+ * ]
  */
 (function() {
 "use strict";
@@ -99,21 +102,15 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
      *  currentOp().query object.
      *  - 'testObj.operation' - The operation to test against. Will look for this to be the value
      *  of the currentOp().op field.
-     *  - 'testObj.useSbe' - True if the server should be configured to use the slot-based execution
-     *  engine rather than the classic query execution engine.
+     *  - 'testObj.skipMongosLocalOps' - True if this test should not be run against a mongos with
+     *  localOps=true.
      */
     function confirmCurrentOpContents(testObj) {
-        const useSbe = testObj.useSbe || false;
-        // TODO SERVER-50712: SBE is not currently expected to be able to run queries that require
-        // shard filtering. If the test asks for SBE and we are running against mongos, just skip
-        // this case.
-        if (useSbe && FixtureHelpers.isMongos(conn.getDB("admin"))) {
+        const skipMongosLocalOps = testObj.skipMongosLocalOps || false;
+
+        if (isLocalMongosCurOp && skipMongosLocalOps) {
             return;
         }
-        FixtureHelpers.runCommandOnEachPrimary({
-            db: conn.getDB("admin"),
-            cmdObj: {setParameter: 1, internalQueryEnableSlotBasedExecutionEngine: useSbe}
-        });
 
         // Force queries to hang on yield to allow for currentOp capture.
         FixtureHelpers.runCommandOnEachPrimary({
@@ -223,7 +220,7 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
                     "collation.locale": "fr",
                     "hint": {_id: 1}
                 },
-                                                             isRemoteShardCurOp)
+                                                             isRemoteShardCurOp),
             },
             {
                 test: function(db) {
@@ -260,14 +257,16 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
             },
             {
                 test: function(db) {
-                    assert.eq(
-                        db.currentop_query.find({a: 1}).comment("currentop_query_sbe").itcount(),
-                        1);
+                    assert.eq(db.currentop_query.find({a: 1}).comment("currentop_query").itcount(),
+                              1);
                 },
                 command: "find",
-                useSbe: true,
+                // Yields only take place on a mongod. Since this test depends on checking that the
+                // currentOp's reported 'numYields' has advanced beyond zero, this test is not
+                // expected to work when running against a mongos with localOps=true.
+                skipMongosLocalOps: true,
                 planSummary: "COLLSCAN",
-                currentOpFilter: {"command.comment": "currentop_query_sbe", numYields: {$gt: 0}}
+                currentOpFilter: {"command.comment": "currentop_query", numYields: {$gt: 0}}
             },
             {
                 test: function(db) {
@@ -388,7 +387,7 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
                 "collation.locale": "fr",
                 "comment": "currentop_query",
             },
-                                                         isRemoteShardCurOp)
+                                                         isRemoteShardCurOp),
         });
 
         //
@@ -435,7 +434,7 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
                 },
                 command: "getMore",
                 planSummary: "COLLSCAN",
-                currentOpFilter: filter
+                currentOpFilter: filter,
             });
 
             delete TestData.commandResult;
@@ -603,7 +602,7 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
                 assert.eq(cursor.itcount(), 0);
             },
             planSummary: "COLLSCAN",
-            currentOpFilter: currentOpFilter
+            currentOpFilter: currentOpFilter,
         });
 
         delete TestData.commandResult;
@@ -629,7 +628,7 @@ function runTests({conn, readMode, currentOp, truncatedOps, localOps}) {
                 }));
             },
             planSummary: "COLLSCAN",
-            currentOpFilter: currentOpFilter
+            currentOpFilter: currentOpFilter,
         });
 
         delete TestData.queryFilter;

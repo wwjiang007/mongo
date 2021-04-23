@@ -1,18 +1,18 @@
 /**
  * Tests a full tenant migration, assuming no failover.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_windows_tls,
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
 "use strict";
 
-load("jstests/aggregation/extras/utils.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 
-const tenantMigrationTest = new TenantMigrationTest(jsTestName());
+const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
     return;
@@ -37,11 +37,11 @@ const migrationOpts = {
 };
 
 const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
 
 for (const db of [...tenantDBs, ...nonTenantDBs]) {
     for (const coll of collNames) {
-        tenantMigrationTest.verifyReceipientDB(tenantId, db, coll);
+        tenantMigrationTest.verifyRecipientDB(tenantId, db, coll);
     }
 }
 

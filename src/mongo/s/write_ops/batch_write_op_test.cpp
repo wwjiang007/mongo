@@ -30,12 +30,12 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/owned_pointer_map.h"
+#include "mongo/s/mock_ns_targeter.h"
 #include "mongo/s/session_catalog_router.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/mock_ns_targeter.h"
 #include "mongo/s/write_ops/write_error_detail.h"
 #include "mongo/unittest/unittest.h"
 
@@ -121,13 +121,13 @@ using BatchWriteOpTest = WriteOpTestFixture;
 
 TEST_F(BatchWriteOpTest, SingleOp) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, single doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << 1)});
         return insertOp;
     }());
@@ -154,13 +154,13 @@ TEST_F(BatchWriteOpTest, SingleOp) {
 
 TEST_F(BatchWriteOpTest, SingleError) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, single doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({buildDelete(BSON("x" << 1), false)});
         return deleteOp;
     }());
@@ -193,13 +193,13 @@ TEST_F(BatchWriteOpTest, SingleError) {
 
 TEST_F(BatchWriteOpTest, SingleTargetError) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterHalfRange(nss, endpoint);
 
     // Do untargetable delete op
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({buildDelete(BSON("x" << 1), false)});
         return deleteOp;
     }());
@@ -228,12 +228,12 @@ TEST_F(BatchWriteOpTest, SingleTargetError) {
 // concern error if one occurs.
 TEST_F(BatchWriteOpTest, SingleWriteConcernErrorOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << 1)});
         return insertOp;
     }());
@@ -270,12 +270,12 @@ TEST_F(BatchWriteOpTest, SingleWriteConcernErrorOrdered) {
 // Single-op stale version test. We should retry the same batch until we're not stale.
 TEST_F(BatchWriteOpTest, SingleStaleError) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << 1)});
         return insertOp;
     }());
@@ -324,13 +324,13 @@ TEST_F(BatchWriteOpTest, SingleStaleError) {
 // Multi-op targeting test (ordered)
 TEST_F(BatchWriteOpTest, MultiOpSameShardOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
+        write_ops::UpdateCommandRequest updateOp(nss);
         updateOp.setUpdates(
             {buildUpdate(BSON("x" << 1), false), buildUpdate(BSON("x" << 2), false)});
         return updateOp;
@@ -361,15 +361,15 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardOrdered) {
 // Multi-op targeting test (unordered)
 TEST_F(BatchWriteOpTest, MultiOpSameShardUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     // Do single-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -404,14 +404,14 @@ TEST_F(BatchWriteOpTest, MultiOpSameShardUnordered) {
 // (one to each shard, one-by-one)
 TEST_F(BatchWriteOpTest, MultiOpTwoShardsOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << -1), BSON("x" << 1)});
         return insertOp;
     }());
@@ -461,7 +461,7 @@ void verifyTargetedBatches(std::map<ShardId, size_t> expected,
     for (auto it = targeted.begin(); it != targeted.end(); ++it) {
         ASSERT_EQUALS(expected[it->second->getEndpoint().shardName],
                       it->second->getWrites().size());
-        ASSERT_EQUALS(ChunkVersion::IGNORED(), it->second->getEndpoint().shardVersion);
+        ASSERT_EQUALS(ChunkVersion::IGNORED(), *it->second->getEndpoint().shardVersion);
         expected.erase(expected.find(it->second->getEndpoint().shardName));
     }
     ASSERT(expected.empty());
@@ -471,16 +471,16 @@ void verifyTargetedBatches(std::map<ShardId, size_t> expected,
 // to each shard).
 TEST_F(BatchWriteOpTest, MultiOpTwoShardsUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -517,14 +517,14 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsUnordered) {
 // two batches to each shard (two for each delete op).
 TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 2), true),
                              buildDelete(BSON("x" << GTE << -2 << LT << 1), true)});
         return deleteOp;
@@ -573,16 +573,16 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachOrdered) {
 // of two batches to each shard (containing writes for both ops).
 TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     // Do multi-target, multi-doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -621,13 +621,13 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardsEachUnordered) {
 // ops should be batched together.
 TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({
             // These go to the same shard
             buildDelete(BSON("x" << -1), false),
@@ -716,15 +716,15 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsOrdered) {
 // shards. Should batch all the ops together into two batches of four ops for each shard.
 TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -770,15 +770,15 @@ TEST_F(BatchWriteOpTest, MultiOpOneOrTwoShardsUnordered) {
 // one shard. There should be one set of two batches to each shard and an error reported.
 TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -831,15 +831,15 @@ TEST_F(BatchWriteOpTest, MultiOpSingleShardErrorUnordered) {
 // on each shard. There should be one set of two batches to each shard and and two errors reported.
 TEST_F(BatchWriteOpTest, MultiOpTwoShardErrorsUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -889,15 +889,15 @@ TEST_F(BatchWriteOpTest, MultiOpTwoShardErrorsUnordered) {
 // shard. There should be one set of two batches to each shard and an error reported.
 TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
-        deleteOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::DeleteCommandRequest deleteOp(nss);
+        deleteOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -952,13 +952,13 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorUnordered) {
 // should not get run.
 TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 2), true),
                              buildDelete(BSON("x" << GTE << -2 << LT << 1), true)});
         return deleteOp;
@@ -1014,14 +1014,14 @@ TEST_F(BatchWriteOpTest, MultiOpPartialSingleShardErrorOrdered) {
 // the error if ordered : false.
 TEST_F(BatchWriteOpTest, MultiOpErrorAndWriteConcernErrorUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -1058,15 +1058,15 @@ TEST_F(BatchWriteOpTest, MultiOpErrorAndWriteConcernErrorUnordered) {
 // ordered and we also have an error
 TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -1114,12 +1114,12 @@ TEST_F(BatchWriteOpTest, SingleOpErrorAndWriteConcernErrorOrdered) {
 // Targeting failure on second op in batch op (ordered)
 TEST_F(BatchWriteOpTest, MultiOpFailedTargetOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterHalfRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << -1), BSON("x" << 2), BSON("x" << -2)});
         return insertOp;
     }());
@@ -1169,14 +1169,14 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetOrdered) {
 // Targeting failure on second op in batch op (unordered)
 TEST_F(BatchWriteOpTest, MultiOpFailedTargetUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterHalfRange(nss, endpoint);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -1223,13 +1223,13 @@ TEST_F(BatchWriteOpTest, MultiOpFailedTargetUnordered) {
 // into write errors for first affected write.
 TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << -1), BSON("x" << 2), BSON("x" << 3)});
         return insertOp;
     }());
@@ -1271,15 +1271,15 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchOrdered) {
 // into write errors for all affected writes.
 TEST_F(BatchWriteOpTest, MultiOpFailedBatchUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -1328,13 +1328,13 @@ TEST_F(BatchWriteOpTest, MultiOpFailedBatchUnordered) {
 // write.
 TEST_F(BatchWriteOpTest, MultiOpAbortOrdered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << -1), BSON("x" << 2), BSON("x" << 3)});
         return insertOp;
     }());
@@ -1373,15 +1373,15 @@ TEST_F(BatchWriteOpTest, MultiOpAbortOrdered) {
 // writes.
 TEST_F(BatchWriteOpTest, MultiOpAbortUnordered) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -1414,13 +1414,13 @@ TEST_F(BatchWriteOpTest, MultiOpAbortUnordered) {
 // Multi-op targeting test where each op goes to both shards and both return a write concern error
 TEST_F(BatchWriteOpTest, MultiOpTwoWCErrors) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED());
-    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED());
+    ShardEndpoint endpointA(ShardId("shardA"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpointB(ShardId("shardB"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterSplitRange(nss, endpointA, endpointB);
 
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
+        write_ops::InsertCommandRequest insertOp(nss);
         insertOp.setDocuments({BSON("x" << -1), BSON("x" << 2)});
         return insertOp;
     }());
@@ -1464,7 +1464,7 @@ using BatchWriteOpLimitTests = WriteOpTestFixture;
 // Big single operation test - should go through
 TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
@@ -1473,9 +1473,9 @@ TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
 
     // Do single-target, single doc batch write op
     BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setWriteCommandBase([] {
-            write_ops::WriteCommandBase wcb;
+        write_ops::InsertCommandRequest insertOp(nss);
+        insertOp.setWriteCommandRequestBase([] {
+            write_ops::WriteCommandRequestBase wcb;
             wcb.setOrdered(false);
             return wcb;
         }());
@@ -1500,7 +1500,7 @@ TEST_F(BatchWriteOpLimitTests, OneBigDoc) {
 // Big doc with smaller additional doc - should go through as two batches
 TEST_F(BatchWriteOpLimitTests, OneBigOneSmall) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterFullRange(nss, endpoint);
 
@@ -1508,7 +1508,7 @@ TEST_F(BatchWriteOpLimitTests, OneBigOneSmall) {
     const std::string bigString(BSONObjMaxUserSize, 'x');
 
     BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
+        write_ops::UpdateCommandRequest updateOp(nss);
         updateOp.setUpdates({buildUpdate(BSON("x" << 1), BSON("data" << bigString), false),
                              buildUpdate(BSON("x" << 2), BSONObj(), false)});
         return updateOp;
@@ -1569,13 +1569,13 @@ private:
 
 TEST_F(BatchWriteOpTransactionTest, ThrowTargetingErrorsInTransaction_Delete) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterHalfRange(nss, endpoint);
 
     // Untargetable delete op.
     BatchedCommandRequest deleteRequest([&] {
-        write_ops::Delete deleteOp(nss);
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({buildDelete(BSON("x" << 1), false)});
         return deleteOp;
     }());
@@ -1599,13 +1599,13 @@ TEST_F(BatchWriteOpTransactionTest, ThrowTargetingErrorsInTransaction_Delete) {
 
 TEST_F(BatchWriteOpTransactionTest, ThrowTargetingErrorsInTransaction_Update) {
     NamespaceString nss("foo.bar");
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED());
+    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
 
     auto targeter = initTargeterHalfRange(nss, endpoint);
 
     // Untargetable update op.
     BatchedCommandRequest updateRequest([&] {
-        write_ops::Update updateOp(nss);
+        write_ops::UpdateCommandRequest updateOp(nss);
         updateOp.setUpdates({buildUpdate(BSON("x" << 1), BSONObj(), false)});
         return updateOp;
     }());

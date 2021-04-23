@@ -175,7 +175,8 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
-                                                   const OID& epoch);
+                                                   const OID& epoch,
+                                                   const boost::optional<Timestamp>& timestamp);
 
 /**
  * Takes a vector of 'chunks' and updates the shard's chunks collection for 'nss'. Any chunk
@@ -201,6 +202,13 @@ Status updateShardChunks(OperationContext* opCtx,
                          const OID& currEpoch);
 
 /**
+ * Adds/removes the timestamp of the  'nss' entry in config.cache.collections
+ */
+void updateTimestampOnShardCollections(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const boost::optional<Timestamp>& timestamp);
+
+/**
  * Deletes locally persisted chunk metadata associated with 'nss': drops the chunks collection
  * and removes the collections collection entry.
  *
@@ -220,14 +228,6 @@ void dropChunks(OperationContext* opCtx, const NamespaceString& nss);
  * collection entry.
  */
 Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName);
-
-
-/**
- * Downgrades the config.cache.collections entries to prior 4.9 version. More specifically, it
- * removes the allowMigrations and timestamp fields from all the documents of
- * config.cache.collections
- */
-void downgradeShardConfigCollectionEntriesToPre49(OperationContext* opCtx);
 
 }  // namespace shardmetadatautil
 }  // namespace mongo

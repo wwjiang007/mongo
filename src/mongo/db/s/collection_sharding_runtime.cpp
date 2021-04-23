@@ -39,23 +39,11 @@
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/type_collection_timeseries_fields_gen.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
-
-/**
- * Returns whether the specified namespace is used for sharding-internal purposes only and can never
- * be marked as anything other than UNSHARDED, because the call sites which reference these
- * collections are not prepared to handle StaleConfig errors.
- */
-bool isNamespaceAlwaysUnsharded(const NamespaceString& nss) {
-    // There should never be a case to mark as sharded collections which are on the config server
-    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer)
-        return true;
-
-    return nss.isNamespaceAlwaysUnsharded();
-}
 
 class UnshardedCollection : public ScopedCollectionDescription::Impl {
 public:
@@ -94,12 +82,16 @@ CollectionShardingRuntime::CollectionShardingRuntime(
       _nss(std::move(nss)),
       _rangeDeleterExecutor(std::move(rangeDeleterExecutor)),
       _stateChangeMutex(_nss.toString()),
-      _metadataType(isNamespaceAlwaysUnsharded(_nss) ? MetadataType::kUnsharded
-                                                     : MetadataType::kUnknown) {}
+      _metadataType(_nss.isNamespaceAlwaysUnsharded() ? MetadataType::kUnsharded
+                                                      : MetadataType::kUnknown) {}
 
 CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
     auto* const css = CollectionShardingState::get(opCtx, nss);
+    return checked_cast<CollectionShardingRuntime*>(css);
+}
+
+CollectionShardingRuntime* CollectionShardingRuntime::get(CollectionShardingState* css) {
     return checked_cast<CollectionShardingRuntime*>(css);
 }
 
@@ -167,18 +159,14 @@ void CollectionShardingRuntime::checkShardVersionOrThrow(OperationContext* opCtx
 }
 
 void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(const CSRLock&) {
-    invariant(_metadataType != MetadataType::kUnknown);
     _critSec.enterCriticalSectionCatchUpPhase();
 }
 
 void CollectionShardingRuntime::enterCriticalSectionCommitPhase(const CSRLock&) {
-    invariant(_metadataType != MetadataType::kUnknown);
     _critSec.enterCriticalSectionCommitPhase();
 }
 
-void CollectionShardingRuntime::exitCriticalSection(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_IX));
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, this);
+void CollectionShardingRuntime::exitCriticalSection(const CSRLock&) {
     _critSec.exitCriticalSection();
 }
 
@@ -190,7 +178,7 @@ boost::optional<SharedSemiFuture<void>> CollectionShardingRuntime::getCriticalSe
 
 void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
                                                      CollectionMetadata newMetadata) {
-    invariant(!newMetadata.isSharded() || !isNamespaceAlwaysUnsharded(_nss),
+    invariant(!newMetadata.isSharded() || !_nss.isNamespaceAlwaysUnsharded(),
               str::stream() << "Namespace " << _nss.ns() << " must never be sharded.");
 
     auto csrLock = CSRLock::lockExclusive(opCtx, this);
@@ -218,7 +206,7 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
 void CollectionShardingRuntime::clearFilteringMetadata(OperationContext* opCtx) {
     const auto csrLock = CSRLock::lockExclusive(opCtx, this);
     stdx::lock_guard lk(_metadataManagerLock);
-    if (!isNamespaceAlwaysUnsharded(_nss)) {
+    if (!_nss.isNamespaceAlwaysUnsharded()) {
         LOGV2_DEBUG(4798530,
                     1,
                     "Clearing metadata for collection {namespace}",
@@ -330,6 +318,11 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
             optCurrentMetadata);
 
     const auto& currentMetadata = optCurrentMetadata->get();
+
+    uassert(ErrorCodes::NotImplemented,
+            "Operations on sharded time-series collections are not supported",
+            !currentMetadata.isSharded() || !currentMetadata.getTimeseriesFields());
+
     auto wantedShardVersion = currentMetadata.getShardVersion();
 
     {
@@ -432,7 +425,8 @@ CollectionCriticalSection::~CollectionCriticalSection() {
     UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
     AutoGetCollection autoColl(_opCtx, _nss, MODE_IX);
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    csr->exitCriticalSection(_opCtx);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+    csr->exitCriticalSection(csrLock);
 }
 
 void CollectionCriticalSection::enterCommitPhase() {

@@ -42,6 +42,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
@@ -56,8 +57,8 @@
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/find_common.h"
-#include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
@@ -85,8 +86,10 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/transport/hello_metrics.h"
+#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/timer.h"
@@ -107,6 +110,21 @@ const auto kOperationTime = "operationTime"_sd;
  * TODO SERVER-48142 should remove the following fail-point.
  */
 MONGO_FAIL_POINT_DEFINE(allowSkippingAppendRequiredFieldsToResponse);
+
+Future<void> runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                  std::shared_ptr<CommandInvocation> invocation) {
+    auto threadingModel = [client = rec->getOpCtx()->getClient()] {
+        if (auto context = transport::ServiceExecutorContext::get(client); context) {
+            return context->getThreadingModel();
+        }
+        tassert(5453902,
+                "Threading model may only be absent for internal and direct clients",
+                !client->hasRemote() || client->isInDirectClient());
+        return transport::ServiceExecutor::ThreadingModel::kDedicated;
+    }();
+    return CommandHelpers::runCommandInvocation(
+        std::move(rec), std::move(invocation), threadingModel);
+}
 
 /**
  * Append required fields to command response.
@@ -165,12 +183,13 @@ Future<void> invokeInTransactionRouter(std::shared_ptr<RequestExecutionContext> 
     // No-op if the transaction is not running with snapshot read concern.
     txnRouter.setDefaultAtClusterTime(opCtx);
 
-    return CommandHelpers::runCommandInvocationAsync(rec, std::move(invocation))
+    return runCommandInvocation(rec, std::move(invocation))
         .tapError([rec = std::move(rec)](Status status) {
             if (auto code = status.code(); ErrorCodes::isSnapshotError(code) ||
                 ErrorCodes::isNeedRetargettingError(code) ||
                 code == ErrorCodes::ShardInvalidatedForTargeting ||
-                code == ErrorCodes::StaleDbVersion) {
+                code == ErrorCodes::StaleDbVersion ||
+                code == ErrorCodes::ShardCannotRefreshDueToLocksHeld) {
                 // Don't abort on possibly retryable errors.
                 return;
             }
@@ -192,7 +211,7 @@ void addContextForTransactionAbortingError(StringData txnIdAsString,
 }
 
 // Factory class to construct a future-chain that executes the invocation against the database.
-class ExecCommandClient final : public std::enable_shared_from_this<ExecCommandClient> {
+class ExecCommandClient final {
 public:
     ExecCommandClient(ExecCommandClient&&) = delete;
     ExecCommandClient(const ExecCommandClient&) = delete;
@@ -205,7 +224,7 @@ public:
 
 private:
     // Prepare the environment for running the invocation (e.g., checking authorization).
-    Status _prologue();
+    void _prologue();
 
     // Returns a future that runs the command invocation.
     Future<void> _run();
@@ -221,7 +240,7 @@ private:
     const std::shared_ptr<CommandInvocation> _invocation;
 };
 
-Status ExecCommandClient::_prologue() {
+void ExecCommandClient::_prologue() {
     auto opCtx = _rec->getOpCtx();
     auto result = _rec->getReplyBuilder();
     const auto& request = _rec->getRequest();
@@ -242,7 +261,7 @@ Status ExecCommandClient::_prologue() {
             auto body = result->getBodyBuilder();
             body.append("help", "help for: {} {}"_format(c->getName(), c->help()));
             CommandHelpers::appendSimpleCommandStatus(body, true, "");
-            return {ErrorCodes::SkipCommandExecution, "Already served help command"};
+            iassert(Status(ErrorCodes::SkipCommandExecution, "Already served help command"));
         }
 
         uassert(ErrorCodes::FailedToParse,
@@ -255,7 +274,7 @@ Status ExecCommandClient::_prologue() {
     } catch (const DBException& e) {
         auto body = result->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
-        return {ErrorCodes::SkipCommandExecution, "Failed to check authorization"};
+        iassert(Status(ErrorCodes::SkipCommandExecution, "Failed to check authorization"));
     }
 
     // attach tracking
@@ -267,8 +286,6 @@ Status ExecCommandClient::_prologue() {
     ReadPreferenceSetting::get(opCtx) =
         uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(request.body));
     VectorClock::get(opCtx)->gossipIn(opCtx, request.body, !c->requiresAuth());
-
-    return Status::OK();
 }
 
 Future<void> ExecCommandClient::_run() {
@@ -276,7 +293,7 @@ Future<void> ExecCommandClient::_run() {
     if (auto txnRouter = TransactionRouter::get(opCtx); txnRouter) {
         return invokeInTransactionRouter(_rec, _invocation);
     } else {
-        return CommandHelpers::runCommandInvocationAsync(_rec, _invocation);
+        return runCommandInvocation(_rec, _invocation);
     }
 }
 
@@ -320,8 +337,6 @@ void ExecCommandClient::_onCompletion() {
     auto body = _rec->getReplyBuilder()->getBodyBuilder();
     appendRequiredFieldsToResponse(opCtx, &body);
 
-    // TODO SERVER-49109 enable the following code-path.
-    /*
     auto seCtx = transport::ServiceExecutorContext::get(opCtx->getClient());
     if (!seCtx) {
         // We were run by a background worker.
@@ -329,27 +344,26 @@ void ExecCommandClient::_onCompletion() {
     }
 
     if (!_invocation->isSafeForBorrowedThreads()) {
-        // If the last command wasn't safe for a borrowed thread, then let's move off of it.
+        // If the last command wasn't safe for a borrowed thread, then let's move
+        // off of it.
         seCtx->setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
     }
-    */
 }
 
 Future<void> ExecCommandClient::run() {
-    auto pf = makePromiseFuture<void>();
-    auto future = std::move(pf.future)
-                      .then([this, anchor = shared_from_this()] { return _prologue(); })
-                      .then([this, anchor = shared_from_this()] { return _run(); })
-                      .then([this, anchor = shared_from_this()] { _epilogue(); })
-                      .onCompletion([this, anchor = shared_from_this()](Status status) {
-                          if (!status.isOK() && status.code() != ErrorCodes::SkipCommandExecution)
-                              return status;  // Execution was interrupted due to an error.
+    return makeReadyFutureWith([&] {
+               _prologue();
 
-                          _onCompletion();
-                          return Status::OK();
-                      });
-    pf.promise.emplaceValue();
-    return future;
+               return _run();
+           })
+        .then([this] { _epilogue(); })
+        .onCompletion([this](Status status) {
+            if (!status.isOK() && status.code() != ErrorCodes::SkipCommandExecution)
+                return status;  // Execution was interrupted due to an error.
+
+            _onCompletion();
+            return Status::OK();
+        });
 }
 
 MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
@@ -358,7 +372,7 @@ MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
  * Produces a future-chain that parses the command, runs the parsed command, and captures the result
  * in replyBuilder.
  */
-class ParseAndRunCommand final : public std::enable_shared_from_this<ParseAndRunCommand> {
+class ParseAndRunCommand final {
 public:
     ParseAndRunCommand(const ParseAndRunCommand&) = delete;
     ParseAndRunCommand(ParseAndRunCommand&&) = delete;
@@ -378,10 +392,7 @@ private:
 
     // Prepares the environment for running the command (e.g., parsing the command to produce the
     // invocation and extracting read/write concerns).
-    Status _prologue();
-
-    // Returns a future-chain that runs the parse invocation.
-    Future<void> _runInvocation();
+    void _parseCommand();
 
     const std::shared_ptr<RequestExecutionContext> _rec;
     const std::shared_ptr<BSONObjBuilder> _errorBuilder;
@@ -398,13 +409,12 @@ private:
 /*
  * Produces a future-chain to run the invocation and capture the result in replyBuilder.
  */
-class ParseAndRunCommand::RunInvocation final
-    : public std::enable_shared_from_this<ParseAndRunCommand::RunInvocation> {
+class ParseAndRunCommand::RunInvocation final {
 public:
     RunInvocation(RunInvocation&&) = delete;
     RunInvocation(const RunInvocation&) = delete;
 
-    explicit RunInvocation(std::shared_ptr<ParseAndRunCommand> parc) : _parc(std::move(parc)) {}
+    explicit RunInvocation(ParseAndRunCommand* parc) : _parc(parc) {}
 
     ~RunInvocation() {
         if (!_shouldAffectCommandCounter)
@@ -419,13 +429,10 @@ public:
 private:
     Status _setup();
 
-    // Returns a future-chain that runs the invocation and retries if necessary.
-    Future<void> _runAndRetry();
-
-    // Logs and updates statistics if an error occurs during `_setup()` or `_runAndRetry()`.
+    // Logs and updates statistics if an error occurs.
     void _tapOnError(const Status& status);
 
-    const std::shared_ptr<ParseAndRunCommand> _parc;
+    ParseAndRunCommand* const _parc;
 
     boost::optional<RouterOperationContextSession> _routerSession;
     bool _shouldAffectCommandCounter = false;
@@ -434,13 +441,12 @@ private:
 /*
  * Produces a future-chain that runs the invocation and retries if necessary.
  */
-class ParseAndRunCommand::RunAndRetry final
-    : public std::enable_shared_from_this<ParseAndRunCommand::RunAndRetry> {
+class ParseAndRunCommand::RunAndRetry final {
 public:
     RunAndRetry(RunAndRetry&&) = delete;
     RunAndRetry(const RunAndRetry&) = delete;
 
-    explicit RunAndRetry(std::shared_ptr<ParseAndRunCommand> parc) : _parc(std::move(parc)) {}
+    explicit RunAndRetry(ParseAndRunCommand* parc) : _parc(parc) {}
 
     Future<void> run();
 
@@ -461,13 +467,14 @@ private:
     void _onNeedRetargetting(Status& status);
     void _onStaleDbVersion(Status& status);
     void _onSnapshotError(Status& status);
+    void _onShardCannotRefreshDueToLocksHeldError(Status& status);
 
-    const std::shared_ptr<ParseAndRunCommand> _parc;
+    ParseAndRunCommand* const _parc;
 
     int _tries = 0;
 };
 
-Status ParseAndRunCommand::_prologue() {
+void ParseAndRunCommand::_parseCommand() {
     auto opCtx = _rec->getOpCtx();
     const auto& m = _rec->getMessage();
     const auto& request = _rec->getRequest();
@@ -481,7 +488,7 @@ Status ParseAndRunCommand::_prologue() {
                                                    {ErrorCodes::CommandNotFound, errorMsg});
         globalCommandRegistry()->incrementUnknownCommands();
         appendRequiredFieldsToResponse(opCtx, &builder);
-        return {ErrorCodes::SkipCommandExecution, errorMsg};
+        iassert(Status(ErrorCodes::SkipCommandExecution, errorMsg));
     }
 
     _rec->setCommand(command);
@@ -508,9 +515,9 @@ Status ParseAndRunCommand::_prologue() {
     // maxTimeMS altogether on a getMore command.
     uassert(ErrorCodes::InvalidOptions,
             "no such command option $maxTimeMs; use maxTimeMS instead",
-            request.body[QueryRequest::queryOptionMaxTimeMS].eoo());
-    const int maxTimeMS = uassertStatusOK(
-        QueryRequest::parseMaxTimeMS(request.body[QueryRequest::cmdOptionMaxTimeMS]));
+            request.body[query_request_helper::queryOptionMaxTimeMS].eoo());
+    const int maxTimeMS =
+        uassertStatusOK(parseMaxTimeMS(request.body[query_request_helper::cmdOptionMaxTimeMS]));
     if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
         opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
     }
@@ -519,6 +526,16 @@ Status ParseAndRunCommand::_prologue() {
     // If the command includes a 'comment' field, set it on the current OpCtx.
     if (auto commentField = request.body["comment"]) {
         opCtx->setComment(commentField.wrap());
+    }
+
+    Client* client = opCtx->getClient();
+    auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
+
+    {
+        // We must obtain the client lock to set APIParameters on the operation context, as it may
+        // be concurrently read by CurrentOp.
+        stdx::lock_guard<Client> lk(*client);
+        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
     }
 
     _invocation = command->parse(opCtx, request);
@@ -547,26 +564,20 @@ Status ParseAndRunCommand::_prologue() {
 
     _wc.emplace(uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body)));
 
-    Client* client = opCtx->getClient();
-    auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
-
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     Status readConcernParseStatus = Status::OK();
     {
-        // We must obtain the client lock to set APIParameters and ReadConcernArgs on the operation
-        // context, as it may be concurrently read by CurrentOp.
+        // We must obtain the client lock to set ReadConcernArgs on the operation context, as it may
+        // be concurrently read by CurrentOp.
         stdx::lock_guard<Client> lk(*client);
-        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
         readConcernParseStatus = readConcernArgs.initialize(request.body);
     }
 
     if (!readConcernParseStatus.isOK()) {
         auto builder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
-        return {ErrorCodes::SkipCommandExecution, "Failed to parse read concern"};
+        iassert(Status(ErrorCodes::SkipCommandExecution, "Failed to parse read concern"));
     }
-
-    return Status::OK();
 }
 
 Status ParseAndRunCommand::RunInvocation::_setup() {
@@ -635,20 +646,33 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
 
     bool clientSuppliedWriteConcern = !_parc->_wc->usedDefault;
     bool customDefaultWriteConcernWasApplied = false;
+    bool isInternalClient =
+        (opCtx->getClient()->session() &&
+         (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient));
 
     if (supportsWriteConcern && !clientSuppliedWriteConcern &&
-        (!TransactionRouter::get(opCtx) || isTransactionCommand(_parc->_commandName))) {
-        // This command supports WC, but wasn't given one - so apply the default, if there is one.
-        if (const auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                       .getDefaultWriteConcern(opCtx)) {
-            _parc->_wc = *wcDefault;
-            customDefaultWriteConcernWasApplied = true;
-            LOGV2_DEBUG(22766,
-                        2,
-                        "Applying default writeConcern on {command} of {writeConcern}",
-                        "Applying default writeConcern on command",
-                        "command"_attr = request.getCommandName(),
-                        "writeConcern"_attr = *wcDefault);
+        (!TransactionRouter::get(opCtx) || isTransactionCommand(_parc->_commandName)) &&
+        !opCtx->getClient()->isInDirectClient()) {
+        if (isInternalClient) {
+            tassert(
+                5569901,
+                "received command without explicit writeConcern on an internalClient connection {}"_format(
+                    redact(request.body.toString())),
+                request.body.hasField(WriteConcernOptions::kWriteConcernField));
+        } else {
+            // This command is not from a DBDirectClient or internal client, and supports WC, but
+            // wasn't given one - so apply the default, if there is one.
+            if (const auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
+                                           .getDefaultWriteConcern(opCtx)) {
+                _parc->_wc = *wcDefault;
+                customDefaultWriteConcernWasApplied = true;
+                LOGV2_DEBUG(22766,
+                            2,
+                            "Applying default writeConcern on {command} of {writeConcern}",
+                            "Applying default writeConcern on command",
+                            "command"_attr = request.getCommandName(),
+                            "writeConcern"_attr = *wcDefault);
+            }
         }
     }
 
@@ -674,6 +698,8 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
                 provenance.setSource(ReadWriteConcernProvenance::Source::clientSupplied);
             } else if (customDefaultWriteConcernWasApplied) {
                 provenance.setSource(ReadWriteConcernProvenance::Source::customDefault);
+            } else if (opCtx->getClient()->isInDirectClient() || isInternalClient) {
+                provenance.setSource(ReadWriteConcernProvenance::Source::internalWriteDefault);
             } else {
                 provenance.setSource(ReadWriteConcernProvenance::Source::implicitDefault);
             }
@@ -836,14 +862,15 @@ void ParseAndRunCommand::RunAndRetry::_setup() {
 }
 
 Future<void> ParseAndRunCommand::RunAndRetry::_run() {
-    auto ecc = std::make_shared<ExecCommandClient>(_parc->_rec, _parc->_invocation);
-    return ecc->run().then([rec = _parc->_rec] {
-        auto opCtx = rec->getOpCtx();
-        auto responseBuilder = rec->getReplyBuilder()->getBodyBuilder();
-        if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter.appendRecoveryToken(&responseBuilder);
-        }
-    });
+    return future_util::makeState<ExecCommandClient>(_parc->_rec, _parc->_invocation)
+        .thenWithState([](auto* runner) { return runner->run(); })
+        .then([rec = _parc->_rec] {
+            auto opCtx = rec->getOpCtx();
+            auto responseBuilder = rec->getReplyBuilder()->getBodyBuilder();
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                txnRouter.appendRecoveryToken(&responseBuilder);
+            }
+        });
 }
 
 void ParseAndRunCommand::RunAndRetry::_checkRetryForTransaction(Status& status) {
@@ -878,7 +905,8 @@ void ParseAndRunCommand::RunAndRetry::_checkRetryForTransaction(Status& status) 
     } else {
         invariant(ErrorCodes::isA<ErrorCategory::NeedRetargettingError>(status) ||
                   status.code() == ErrorCodes::ShardInvalidatedForTargeting ||
-                  status.code() == ErrorCodes::StaleDbVersion);
+                  status.code() == ErrorCodes::StaleDbVersion ||
+                  status.code() == ErrorCodes::ShardCannotRefreshDueToLocksHeld);
 
         if (!txnRouter.canContinueOnStaleShardOrDbError(_parc->_commandName, status)) {
             if (status.code() == ErrorCodes::ShardInvalidatedForTargeting) {
@@ -970,6 +998,15 @@ void ParseAndRunCommand::RunAndRetry::_onSnapshotError(Status& status) {
         iassert(status);
 }
 
+void ParseAndRunCommand::RunAndRetry::_onShardCannotRefreshDueToLocksHeldError(Status& status) {
+    invariant(status.code() == ErrorCodes::ShardCannotRefreshDueToLocksHeld);
+
+    _checkRetryForTransaction(status);
+
+    if (!_canRetry())
+        iassert(status);
+}
+
 void ParseAndRunCommand::RunInvocation::_tapOnError(const Status& status) {
     auto opCtx = _parc->_rec->getOpCtx();
     const auto command = _parc->_rec->getCommand();
@@ -993,84 +1030,55 @@ void ParseAndRunCommand::RunInvocation::_tapOnError(const Status& status) {
     _parc->_errorBuilder->appendElements(errorLabels);
 }
 
-Future<void> ParseAndRunCommand::RunInvocation::_runAndRetry() {
-    auto instance = std::make_shared<RunAndRetry>(_parc);
-    return instance->run();
-}
-
-Future<void> ParseAndRunCommand::_runInvocation() {
-    auto ri = std::make_shared<RunInvocation>(shared_from_this());
-    return ri->run();
-}
-
 Future<void> ParseAndRunCommand::RunAndRetry::run() {
-    // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are rethrown.
-    _tries++;
+    return makeReadyFutureWith([&] {
+               // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are rethrown.
+               _tries++;
 
-    auto pf = makePromiseFuture<void>();
-    auto future = std::move(pf.future)
-                      .then([this, anchor = shared_from_this()] { _setup(); })
-                      .then([this, anchor = shared_from_this()] {
-                          return _run()
-                              .onError<ErrorCodes::ShardInvalidatedForTargeting>(
-                                  [this, anchor = shared_from_this()](Status status) {
-                                      _onShardInvalidatedForTargeting(status);
-                                      return run();  // Retry
-                                  })
-                              .onErrorCategory<ErrorCategory::NeedRetargettingError>(
-                                  [this, anchor = shared_from_this()](Status status) {
-                                      _onNeedRetargetting(status);
-                                      return run();  // Retry
-                                  })
-                              .onError<ErrorCodes::StaleDbVersion>(
-                                  [this, anchor = shared_from_this()](Status status) {
-                                      _onStaleDbVersion(status);
-                                      return run();  // Retry
-                                  })
-                              .onErrorCategory<ErrorCategory::SnapshotError>(
-                                  [this, anchor = shared_from_this()](Status status) {
-                                      _onSnapshotError(status);
-                                      return run();  // Retry
-                                  });
-                      });
-    pf.promise.emplaceValue();
-    return future;
+               _setup();
+               return _run();
+           })
+        .onError<ErrorCodes::ShardInvalidatedForTargeting>([this](Status status) {
+            _onShardInvalidatedForTargeting(status);
+            return run();  // Retry
+        })
+        .onErrorCategory<ErrorCategory::NeedRetargettingError>([this](Status status) {
+            _onNeedRetargetting(status);
+            return run();  // Retry
+        })
+        .onError<ErrorCodes::StaleDbVersion>([this](Status status) {
+            _onStaleDbVersion(status);
+            return run();  // Retry
+        })
+        .onErrorCategory<ErrorCategory::SnapshotError>([this](Status status) {
+            _onSnapshotError(status);
+            return run();  // Retry
+        })
+        .onError<ErrorCodes::ShardCannotRefreshDueToLocksHeld>([this](Status status) {
+            _onShardCannotRefreshDueToLocksHeldError(status);
+            return run();  // Retry
+        });
 }
 
 Future<void> ParseAndRunCommand::RunInvocation::run() {
-    auto pf = makePromiseFuture<void>();
-    auto future =
-        std::move(pf.future)
-            .then([this, anchor = shared_from_this()] { return _setup(); })
-            .then([this, anchor = shared_from_this()] { return _runAndRetry(); })
-            .tapError([this, anchor = shared_from_this()](Status status) { _tapOnError(status); });
-    pf.promise.emplaceValue();
-    return future;
+    return makeReadyFutureWith([&] {
+               iassert(_setup());
+               return future_util::makeState<RunAndRetry>(_parc).thenWithState(
+                   [](auto* runner) { return runner->run(); });
+           })
+        .tapError([this](Status status) { _tapOnError(status); });
 }
 
 Future<void> ParseAndRunCommand::run() {
-    auto pf = makePromiseFuture<void>();
-    auto future = std::move(pf.future)
-                      .then([this, anchor = shared_from_this()] { return _prologue(); })
-                      .then([this, anchor = shared_from_this()] { return _runInvocation(); })
-                      .onError([this, anchor = shared_from_this()](Status status) {
-                          if (status.code() == ErrorCodes::SkipCommandExecution)
-                              // We've already skipped execution, so no other action is required.
-                              return Status::OK();
-                          return status;
-                      });
-    pf.promise.emplaceValue();
-    return future;
-}
-
-/**
- * Executes the command for the given request, and appends the result to replyBuilder
- * and error labels, if any, to errorBuilder.
- */
-Future<void> runCommand(std::shared_ptr<RequestExecutionContext> rec,
-                        std::shared_ptr<BSONObjBuilder> errorBuilder) {
-    auto instance = std::make_shared<ParseAndRunCommand>(std::move(rec), std::move(errorBuilder));
-    return instance->run();
+    return makeReadyFutureWith([&] {
+               _parseCommand();
+               return future_util::makeState<RunInvocation>(this).thenWithState(
+                   [](auto* runner) { return runner->run(); });
+           })
+        .onError<ErrorCodes::SkipCommandExecution>([this](Status status) {
+            // We've already skipped execution, so no other action is required.
+            return Status::OK();
+        });
 }
 
 }  // namespace
@@ -1100,7 +1108,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
         opCtx->setComment(commentField.wrap());
     }
 
-    Status status = authSession->checkAuthForFind(nss, false);
+    Status status = auth::checkAuthForFind(authSession, nss, false);
     audit::logQueryAuthzCheck(client, nss, q.query, status.code());
     uassertStatusOK(status);
 
@@ -1134,29 +1142,29 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures));
 
-    const QueryRequest& queryRequest = canonicalQuery->getQueryRequest();
+    const FindCommandRequest& findCommand = canonicalQuery->getFindCommandRequest();
     // Handle query option $maxTimeMS (not used with commands).
-    if (queryRequest.getMaxTimeMS() > 0) {
+    if (findCommand.getMaxTimeMS().value_or(0) > 0) {
         uassert(50749,
                 "Illegal attempt to set operation deadline within DBDirectClient",
                 !opCtx->getClient()->isInDirectClient());
-        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()},
+        opCtx->setDeadlineAfterNowBy(Milliseconds{findCommand.getMaxTimeMS().value_or(0)},
                                      ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
     // If the $explain flag was set, we must run the operation on the shards as an explain command
     // rather than a find command.
-    if (queryRequest.isExplain()) {
-        const BSONObj findCommand = queryRequest.asFindCommand();
+    if (canonicalQuery->getExplain()) {
+        const BSONObj findCommandObj = findCommand.toBSON(BSONObj());
 
         // We default to allPlansExecution verbosity.
         const auto verbosity = ExplainOptions::Verbosity::kExecAllPlans;
 
         BSONObjBuilder explainBuilder;
         Strategy::explainFind(opCtx,
+                              findCommandObj,
                               findCommand,
-                              queryRequest,
                               verbosity,
                               ReadPreferenceSetting::get(opCtx),
                               &explainBuilder);
@@ -1195,7 +1203,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
 
 // Maintains the state required to execute client commands, and provides the interface to construct
 // a future-chain that runs the command against the database.
-class ClientCommand final : public std::enable_shared_from_this<ClientCommand> {
+class ClientCommand final {
 public:
     ClientCommand(ClientCommand&&) = delete;
     ClientCommand(const ClientCommand&) = delete;
@@ -1203,11 +1211,10 @@ public:
     explicit ClientCommand(std::shared_ptr<RequestExecutionContext> rec)
         : _rec(std::move(rec)), _errorBuilder(std::make_shared<BSONObjBuilder>()) {}
 
-    // Returns the future-chain that produces the response by parsing and executing the command.
     Future<DbResponse> run();
 
 private:
-    void _parse();
+    void _parseMessage();
 
     Future<void> _execute();
 
@@ -1223,7 +1230,7 @@ private:
     bool _propagateException = false;
 };
 
-void ClientCommand::_parse() try {
+void ClientCommand::_parseMessage() try {
     const auto& msg = _rec->getMessage();
     _rec->setReplyBuilder(rpc::makeReplyBuilder(rpc::protocolForMessage(msg)));
     _rec->setRequest(rpc::opMsgRequestFromAnyProtocol(msg));
@@ -1248,8 +1255,9 @@ Future<void> ClientCommand::_execute() {
                 "db"_attr = _rec->getRequest().getDatabase().toString(),
                 "headerId"_attr = _rec->getMessage().header().getId());
 
-    return runCommand(_rec, _errorBuilder)
-        .then([this, anchor = shared_from_this()] {
+    return future_util::makeState<ParseAndRunCommand>(_rec, _errorBuilder)
+        .thenWithState([](auto* runner) { return runner->run(); })
+        .then([this] {
             LOGV2_DEBUG(22771,
                         3,
                         "Command end db: {db} msg id: {headerId}",
@@ -1257,7 +1265,7 @@ Future<void> ClientCommand::_execute() {
                         "db"_attr = _rec->getRequest().getDatabase().toString(),
                         "headerId"_attr = _rec->getMessage().header().getId());
         })
-        .tapError([this, anchor = shared_from_this()](Status status) {
+        .tapError([this](Status status) {
             LOGV2_DEBUG(
                 22772,
                 1,
@@ -1323,21 +1331,18 @@ DbResponse ClientCommand::_produceResponse() {
 }
 
 Future<DbResponse> ClientCommand::run() {
-    auto pf = makePromiseFuture<void>();
-    auto future = std::move(pf.future)
-                      .then([this, anchor = shared_from_this()] { _parse(); })
-                      .then([this, anchor = shared_from_this()] { return _execute(); })
-                      .onError([this, anchor = shared_from_this()](Status status) {
-                          return _handleException(std::move(status));
-                      })
-                      .then([this, anchor = shared_from_this()] { return _produceResponse(); });
-    pf.promise.emplaceValue();
-    return future;
+    return makeReadyFutureWith([&] {
+               _parseMessage();
+               return _execute();
+           })
+        .onError([this](Status status) { return _handleException(std::move(status)); })
+        .then([this] { return _produceResponse(); });
 }
 
 Future<DbResponse> Strategy::clientCommand(std::shared_ptr<RequestExecutionContext> rec) {
-    auto instance = std::make_shared<ClientCommand>(std::move(rec));
-    return instance->run();
+    return future_util::makeState<ClientCommand>(std::move(rec)).thenWithState([](auto* runner) {
+        return runner->run();
+    });
 }
 
 DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
@@ -1357,18 +1362,17 @@ DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss
     }
     uassertStatusOK(statusGetDb);
 
-    boost::optional<std::int64_t> batchSize;
+    GetMoreCommandRequest getMoreCmd(cursorId, nss.coll().toString());
+    getMoreCmd.setDbName(nss.db());
     if (ntoreturn) {
-        batchSize = ntoreturn;
+        getMoreCmd.setBatchSize(ntoreturn);
     }
-
-    GetMoreRequest getMoreRequest(nss, cursorId, batchSize, boost::none, boost::none, boost::none);
 
     // Set the upconverted getMore as the CurOp command object.
     CurOp::get(opCtx)->setGenericOpRequestDetails(
-        opCtx, nss, nullptr, getMoreRequest.toBSON(), dbm->msg().operation());
+        opCtx, nss, nullptr, getMoreCmd.toBSON({}), dbm->msg().operation());
 
-    auto cursorResponse = ClusterFind::runGetMore(opCtx, getMoreRequest);
+    auto cursorResponse = ClusterFind::runGetMore(opCtx, getMoreCmd);
     if (cursorResponse == ErrorCodes::CursorNotFound) {
         return replyToQuery(ResultFlag_CursorNotFound, nullptr, 0, 0);
     }
@@ -1424,7 +1428,7 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
 
         auto authzSession = AuthorizationSession::get(client);
         auto authChecker = [&authzSession, &nss](UserNameIterator userNames) -> Status {
-            return authzSession->checkAuthForKillCursors(*nss, userNames);
+            return auth::checkAuthForKillCursors(authzSession, *nss, userNames);
         };
         auto authzStatus = manager->checkAuthForKillCursors(opCtx, *nss, cursorId, authChecker);
         audit::logKillCursorsAuthzCheck(client, *nss, cursorId, authzStatus.code());
@@ -1478,18 +1482,19 @@ void Strategy::writeOp(std::shared_ptr<RequestExecutionContext> rec) {
     }());
 
     rec->setReplyBuilder(std::make_unique<rpc::OpMsgReplyBuilder>());
-    runCommand(std::move(rec),
-               std::make_shared<BSONObjBuilder>())  // built objects are ignored
+    auto bob = std::make_shared<BSONObjBuilder>();  // built objects are ignorned.
+    future_util::makeState<ParseAndRunCommand>(std::move(rec), std::move(bob))
+        .thenWithState([](auto* runner) { return runner->run(); })
         .get();
 }
 
 void Strategy::explainFind(OperationContext* opCtx,
-                           const BSONObj& findCommand,
-                           const QueryRequest& qr,
+                           const BSONObj& findCommandObj,
+                           const FindCommandRequest& findCommand,
                            ExplainOptions::Verbosity verbosity,
                            const ReadPreferenceSetting& readPref,
                            BSONObjBuilder* out) {
-    const auto explainCmd = ClusterExplain::wrapAsExplain(findCommand, verbosity);
+    const auto explainCmd = ClusterExplain::wrapAsExplain(findCommandObj, verbosity);
 
     long long millisElapsed;
     std::vector<AsyncRequestsSender::Response> shardResponses;
@@ -1500,18 +1505,20 @@ void Strategy::explainFind(OperationContext* opCtx,
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
         try {
-            const auto routingInfo = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, qr.nss()));
-            shardResponses =
-                scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                           qr.nss().db(),
-                                                           qr.nss(),
-                                                           routingInfo,
-                                                           explainCmd,
-                                                           readPref,
-                                                           Shard::RetryPolicy::kIdempotent,
-                                                           qr.getFilter(),
-                                                           qr.getCollation());
+            invariant(findCommand.getNamespaceOrUUID().nss());
+            const auto routingInfo =
+                uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+                    opCtx, *findCommand.getNamespaceOrUUID().nss()));
+            shardResponses = scatterGatherVersionedTargetByRoutingTable(
+                opCtx,
+                findCommand.getNamespaceOrUUID().nss()->db(),
+                *findCommand.getNamespaceOrUUID().nss(),
+                routingInfo,
+                explainCmd,
+                readPref,
+                Shard::RetryPolicy::kIdempotent,
+                findCommand.getFilter(),
+                findCommand.getCollation());
             millisElapsed = timer.millis();
             break;
         } catch (ExceptionFor<ErrorCodes::ShardInvalidatedForTargeting>&) {
@@ -1564,9 +1571,9 @@ void Strategy::explainFind(OperationContext* opCtx,
     }
 
     const char* mongosStageName =
-        ClusterExplain::getStageNameForReadOp(shardResponses.size(), findCommand);
+        ClusterExplain::getStageNameForReadOp(shardResponses.size(), findCommandObj);
 
     uassertStatusOK(ClusterExplain::buildExplainResult(
-        opCtx, shardResponses, mongosStageName, millisElapsed, findCommand, out));
+        opCtx, shardResponses, mongosStageName, millisElapsed, findCommandObj, out));
 }
 }  // namespace mongo

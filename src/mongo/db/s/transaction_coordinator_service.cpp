@@ -34,8 +34,8 @@
 #include "mongo/db/s/transaction_coordinator_service.h"
 
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/transaction_coordinator_document_gen.h"
+#include "mongo/db/s/transaction_coordinator_params_gen.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/db/write_concern.h"
@@ -83,7 +83,18 @@ void TransactionCoordinatorService::createCoordinator(OperationContext* opCtx,
     auto coordinator = std::make_shared<TransactionCoordinator>(
         opCtx, lsid, txnNumber, scheduler.makeChildScheduler(), commitDeadline);
 
-    catalog.insert(opCtx, lsid, txnNumber, coordinator);
+    try {
+        catalog.insert(opCtx, lsid, txnNumber, coordinator);
+    } catch (const DBException&) {
+        // Handle the case where the opCtx has been interrupted and we do not successfully insert
+        // the coordinator into the catalog.
+        coordinator->cancelIfCommitNotYetStarted();
+        // Wait for it to finish processing the error before throwing, since leaving this scope will
+        // cause the newly created coordinator to be destroyed. We ignore the return Status since we
+        // want to just rethrow whatever exception was thrown when inserting into the catalog.
+        [[maybe_unused]] auto status = coordinator->onCompletion().waitNoThrow();
+        throw;
+    }
 }
 
 

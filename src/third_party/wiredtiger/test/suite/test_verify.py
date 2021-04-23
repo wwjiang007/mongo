@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2020 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -182,7 +182,9 @@ class test_verify(wttest.WiredTigerTestCase, suite_subprocess):
             f.truncate(0)
         self.runWt(["verify", "table:" + self.tablename],
             errfilename="verifyerr.out", failure=True)
-        self.check_non_empty_file("verifyerr.out")
+        # The test may output the following error message while opening a file that
+        # does not exist. Ignore that.
+        self.ignoreStderrPatternIfExists('No such file or directory')
 
     def test_verify_process_zero_length(self):
         """
@@ -195,7 +197,9 @@ class test_verify(wttest.WiredTigerTestCase, suite_subprocess):
             f.truncate(0)
         self.runWt(["verify", "table:" + self.tablename],
             errfilename="verifyerr.out", failure=True)
-        self.check_non_empty_file("verifyerr.out")
+        # The test may output the following error message while opening a file that
+        # does not exist. Ignore that.
+        self.ignoreStderrPatternIfExists('No such file or directory')
 
 if __name__ == '__main__':
     wttest.run()

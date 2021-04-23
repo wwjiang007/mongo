@@ -42,7 +42,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_database.h"
@@ -53,6 +53,7 @@
 #include "mongo/s/request_types/move_primary_gen.h"
 #include "mongo/util/scopeguard.h"
 
+// TODO (SERVER-54879): Remove this command entirely after 5.0 branches
 namespace mongo {
 namespace {
 
@@ -145,7 +146,7 @@ public:
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
-        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+        auto dbDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
             opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
 
         auto dbType =

@@ -85,8 +85,6 @@ MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
     v3SystemRolesIndexSpec.addKeys(v3SystemRolesKeyPattern);
     v3SystemRolesIndexSpec.unique();
     v3SystemRolesIndexSpec.name(v3SystemRolesIndexName);
-
-    return Status::OK();
 }
 
 void generateSystemIndexForExistingCollection(OperationContext* opCtx,
@@ -103,8 +101,7 @@ void generateSystemIndexForExistingCollection(OperationContext* opCtx,
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
 
     try {
-        auto indexSpecStatus = index_key_validate::validateIndexSpec(
-            opCtx, spec.toBSON(), serverGlobalParams.featureCompatibility);
+        auto indexSpecStatus = index_key_validate::validateIndexSpec(opCtx, spec.toBSON());
         BSONObj indexSpec = fassert(40452, indexSpecStatus);
 
         LOGV2(22488,
@@ -206,15 +203,11 @@ void createSystemIndexes(OperationContext* opCtx, CollectionWriter& collection) 
     BSONObj indexSpec;
     if (ns == AuthorizationManager::usersCollectionNamespace) {
         indexSpec = fassert(
-            40455,
-            index_key_validate::validateIndexSpec(
-                opCtx, v3SystemUsersIndexSpec.toBSON(), serverGlobalParams.featureCompatibility));
+            40455, index_key_validate::validateIndexSpec(opCtx, v3SystemUsersIndexSpec.toBSON()));
 
     } else if (ns == AuthorizationManager::rolesCollectionNamespace) {
         indexSpec = fassert(
-            40457,
-            index_key_validate::validateIndexSpec(
-                opCtx, v3SystemRolesIndexSpec.toBSON(), serverGlobalParams.featureCompatibility));
+            40457, index_key_validate::validateIndexSpec(opCtx, v3SystemRolesIndexSpec.toBSON()));
     }
     if (!indexSpec.isEmpty()) {
         auto fromMigrate = false;

@@ -1,15 +1,23 @@
-// Cannot implicitly shard accessed collections because of collection existing when none
-// expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop, requires_getmore,
-// requires_replication]
-
-// Basic functional tests for the listCollections command.
-//
-// Note that storage engines used to be allowed to advertise internal collections to the user (in
-// particular, the MMAPv1 storage engine used to advertise the "system.indexes" collection).
-// Hence, this test suite does not test for a particular number of collections returned in
-// listCollections output, but rather tests for existence or absence of particular collections in
-// listCollections output.
+/*
+ * Basic functional tests for the listCollections command.
+ *
+ * @tags: [
+ *   # Cannot implicitly shard accessed collections
+ *   # because of collection existing when none expected.
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   # applyOps is not supported on mongos
+ *   assumes_against_mongod_not_mongos,
+ *   requires_getmore,
+ *   requires_replication,
+ *   requires_fcv_49,
+ * ]
+ *
+ * Note that storage engines used to be allowed to advertise internal collections to the user (in
+ * particular, the MMAPv1 storage engine used to advertise the "system.indexes" collection).
+ * Hence, this test suite does not test for a particular number of collections returned in
+ * listCollections output, but rather tests for existence or absence of particular collections in
+ * listCollections output.
+ */
 
 (function() {
 "use strict";
@@ -334,4 +342,10 @@ assert.commandFailedWithCode(mydb.runCommand("listCollections", {includePendingD
 assert.commandWorked(mydb.runCommand("listCollections", {includePendingDrops: 1}));
 assert.commandWorked(mydb.runCommand("listCollections", {includePendingDrops: true}));
 assert.commandWorked(mydb.runCommand("listCollections", {includePendingDrops: false}));
+
+// Verify that 'includePendingDrops' field is unstable in API version 1.
+assert.commandFailedWithCode(
+    mydb.runCommand("listCollections",
+                    {includePendingDrops: false, apiVersion: "1", apiStrict: true}),
+    ErrorCodes.APIStrictError);
 }());

@@ -33,9 +33,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops_gen.h"
-#include "mongo/db/ops/write_ops_parsers.h"
-#include "mongo/db/pipeline/runtime_constants_gen.h"
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/util/str.h"
 
@@ -44,6 +43,20 @@ namespace mongo {
 namespace {
 const std::vector<BSONObj> emptyArrayFilters{};
 const BSONObj emptyCollation{};
+
+template <typename T>
+void appendArrayToString(const T& arr, StringBuilder* builder) {
+    bool first = true;
+    *builder << "[";
+    for (const auto& elem : arr) {
+        if (!first) {
+            *builder << ", ";
+        }
+        first = false;
+        *builder << elem;
+    }
+    *builder << "]";
+}
 }  // namespace
 
 class FieldRef;
@@ -121,12 +134,12 @@ public:
         return _updateOp.getC();
     }
 
-    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
-        _runtimeConstants = std::move(runtimeConstants);
+    void setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants) {
+        _legacyRuntimeConstants = std::move(runtimeConstants);
     }
 
-    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
-        return _runtimeConstants;
+    const boost::optional<LegacyRuntimeConstants>& getLegacyRuntimeConstants() const {
+        return _legacyRuntimeConstants;
     }
 
     void setLetParameters(const boost::optional<BSONObj>& letParameters) {
@@ -180,12 +193,20 @@ public:
         return _updateOp.getMulti();
     }
 
-    void setFromMigration(bool value = true) {
-        _fromMigration = value;
+    void setSource(OperationSource source) {
+        _source = source;
+    }
+
+    OperationSource source() const {
+        return _source;
     }
 
     bool isFromMigration() const {
-        return _fromMigration;
+        return _source == OperationSource::kFromMigrate;
+    }
+
+    bool isTimeseries() const {
+        return _source == OperationSource::kTimeseries;
     }
 
     void setFromOplogApplication(bool value = true) {
@@ -236,12 +257,12 @@ public:
         return _yieldPolicy;
     }
 
-    void setStmtId(StmtId stmtId) {
-        _stmtId = std::move(stmtId);
+    void setStmtIds(std::vector<StmtId> stmtIds) {
+        _stmtIds = std::move(stmtIds);
     }
 
-    StmtId getStmtId() const {
-        return _stmtId;
+    const std::vector<StmtId>& getStmtIds() const {
+        return _stmtIds;
     }
 
     const std::string toString() const {
@@ -251,25 +272,19 @@ public:
         builder << " sort: " << _sort;
         builder << " collation: " << getCollation();
         builder << " updateModification: " << getUpdateModification().toString();
-        builder << " stmtId: " << _stmtId;
 
-        builder << " arrayFilters: [";
-        bool first = true;
-        for (auto arrayFilter : getArrayFilters()) {
-            if (!first) {
-                builder << ", ";
-            }
-            first = false;
-            builder << arrayFilter;
-        }
-        builder << "]";
+        builder << " stmtIds: ";
+        appendArrayToString(getStmtIds(), &builder);
+
+        builder << " arrayFilters: ";
+        appendArrayToString(getArrayFilters(), &builder);
 
         if (getUpdateConstants()) {
             builder << " updateConstants: " << *getUpdateConstants();
         }
 
-        if (_runtimeConstants) {
-            builder << " runtimeConstants: " << _runtimeConstants->toBSON().toString();
+        if (_legacyRuntimeConstants) {
+            builder << " runtimeConstants: " << _legacyRuntimeConstants->toBSON().toString();
         }
 
         if (_letParameters) {
@@ -279,7 +294,8 @@ public:
         builder << " god: " << _god;
         builder << " upsert: " << isUpsert();
         builder << " multi: " << isMulti();
-        builder << " fromMigration: " << _fromMigration;
+        builder << " fromMigration: " << isFromMigration();
+        builder << " timeseries: " << isTimeseries();
         builder << " fromOplogApplication: " << _fromOplogApplication;
         builder << " isExplain: " << static_cast<bool>(_explain);
         return builder.str();
@@ -297,14 +313,14 @@ private:
     BSONObj _sort;
 
     // System-defined constant values which may be required by the query or update operation.
-    boost::optional<RuntimeConstants> _runtimeConstants;
+    boost::optional<LegacyRuntimeConstants> _legacyRuntimeConstants;
 
     // User-defined constant values to be used with a pipeline-style update. These can be specified
     // by the user for each individual element of the 'updates' array in the 'update' command.
     boost::optional<BSONObj> _letParameters;
 
-    // The statement id of this request.
-    StmtId _stmtId = kUninitializedStmtId;
+    // The statement ids of this request.
+    std::vector<StmtId> _stmtIds = {kUninitializedStmtId};
 
     // Flags controlling the update.
 
@@ -312,8 +328,8 @@ private:
     // updates, never user updates.
     bool _god = false;
 
-    // True if this update is on behalf of a chunk migration.
-    bool _fromMigration = false;
+    // See Source declaration
+    OperationSource _source = OperationSource::kStandard;
 
     // True if this update was triggered by the application of an oplog entry.
     bool _fromOplogApplication = false;

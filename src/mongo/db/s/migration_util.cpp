@@ -583,15 +583,18 @@ void persistRangeDeletionTaskLocally(OperationContext* opCtx,
     }
 }
 
-void persistCommitDecision(OperationContext* opCtx, const UUID& migrationId) {
+void persistCommitDecision(OperationContext* opCtx,
+                           const MigrationCoordinatorDocument& migrationDoc) {
+    invariant(migrationDoc.getDecision() &&
+              *migrationDoc.getDecision() == DecisionEnum::kCommitted);
+
     hangInPersistMigrateCommitDecisionInterruptible.pauseWhileSet(opCtx);
 
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
-    store.update(
-        opCtx,
-        QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationId),
-        BSON("$set" << BSON(MigrationCoordinatorDocument::kDecisionFieldName << "committed")));
+    store.upsert(opCtx,
+                 QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
+                 migrationDoc.toBSON());
 
     if (hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible.shouldFail()) {
         hangInPersistMigrateCommitDecisionThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
@@ -600,31 +603,29 @@ void persistCommitDecision(OperationContext* opCtx, const UUID& migrationId) {
     }
 }
 
-void persistAbortDecision(OperationContext* opCtx, const UUID& migrationId) {
-    retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
-        opCtx, "persist migrate abort decision", [&](OperationContext* newOpCtx) {
-            hangInPersistMigrateAbortDecisionInterruptible.pauseWhileSet(newOpCtx);
+void persistAbortDecision(OperationContext* opCtx,
+                          const MigrationCoordinatorDocument& migrationDoc) {
+    invariant(migrationDoc.getDecision() && *migrationDoc.getDecision() == DecisionEnum::kAborted);
 
-            PersistentTaskStore<MigrationCoordinatorDocument> store(
-                NamespaceString::kMigrationCoordinatorsNamespace);
-            store.update(newOpCtx,
-                         QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationId),
-                         BSON("$set" << BSON(MigrationCoordinatorDocument::kDecisionFieldName
-                                             << "aborted")));
+    hangInPersistMigrateAbortDecisionInterruptible.pauseWhileSet(opCtx);
 
-            if (hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.shouldFail()) {
-                hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.pauseWhileSet(
-                    newOpCtx);
-                uasserted(ErrorCodes::InternalError,
-                          "simulate an error response when persisting migrate abort decision");
-            }
-        });
+    PersistentTaskStore<MigrationCoordinatorDocument> store(
+        NamespaceString::kMigrationCoordinatorsNamespace);
+    store.upsert(opCtx,
+                 QUERY(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
+                 migrationDoc.toBSON());
+
+    if (hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.shouldFail()) {
+        hangInPersistMigrateAbortDecisionThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
+        uasserted(ErrorCodes::InternalError,
+                  "simulate an error response when persisting migrate abort decision");
+    }
 }
 
 void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                         const ShardId& recipientId,
                                         const UUID& migrationId) {
-    write_ops::Delete deleteOp(NamespaceString::kRangeDeletionNamespace);
+    write_ops::DeleteCommandRequest deleteOp(NamespaceString::kRangeDeletionNamespace);
     write_ops::DeleteOpEntry query(BSON(RangeDeletionTask::kIdFieldName << migrationId),
                                    false /*multi*/);
     deleteOp.setDeletes({query});
@@ -646,26 +647,21 @@ void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
 void deleteRangeDeletionTaskLocally(OperationContext* opCtx,
                                     const UUID& deletionTaskId,
                                     const WriteConcernOptions& writeConcern) {
-    retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
-        opCtx, "cancel local range deletion", [&](OperationContext* newOpCtx) {
-            hangInDeleteRangeDeletionLocallyInterruptible.pauseWhileSet(newOpCtx);
-            PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-            store.remove(
-                newOpCtx, QUERY(RangeDeletionTask::kIdFieldName << deletionTaskId), writeConcern);
+    hangInDeleteRangeDeletionLocallyInterruptible.pauseWhileSet(opCtx);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    store.remove(opCtx, QUERY(RangeDeletionTask::kIdFieldName << deletionTaskId), writeConcern);
 
-            if (hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible.shouldFail()) {
-                hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible.pauseWhileSet(
-                    newOpCtx);
-                uasserted(ErrorCodes::InternalError,
-                          "simulate an error response when deleting range deletion locally");
-            }
-        });
+    if (hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible.shouldFail()) {
+        hangInDeleteRangeDeletionLocallyThenSimulateErrorUninterruptible.pauseWhileSet(opCtx);
+        uasserted(ErrorCodes::InternalError,
+                  "simulate an error response when deleting range deletion locally");
+    }
 }
 
 void markAsReadyRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                              const ShardId& recipientId,
                                              const UUID& migrationId) {
-    write_ops::Update updateOp(NamespaceString::kRangeDeletionNamespace);
+    write_ops::UpdateCommandRequest updateOp(NamespaceString::kRangeDeletionNamespace);
     auto queryFilter = BSON(RangeDeletionTask::kIdFieldName << migrationId);
     auto updateModification =
         write_ops::UpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(
@@ -707,7 +703,7 @@ void advanceTransactionOnRecipient(OperationContext* opCtx,
                                    const ShardId& recipientId,
                                    const LogicalSessionId& lsid,
                                    TxnNumber currentTxnNumber) {
-    write_ops::Update updateOp(NamespaceString::kServerConfigurationNamespace);
+    write_ops::UpdateCommandRequest updateOp(NamespaceString::kServerConfigurationNamespace);
     auto queryFilter = BSON("_id"
                             << "migrationCoordinatorStats");
     auto updateModification = write_ops::UpdateModification(
@@ -891,9 +887,6 @@ void recoverMigrationCoordinations(OperationContext* opCtx, NamespaceString nss)
 
             if (doc.getDecision()) {
                 // The decision is already known.
-                coordinator.setMigrationDecision((*doc.getDecision()) == DecisionEnum::kCommitted
-                                                     ? MigrationCoordinator::Decision::kCommitted
-                                                     : MigrationCoordinator::Decision::kAborted);
                 coordinator.completeMigration(opCtx);
                 return true;
             }
@@ -957,9 +950,9 @@ void recoverMigrationCoordinations(OperationContext* opCtx, NamespaceString nss)
             }
 
             if (currentMetadata.keyBelongsToMe(doc.getRange().getMin())) {
-                coordinator.setMigrationDecision(MigrationCoordinator::Decision::kAborted);
+                coordinator.setMigrationDecision(DecisionEnum::kAborted);
             } else {
-                coordinator.setMigrationDecision(MigrationCoordinator::Decision::kCommitted);
+                coordinator.setMigrationDecision(DecisionEnum::kCommitted);
             }
 
             coordinator.completeMigration(opCtx);

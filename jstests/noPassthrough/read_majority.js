@@ -11,7 +11,9 @@
  *
  * All of this requires support for committed reads, so this test will be skipped if the storage
  * engine does not support them.
- * @tags: [requires_majority_read_concern]
+ * @tags: [
+ *   requires_majority_read_concern,
+ * ]
  */
 
 load("jstests/libs/analyze_plan.js");
@@ -75,7 +77,7 @@ function testReadConcernLevel(level) {
 
     function getExplainPlan(query) {
         var res = db.runCommand({explain: {find: t.getName(), filter: query}});
-        return assert.commandWorked(res).queryPlanner.winningPlan;
+        return getWinningPlan(assert.commandWorked(res).queryPlanner);
     }
 
     //

@@ -31,29 +31,15 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
-#include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
+#include "mongo/db/s/resharding/resharding_critical_section.h"
+#include "mongo/db/s/resharding/resharding_data_replication.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 
-class ReshardingCollectionCloner;
-
-namespace resharding {
-
-/**
- * Creates the temporary resharding collection locally by loading the collection options and
- * collection indexes from the original collection's primary and MinKey owning chunk shards,
- * respectively.
- */
-void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
-                                                const NamespaceString& originalNss,
-                                                const UUID& reshardingUUID,
-                                                const UUID& existingUUID,
-                                                Timestamp fetchTimestamp);
-
-}  // namespace resharding
-
-class ReshardingRecipientService final : public repl::PrimaryOnlyService {
+class ReshardingRecipientService : public repl::PrimaryOnlyService {
 public:
     static constexpr StringData kServiceName = "ReshardingRecipientService"_sd;
 
@@ -62,6 +48,8 @@ public:
     ~ReshardingRecipientService() = default;
 
     class RecipientStateMachine;
+
+    class RecipientStateMachineExternalState;
 
     StringData getServiceName() const override {
         return kServiceName;
@@ -76,8 +64,7 @@ public:
         return ThreadPool::Limits();
     }
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        BSONObj initialState) const override;
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
 };
 
 /**
@@ -87,12 +74,35 @@ public:
 class ReshardingRecipientService::RecipientStateMachine final
     : public repl::PrimaryOnlyService::TypedInstance<RecipientStateMachine> {
 public:
-    explicit RecipientStateMachine(const BSONObj& recipientDoc);
+    struct CloneDetails {
+        Timestamp cloneTimestamp;
+        int64_t approxDocumentsToCopy;
+        int64_t approxBytesToCopy;
+        std::vector<DonorShardFetchTimestamp> donorShards;
+
+        auto lens() const {
+            return std::tie(cloneTimestamp, approxDocumentsToCopy, approxBytesToCopy);
+        }
+
+        friend bool operator==(const CloneDetails& a, const CloneDetails& b) {
+            return a.lens() == b.lens();
+        }
+
+        friend bool operator!=(const CloneDetails& a, const CloneDetails& b) {
+            return a.lens() != b.lens();
+        }
+    };
+
+    explicit RecipientStateMachine(
+        const ReshardingRecipientService* recipientService,
+        const ReshardingRecipientDocument& recipientDoc,
+        std::unique_ptr<RecipientStateMachineExternalState> externalState,
+        ReshardingDataReplicationFactory dataReplicationFactory);
 
     ~RecipientStateMachine();
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancelationToken& token) noexcept override;
+                         const CancellationToken& token) noexcept override;
 
     void interrupt(Status status) override;
 
@@ -104,71 +114,126 @@ public:
         return _completionPromise.getFuture();
     }
 
-    /**
-     * TODO(SERVER-51021) Report ReshardingRecipientService Instances in currentOp().
-     */
     boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept final {
-        return boost::none;
-    }
+        MongoProcessInterface::CurrentOpConnectionsMode,
+        MongoProcessInterface::CurrentOpSessionsMode) noexcept override;
 
-    void onReshardingFieldsChanges(
-        boost::optional<TypeCollectionReshardingFields> reshardingFields);
+    void onReshardingFieldsChanges(OperationContext* opCtx,
+                                   const TypeCollectionReshardingFields& reshardingFields);
+
+    static void insertStateDocument(OperationContext* opCtx,
+                                    const ReshardingRecipientDocument& recipientDoc);
 
 private:
     // The following functions correspond to the actions to take at a particular recipient state.
-    void _transitionToCreatingTemporaryReshardingCollection();
+    ExecutorFuture<void> _awaitAllDonorsPreparedToDonateThenTransitionToCreatingCollection(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
     ExecutorFuture<void> _cloneThenTransitionToApplying(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
+
+    ExecutorFuture<void> _applyThenTransitionToSteadyState(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
+
+    ExecutorFuture<void> _awaitAllDonorsBlockingWritesThenTransitionToStrictConsistency(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
+
+    ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    void _applyThenTransitionToSteadyState();
+    void _renameTemporaryReshardingCollection();
 
-    ExecutorFuture<void> _awaitAllDonorsMirroringThenTransitionToStrictConsistency(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+    // Transitions the on-disk and in-memory state to 'newState'.
+    void _transitionState(RecipientStateEnum newState);
 
-    ExecutorFuture<void> _awaitCoordinatorHasCommittedThenTransitionToRenaming(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+    void _transitionState(RecipientShardContext&& newRecipientCtx,
+                          boost::optional<CloneDetails>&& cloneDetails);
 
-    void _renameTemporaryReshardingCollectionThenDeleteLocalState();
+    // Transitions the on-disk and in-memory state to RecipientStateEnum::kCreatingCollection.
+    void _transitionToCreatingCollection(CloneDetails cloneDetails);
 
-    void _fulfillAllDonorsPreparedToDonate(Timestamp);
+    // Transitions the on-disk and in-memory state to RecipientStateEnum::kError.
+    void _transitionToError(Status abortReason);
 
-    // Transitions the state on-disk and in-memory to 'endState'.
-    void _transitionState(RecipientStateEnum endState,
-                          boost::optional<Timestamp> fetchTimestamp = boost::none);
+    BSONObj _makeQueryForCoordinatorUpdate(const ShardId& shardId, RecipientStateEnum newState);
 
-    void _transitionStateAndUpdateCoordinator(RecipientStateEnum endState);
+    ExecutorFuture<void> _updateCoordinator(
+        OperationContext* opCtx, const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    // Transitions the state on-disk and in-memory to kError.
-    void _transitionStateToError(const Status& status);
+    // Updates the mutable portion of the on-disk and in-memory recipient document with
+    // 'newRecipientCtx', 'fetchTimestamp and 'donorShards'.
+    void _updateRecipientDocument(RecipientShardContext&& newRecipientCtx,
+                                  boost::optional<CloneDetails>&& cloneDetails);
 
-    // Inserts 'doc' on-disk and sets '_replacementDoc' in-memory.
-    void _insertRecipientDocument(const ReshardingRecipientDocument& doc);
+    // Removes the local recipient document from disk.
+    void _removeRecipientDocument();
 
-    // Updates the recipient document on-disk and in-memory with the 'replacementDoc.'
-    void _updateRecipientDocument(ReshardingRecipientDocument&& replacementDoc);
+    std::unique_ptr<ReshardingDataReplicationInterface> _makeDataReplication(
+        OperationContext* opCtx, bool cloningDone);
 
-    // The in-memory representation of the underlying document in
+    void _ensureDataReplicationStarted(
+        OperationContext* opCtx,
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
+
+    ReshardingMetrics* _metrics() const;
+
+    // Does work necessary for both recoverable errors (failover/stepdown) and unrecoverable errors
+    // (abort resharding).
+    void _onAbortOrStepdown(WithLock, Status status);
+
+    // Initializes the _abortSource and generates a token from it to return back the caller.
+    //
+    // Should only be called once per lifetime.
+    CancellationToken _initAbortSource(const CancellationToken& stepdownToken);
+
+    const ReshardingRecipientService* const _recipientService;
+
+    // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.recipient.
-    ReshardingRecipientDocument _recipientDoc;
+    const CommonReshardingMetadata _metadata;
+    const Milliseconds _minimumOperationDuration;
 
-    // The id both for the resharding operation and for the primary-only-service instance.
-    const UUID _id;
+    // The in-memory representation of the mutable portion of the document in
+    // config.localReshardingOperations.recipient.
+    RecipientShardContext _recipientCtx;
+    std::vector<DonorShardFetchTimestamp> _donorShards;
+    boost::optional<Timestamp> _cloneTimestamp;
 
-    std::unique_ptr<ReshardingCollectionCloner> _collectionCloner;
+    const std::unique_ptr<RecipientStateMachineExternalState> _externalState;
 
-    // Protects the promises below
-    Mutex _mutex = MONGO_MAKE_LATCH("ReshardingRecipient::_mutex");
+    // ThreadPool used by CancelableOperationContext.
+    // CancelableOperationContext must have a thread that is always available to it to mark its
+    // opCtx as killed when the cancelToken has been cancelled.
+    const std::shared_ptr<ThreadPool> _markKilledExecutor;
+    boost::optional<CancelableOperationContextFactory> _cancelableOpCtxFactory;
+
+    const ReshardingDataReplicationFactory _dataReplicationFactory;
+    SharedSemiFuture<void> _dataReplicationQuiesced;
+
+    // Protects the state below
+    Mutex _mutex = MONGO_MAKE_LATCH("RecipientStateMachine::_mutex");
+
+    std::unique_ptr<ReshardingDataReplicationInterface> _dataReplication;
+
+    // Canceled when there is an unrecoverable error or stepdown.
+    boost::optional<CancellationSource> _abortSource;
+
+    // Contains the status with which the operation was aborted.
+    boost::optional<Status> _abortStatus;
+
+    boost::optional<ReshardingCriticalSection> _critSec;
 
     // Each promise below corresponds to a state on the recipient state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.
-    SharedPromise<void> _allDonorsMirroring;
+    SharedPromise<CloneDetails> _allDonorsPreparedToDonate;
 
-    SharedPromise<void> _coordinatorHasCommitted;
+    SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;
 };

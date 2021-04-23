@@ -82,11 +82,15 @@ value::SlotAccessor* BSONScanStage::getAccessor(CompileCtx& ctx, value::SlotId s
 }
 
 void BSONScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _bsonCurrent = _bsonBegin;
 }
 
 PlanState BSONScanStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (_bsonCurrent < _bsonEnd) {
         if (_recordAccessor) {
             _recordAccessor->reset(value::TypeTags::bsonObject,
@@ -94,8 +98,10 @@ PlanState BSONScanStage::getNext() {
         }
 
         if (auto fieldsToMatch = _fieldAccessors.size(); fieldsToMatch != 0) {
-            auto be = _bsonCurrent + 4;
-            auto end = _bsonCurrent + value::readFromMemory<uint32_t>(_bsonCurrent);
+            auto be = _bsonCurrent;
+            auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
+            // Skip document length.
+            be += 4;
             for (auto& [name, accessor] : _fieldAccessors) {
                 accessor->reset();
             }
@@ -118,17 +124,18 @@ PlanState BSONScanStage::getNext() {
         }
 
         // Advance to the next document.
-        _bsonCurrent += value::readFromMemory<uint32_t>(_bsonCurrent);
+        _bsonCurrent += ConstDataView(_bsonCurrent).read<LittleEndian<uint32_t>>();
 
         _specificStats.numReads++;
         return trackPlanState(PlanState::ADVANCED);
     }
 
-    _commonStats.isEOF = true;
     return trackPlanState(PlanState::IS_EOF);
 }
 
 void BSONScanStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 }
 
@@ -139,7 +146,7 @@ std::unique_ptr<PlanStageStats> BSONScanStage::getStats(bool includeDebugInfo) c
     if (includeDebugInfo) {
         BSONObjBuilder bob;
         if (_recordSlot) {
-            bob.appendIntOrLL("recordSlot", *_recordSlot);
+            bob.appendNumber("recordSlot", static_cast<long long>(*_recordSlot));
         }
         bob.append("field", _fields);
         bob.append("outputSlots", _vars);

@@ -45,7 +45,7 @@
 #include "mongo/db/repl/oplog_interface_mock.h"
 #include "mongo/db/repl/rollback_impl.h"
 #include "mongo/db/repl/rollback_test_fixture.h"
-#include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
@@ -57,10 +57,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
+namespace mongo {
+namespace repl {
 namespace {
-
-using namespace mongo;
-using namespace mongo::repl;
 
 NamespaceString kOplogNSS("local.oplog.rs");
 NamespaceString nss("test.coll");
@@ -165,6 +164,8 @@ protected:
         // Create a new collection in the storage interface.
         CollectionOptions options;
         options.uuid = uuid;
+        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+            opCtx);
         ASSERT_OK(_storageInterface->createCollection(opCtx, nss, options));
 
         // Initialize a mock collection.
@@ -1433,24 +1434,24 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
     insertOp2Obj = insertOp2Obj.removeField("wall");
 
     auto partialApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp2Obj) << "partialTxn" << true);
-    OplogEntry partialApplyOpsOplogEntry(partialApplyOpsOpTime,      // opTime
-                                         1LL,                        // hash
-                                         OpTypeEnum::kCommand,       // opType
-                                         adminCmdNss,                // nss
-                                         boost::none,                // uuid
-                                         boost::none,                // fromMigrate
-                                         OplogEntry::kOplogVersion,  // version
-                                         partialApplyOpsObj,         // oField
-                                         boost::none,                // o2Field
-                                         sessionInfo,                // sessionInfo
-                                         boost::none,                // isUpsert
-                                         Date_t(),                   // wallClockTime
-                                         boost::none,                // statementId
-                                         OpTime(),                   // prevWriteOpTimeInTransaction
-                                         boost::none,                // preImageOpTime
-                                         boost::none,                // postImageOpTime
-                                         boost::none,   // ShardId of resharding recipient
-                                         boost::none);  // _id
+    DurableOplogEntry partialApplyOpsOplogEntry(partialApplyOpsOpTime,      // opTime
+                                                1LL,                        // hash
+                                                OpTypeEnum::kCommand,       // opType
+                                                adminCmdNss,                // nss
+                                                boost::none,                // uuid
+                                                boost::none,                // fromMigrate
+                                                OplogEntry::kOplogVersion,  // version
+                                                partialApplyOpsObj,         // oField
+                                                boost::none,                // o2Field
+                                                sessionInfo,                // sessionInfo
+                                                boost::none,                // isUpsert
+                                                Date_t(),                   // wallClockTime
+                                                {},                         // statementIds
+                                                OpTime(),      // prevWriteOpTimeInTransaction
+                                                boost::none,   // preImageOpTime
+                                                boost::none,   // postImageOpTime
+                                                boost::none,   // ShardId of resharding recipient
+                                                boost::none);  // _id
     ASSERT_OK(_insertOplogEntry(partialApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(partialApplyOpsOplogEntry.toBSON(), insertOp2.second));
 
@@ -1466,24 +1467,25 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
     insertOp3Obj = insertOp3Obj.removeField("wall");
 
     auto commitApplyOpsObj = BSON("applyOps" << BSON_ARRAY(insertOp3Obj) << "count" << 1);
-    OplogEntry commitApplyOpsOplogEntry(commitApplyOpsOpTime,       // opTime
-                                        1LL,                        // hash
-                                        OpTypeEnum::kCommand,       // opType
-                                        adminCmdNss,                // nss
-                                        boost::none,                // uuid
-                                        boost::none,                // fromMigrate
-                                        OplogEntry::kOplogVersion,  // version
-                                        commitApplyOpsObj,          // oField
-                                        boost::none,                // o2Field
-                                        sessionInfo,                // sessionInfo
-                                        boost::none,                // isUpsert
-                                        Date_t(),                   // wallClockTime
-                                        boost::none,                // statementId
-                                        partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
-                                        boost::none,                // preImageOpTime
-                                        boost::none,                // postImageOpTime
-                                        boost::none,   // ShardId of resharding recipient
-                                        boost::none);  // _id
+    DurableOplogEntry commitApplyOpsOplogEntry(
+        commitApplyOpsOpTime,       // opTime
+        1LL,                        // hash
+        OpTypeEnum::kCommand,       // opType
+        adminCmdNss,                // nss
+        boost::none,                // uuid
+        boost::none,                // fromMigrate
+        OplogEntry::kOplogVersion,  // version
+        commitApplyOpsObj,          // oField
+        boost::none,                // o2Field
+        sessionInfo,                // sessionInfo
+        boost::none,                // isUpsert
+        Date_t(),                   // wallClockTime
+        {},                         // statementIds
+        partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
+        boost::none,                // preImageOpTime
+        boost::none,                // postImageOpTime
+        boost::none,                // ShardId of resharding recipient
+        boost::none);               // _id
     ASSERT_OK(_insertOplogEntry(commitApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(commitApplyOpsOplogEntry.toBSON(), insertOp3.second));
 
@@ -1581,7 +1583,6 @@ public:
                                        << bson.jsonString(JsonStringFormat::LegacyStrict)
                                        << " in namespace with uuid " << uuid.toString();
     }
-
 
 protected:
     OpObserver::RollbackObserverInfo _rbInfo;
@@ -2069,4 +2070,7 @@ TEST_F(RollbackImplObserverInfoTest, RollbackRecordsMultipleUpdateOpsForSameName
     assertRollbackInfoContainsObjectForUUID(uuid, obj1);
     assertRollbackInfoContainsObjectForUUID(uuid, obj2);
 }
+
 }  // namespace
+}  // namespace repl
+}  // namespace mongo

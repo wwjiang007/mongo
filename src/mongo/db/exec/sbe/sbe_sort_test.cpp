@@ -29,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <string_view>
 
 #include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
 #include "mongo/db/exec/sbe/stages/sort.h"
@@ -59,7 +58,6 @@ TEST_F(SortStageTest, SortNumbersTest) {
                              std::numeric_limits<std::size_t>::max(),
                              204857600,
                              false,
-                             nullptr,
                              kEmptyPlanNodeId);
 
         return std::make_pair(scanSlots, std::move(sortStage));

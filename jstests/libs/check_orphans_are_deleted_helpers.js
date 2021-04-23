@@ -24,7 +24,8 @@ var CheckOrphansAreDeletedHelpers = (function() {
             5 * 60 * 1000,
             1000);
 
-        mongosConn.getDB('config').collections.find({dropped: false}).forEach(collDoc => {
+        // TODO SERVER-51881: Remove the checking for 'dropped: {$ne: true}' after 5.0 is released
+        mongosConn.getDB('config').collections.find({dropped: {$ne: true}}).forEach(collDoc => {
             const ns = collDoc._id;
             const tempNsArray = ns.split('.');
             const dbName = tempNsArray.shift();
@@ -66,20 +67,17 @@ var CheckOrphansAreDeletedHelpers = (function() {
                 });
 
             const coll = shardConn.getDB(dbName)[collName];
-            mongosConn.getDB('config')
-                .chunks.find({ns: ns, shard: {$ne: shardId}})
-                .forEach(chunkDoc => {
-                    // Use $min/$max so this will also work with hashed and compound shard keys.
-                    const orphans = coll.find({})
-                                        .hint(collDoc.key)
-                                        .min(chunkDoc.min)
-                                        .max(chunkDoc.max)
-                                        .toArray();
-                    assert.eq(0,
-                              orphans.length,
-                              'found orphans @ ' + shardId + ' within chunk: ' + tojson(chunkDoc) +
-                                  ', orphans: ' + tojson(orphans));
-                });
+            const chunksQuery = (collDoc.timestamp) ? {uuid: collDoc.uuid, shard: {$ne: shardId}}
+                                                    : {ns: ns, shard: {$ne: shardId}};
+            mongosConn.getDB('config').chunks.find(chunksQuery).forEach(chunkDoc => {
+                // Use $min/$max so this will also work with hashed and compound shard keys.
+                const orphans =
+                    coll.find({}).hint(collDoc.key).min(chunkDoc.min).max(chunkDoc.max).toArray();
+                assert.eq(0,
+                          orphans.length,
+                          'found orphans @ ' + shardId + ' within chunk: ' + tojson(chunkDoc) +
+                              ', orphans: ' + tojson(orphans));
+            });
         });
     }
 

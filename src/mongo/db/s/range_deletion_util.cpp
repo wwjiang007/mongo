@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingRangeDeleter
 
 #include "mongo/platform/basic.h"
 
@@ -56,13 +56,13 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future_util.h"
 
 namespace mongo {
@@ -188,7 +188,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
                                                      min,
                                                      max,
                                                      BoundInclusion::kIncludeStartKeyOnly,
-                                                     PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
+                                                     PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                                      InternalPlanner::FORWARD);
 
     if (MONGO_unlikely(hangBeforeDoingDeletion.shouldFail())) {
@@ -302,6 +302,14 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
                                           Milliseconds delayBetweenBatches) {
     return AsyncTry([=] {
                return withTemporaryOperationContext([=](OperationContext* opCtx) {
+                   LOGV2_DEBUG(5346200,
+                               1,
+                               "Starting batch deletion",
+                               "namespace"_attr = nss,
+                               "range"_attr = redact(range.toString()),
+                               "numDocsToRemovePerBatch"_attr = numDocsToRemovePerBatch,
+                               "delayBetweenBatches"_attr = delayBetweenBatches);
+
                    if (migrationId) {
                        ensureRangeDeletionTaskStillExists(opCtx, *migrationId);
                    }
@@ -324,7 +332,7 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
 
                    LOGV2_DEBUG(
                        23769,
-                       2,
+                       1,
                        "Deleted {numDeleted} documents in pass in namespace {namespace} with "
                        "UUID  {collectionUUID} for range {range}",
                        "Deleted documents in pass",
@@ -348,7 +356,7 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
                 ErrorCodes::isNotPrimaryError(swNumDeleted.getStatus());
         })
         .withDelayBetweenIterations(delayBetweenBatches)
-        .on(executor)
+        .on(executor, CancellationToken::uncancelable())
         .ignoreValue();
 }
 
@@ -388,23 +396,83 @@ ExecutorFuture<void> waitForDeletionsToMajorityReplicate(
         repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         auto clientOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
 
-        LOGV2_DEBUG(23771,
-                    2,
-                    "Waiting for majority replication of local deletions in namespace {namespace} "
-                    "with UUID  {collectionUUID} for range {range}",
+        LOGV2_DEBUG(5346202,
+                    1,
                     "Waiting for majority replication of local deletions",
                     "namespace"_attr = nss.ns(),
                     "collectionUUID"_attr = collectionUuid,
-                    "range"_attr = redact(range.toString()));
+                    "range"_attr = redact(range.toString()),
+                    "clientOpTime"_attr = clientOpTime);
 
         // Asynchronously wait for majority write concern.
         return WaitForMajorityService::get(opCtx->getServiceContext())
-            .waitUntilMajority(clientOpTime)
+            .waitUntilMajority(clientOpTime, CancellationToken::uncancelable())
             .thenRunOn(executor);
     });
 }
 
+std::vector<RangeDeletionTask> getPersistentRangeDeletionTasks(OperationContext* opCtx,
+                                                               const NamespaceString& nss) {
+    std::vector<RangeDeletionTask> tasks;
+
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    auto query = QUERY(RangeDeletionTask::kNssFieldName << nss.ns());
+
+    store.forEach(opCtx, query, [&](const RangeDeletionTask& deletionTask) {
+        tasks.push_back(std::move(deletionTask));
+        return true;
+    });
+
+    return tasks;
+}
+
 }  // namespace
+
+void snapshotRangeDeletionsForRename(OperationContext* opCtx,
+                                     const NamespaceString& fromNss,
+                                     const NamespaceString& toNss) {
+    auto rangeDeletionTasks = getPersistentRangeDeletionTasks(opCtx, fromNss);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionForRenameNamespace);
+    for (auto& task : rangeDeletionTasks) {
+        task.setNss(toNss);  // Associate task to the new namespace
+        store.add(opCtx, task);
+    }
+}
+
+void restoreRangeDeletionTasksForRename(OperationContext* opCtx, const NamespaceString& nss) {
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsForRenameStore(
+        NamespaceString::kRangeDeletionForRenameNamespace);
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsStore(
+        NamespaceString::kRangeDeletionNamespace);
+
+    const auto query = QUERY(RangeDeletionTask::kNssFieldName << nss.ns());
+
+    // Remove eventual leftovers from a previously uncompleted restore
+    rangeDeletionsStore.remove(opCtx, query);
+
+    rangeDeletionsForRenameStore.forEach(opCtx, query, [&](const RangeDeletionTask& deletionTask) {
+        auto task = deletionTask;
+        task.setId(UUID::gen());  // Assign a new id to prevent duplicate key errors
+        rangeDeletionsStore.add(opCtx, task);
+        return true;
+    });
+}
+
+void deleteRangeDeletionTasksForRename(OperationContext* opCtx,
+                                       const NamespaceString& fromNss,
+                                       const NamespaceString& toNss) {
+    // Delete range deletion tasks associated to the source collection
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsStore(
+        NamespaceString::kRangeDeletionNamespace);
+    rangeDeletionsStore.remove(opCtx, QUERY(RangeDeletionTask::kNssFieldName << fromNss.ns()));
+
+    // Delete already restored snapshots associated to the target collection
+    PersistentTaskStore<RangeDeletionTask> rangeDeletionsForRenameStore(
+        NamespaceString::kRangeDeletionForRenameNamespace);
+    rangeDeletionsForRenameStore.remove(opCtx,
+                                        QUERY(RangeDeletionTask::kNssFieldName << toNss.ns()));
+}
+
 
 SharedSemiFuture<void> removeDocumentsInRange(
     const std::shared_ptr<executor::TaskExecutor>& executor,
@@ -432,7 +500,7 @@ SharedSemiFuture<void> removeDocumentsInRange(
         })
         .then([=]() mutable {
             LOGV2_DEBUG(23772,
-                        2,
+                        1,
                         "Beginning deletion of any documents in {namespace} range {range} with  "
                         "numDocsToRemovePerBatch {numDocsToRemovePerBatch}",
                         "Beginning deletion of documents",
@@ -463,6 +531,11 @@ SharedSemiFuture<void> removeDocumentsInRange(
                     // visible to the caller at non-local read concerns.
                     return waitForDeletionsToMajorityReplicate(executor, nss, collectionUuid, range)
                         .then([=] {
+                            LOGV2_DEBUG(5346201,
+                                        1,
+                                        "Finished waiting for majority for deleted batch",
+                                        "namespace"_attr = nss,
+                                        "range"_attr = redact(range.toString()));
                             // Propagate any errors to the onCompletion() handler below.
                             return s;
                         });
@@ -471,7 +544,7 @@ SharedSemiFuture<void> removeDocumentsInRange(
         .onCompletion([=](Status s) {
             if (s.isOK()) {
                 LOGV2_DEBUG(23773,
-                            2,
+                            1,
                             "Completed deletion of documents in {namespace} range {range}",
                             "Completed deletion of documents",
                             "namespace"_attr = nss.ns(),
@@ -500,13 +573,13 @@ SharedSemiFuture<void> removeDocumentsInRange(
             try {
                 removePersistentRangeDeletionTask(nss, std::move(*migrationId));
             } catch (const DBException& e) {
-                LOGV2(23770,
-                      "Failed to delete range deletion task for range {range} in collection "
-                      "{namespace} due to {error}",
-                      "Failed to delete range deletion task",
-                      "range"_attr = range,
-                      "namespace"_attr = nss,
-                      "error"_attr = e.what());
+                LOGV2_ERROR(23770,
+                            "Failed to delete range deletion task for range {range} in collection "
+                            "{namespace} due to {error}",
+                            "Failed to delete range deletion task",
+                            "range"_attr = range,
+                            "namespace"_attr = nss,
+                            "error"_attr = e.what());
 
                 return e.toStatus();
             }

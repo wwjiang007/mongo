@@ -539,15 +539,21 @@ public:
 
     /**
      * Like registerChange() above but should only be used to make new state visible in the
-     * in-memory catalog. Changes registered with this function will commit after the commit changes
-     * registered with registerChange and rollback will run before the rollback changes registered
-     * with registerChange.
+     * in-memory catalog. Only one change of this kind may be registered at a given time to ensure
+     * catalog updates are atomic. Change registered with this function will commit after the commit
+     * changes registered with registerChange and rollback will run before the rollback changes
+     * registered with registerChange.
      *
      * This separation ensures that regular Changes that can modify state are run before the Change
      * to install the new state in the in-memory catalog, after which there should be no further
      * changes.
      */
     void registerChangeForCatalogVisibility(std::unique_ptr<Change> change);
+
+    /**
+     * Returns true if a change has been registered with registerChangeForCatalogVisibility() above.
+     */
+    bool hasRegisteredChangeForCatalogVisibility();
 
     /**
      * Registers a callback to be called if the current WriteUnitOfWork rolls back.
@@ -641,7 +647,7 @@ public:
         kCommitting,
     };
 
-    std::string toString(State state) const {
+    static std::string toString(State state) {
         switch (state) {
             case State::kInactive:
                 return "Inactive";
@@ -657,6 +663,13 @@ public:
                 return "Aborting";
         }
         MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Exposed for debugging purposes.
+     */
+    State getState() {
+        return _getState();
     }
 
     void setMustBeTimestamped() {
@@ -744,7 +757,7 @@ private:
 
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
-    Changes _changesForCatalogVisibility;
+    std::unique_ptr<Change> _changeForCatalogVisibility;
     State _state = State::kInactive;
     uint64_t _mySnapshotId;
 };

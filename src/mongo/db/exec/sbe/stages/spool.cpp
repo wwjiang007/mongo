@@ -74,6 +74,8 @@ value::SlotAccessor* SpoolEagerProducerStage::getAccessor(CompileCtx& ctx, value
 }
 
 void SpoolEagerProducerStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _children[0]->open(reOpen);
 
@@ -98,6 +100,8 @@ void SpoolEagerProducerStage::open(bool reOpen) {
 }
 
 PlanState SpoolEagerProducerStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (_bufferIt == _buffer->size()) {
         _bufferIt = 0;
     } else {
@@ -112,7 +116,10 @@ PlanState SpoolEagerProducerStage::getNext() {
 }
 
 void SpoolEagerProducerStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
     _commonStats.closes++;
+
+    _buffer->clear();
 }
 
 std::unique_ptr<PlanStageStats> SpoolEagerProducerStage::getStats(bool includeDebugInfo) const {
@@ -120,7 +127,7 @@ std::unique_ptr<PlanStageStats> SpoolEagerProducerStage::getStats(bool includeDe
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendIntOrLL("spoolId", _spoolId);
+        bob.appendNumber("spoolId", static_cast<long long>(_spoolId));
         bob.append("outputSlots", _vals);
         ret->debugInfo = bob.obj();
     }
@@ -208,6 +215,8 @@ value::SlotAccessor* SpoolLazyProducerStage::getAccessor(CompileCtx& ctx, value:
 }
 
 void SpoolLazyProducerStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _children[0]->open(reOpen);
 
@@ -217,6 +226,8 @@ void SpoolLazyProducerStage::open(bool reOpen) {
 }
 
 PlanState SpoolLazyProducerStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     auto state = _children[0]->getNext();
 
     if (state == PlanState::ADVANCED) {
@@ -253,7 +264,11 @@ PlanState SpoolLazyProducerStage::getNext() {
 }
 
 void SpoolLazyProducerStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
     _commonStats.closes++;
+
+    _buffer->clear();
+    _children[0]->close();
 }
 
 std::unique_ptr<PlanStageStats> SpoolLazyProducerStage::getStats(bool includeDebugInfo) const {
@@ -261,7 +276,7 @@ std::unique_ptr<PlanStageStats> SpoolLazyProducerStage::getStats(bool includeDeb
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendIntOrLL("spoolId", _spoolId);
+        bob.appendNumber("spoolId", static_cast<long long>(_spoolId));
         bob.append("outputSlots", _vals);
         if (_predicate) {
             bob.append("filter", DebugPrinter{}.print(_predicate->debugPrint()));

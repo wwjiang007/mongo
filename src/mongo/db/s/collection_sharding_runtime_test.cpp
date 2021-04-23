@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -51,21 +52,25 @@ protected:
                                                   UUID uuid = UUID::gen()) {
         const OID epoch = OID::gen();
         auto range = ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY));
-        auto chunk =
-            ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
-        ChunkManager cm(
-            ShardId("0"),
-            DatabaseVersion(UUID::gen()),
-            makeStandaloneRoutingTableHistory(RoutingTableHistory::makeNew(kTestNss,
-                                                                           uuid,
-                                                                           kShardKeyPattern,
-                                                                           nullptr,
-                                                                           false,
-                                                                           epoch,
-                                                                           boost::none,
-                                                                           true,
-                                                                           {std::move(chunk)})),
-            boost::none);
+        auto chunk = ChunkType(kTestNss,
+                               std::move(range),
+                               ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
+                               ShardId("other"));
+        ChunkManager cm(ShardId("0"),
+                        DatabaseVersion(UUID::gen()),
+                        makeStandaloneRoutingTableHistory(
+                            RoutingTableHistory::makeNew(kTestNss,
+                                                         uuid,
+                                                         kShardKeyPattern,
+                                                         nullptr,
+                                                         false,
+                                                         epoch,
+                                                         boost::none /* timestamp */,
+                                                         boost::none /* timeseriesFields */,
+                                                         boost::none,
+                                                         true,
+                                                         {std::move(chunk)})),
+                        boost::none);
 
         if (!OperationShardingState::isOperationVersioned(opCtx)) {
             const auto version = cm.getVersion(ShardId("0"));
@@ -184,8 +189,8 @@ TEST_F(CollectionShardingRuntimeTest,
 class CollectionShardingRuntimeWithRangeDeleterTest : public CollectionShardingRuntimeTest {
 public:
     void setUp() override {
-        ShardServerTestFixture::setUp();
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+        CollectionShardingRuntimeTest::setUp();
+        WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
         // Set up replication coordinator to be primary and have no replication delay.
         auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext());
         replCoord->setCanAcceptNonLocalWrites(true);
@@ -197,8 +202,13 @@ public:
         });
         repl::ReplicationCoordinator::set(getServiceContext(), std::move(replCoord));
 
-        DBDirectClient client(operationContext());
-        client.createCollection(kTestNss.ns());
+        {
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(operationContext());
+            uassertStatusOK(createCollection(
+                operationContext(), kTestNss.db().toString(), BSON("create" << kTestNss.coll())));
+        }
+
         AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
         _uuid = autoColl.getCollection()->uuid();
     }
@@ -208,7 +218,7 @@ public:
         client.dropCollection(kTestNss.ns());
 
         WaitForMajorityService::get(getServiceContext()).shutDown();
-        ShardServerTestFixture::tearDown();
+        CollectionShardingRuntimeTest::tearDown();
     }
 
     CollectionShardingRuntime& csr() {
@@ -224,7 +234,6 @@ public:
 private:
     UUID _uuid{UUID::gen()};
 };
-
 
 TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
        WaitForCleanReturnsErrorIfMetadataManagerDoesNotExist) {
@@ -336,5 +345,4 @@ TEST_F(CollectionShardingRuntimeWithRangeDeleterTest,
 }
 
 }  // namespace
-
 }  // namespace mongo

@@ -13,6 +13,7 @@
 "use strict";
 
 load('./jstests/multiVersion/libs/multi_cluster.js');  // for upgradeCluster()
+load("jstests/sharding/libs/find_chunks_util.js");
 
 // testDroppedAndDistributionModeFields: it checks two things after upgrading from versions
 // prior 4.9:
@@ -20,36 +21,38 @@ load('./jstests/multiVersion/libs/multi_cluster.js');  // for upgradeCluster()
 // - Entries on config.collections doesn't have the 'distributionMode' and the 'dropped' fields
 //
 // This test must be removed once 5.0 is defined as the lastLTS (SERVER-52630)
-function testDroppedAndDistributionModeFieldsSetup() {
-    let csrs_config_db = st.configRS.getPrimary().getDB('config');
+function testDroppedAndDistributionModeFieldsSetup(oldVersion) {
+    let configDB = st.s.getDB('config');
     // Setup sharded collections
     assert.commandWorked(st.s.adminCommand({shardCollection: 'sharded.foo', key: {x: 1}}));
     assert.commandWorked(st.s.adminCommand({shardCollection: 'sharded.bar', key: {x: 1}}));
 
-    {
-        var collFoo = csrs_config_db.collections.findOne({_id: 'sharded.foo'});
+    if (oldVersion == lastLTSFCV) {
+        var collFoo = configDB.collections.findOne({_id: 'sharded.foo'});
         assert.eq('sharded', collFoo.distributionMode);
         assert.eq(false, collFoo.dropped);
 
-        var collBar = csrs_config_db.collections.findOne({_id: 'sharded.bar'});
+        var collBar = configDB.collections.findOne({_id: 'sharded.bar'});
         assert.eq('sharded', collBar.distributionMode);
         assert.eq(false, collBar.dropped);
     }
 
-    // Drop a collection so that it's metadata is left over on the config server's
+    // Drop a collection so that in a 4.4 binary, its metadata is left over on the config server's
     // config.collections as 'dropped: true'
     st.s.getDB('sharded').foo.drop();
-    assert.eq(true, csrs_config_db.collections.findOne({_id: 'sharded.foo'}).dropped);
-    assert.neq(null, csrs_config_db.collections.findOne({_id: 'sharded.bar'}));
+    if (oldVersion == lastLTSFCV) {
+        assert.eq(true, configDB.collections.findOne({_id: 'sharded.foo'}).dropped);
+        assert.neq(null, configDB.collections.findOne({_id: 'sharded.bar'}));
+    }
 }
 
 function testDroppedAndDistributionModeFieldsChecksAfterUpgrade() {
-    let csrs_config_db = st.configRS.getPrimary().getDB('config');
+    let configDB = st.s.getDB('config');
 
     // Check that the left over metadata at csrs config.collections has been cleaned up.
-    assert.eq(null, csrs_config_db.collections.findOne({_id: 'sharded.foo'}));
+    assert.eq(null, configDB.collections.findOne({_id: 'sharded.foo'}));
 
-    var collBar = csrs_config_db.collections.findOne({_id: 'sharded.bar'});
+    var collBar = configDB.collections.findOne({_id: 'sharded.bar'});
     assert.eq(undefined, collBar.distributionMode);
     assert.eq(undefined, collBar.dropped);
 }
@@ -58,131 +61,219 @@ function testDroppedAndDistributionModeFieldsChecksAfterUpgrade() {
 // config.cache.collections entries is removed when downgrading to prior 4.9
 //
 // This test must be removed once 5.0 is defined as the lastLTS (SERVER-52632)
+
+function checkAllowMigrationsOnConfigAndShardMetadata(expectedResult) {
+    const ns = "sharded.test2";
+    assert.eq(
+        expectedResult,
+        st.configRS.getPrimary().getDB("config").collections.findOne({_id: ns}).allowMigrations);
+    assert.eq(
+        expectedResult,
+        st.rs0.getPrimary().getDB("config").cache.collections.findOne({_id: ns}).allowMigrations);
+    assert.eq(
+        expectedResult,
+        st.rs1.getPrimary().getDB("config").cache.collections.findOne({_id: ns}).allowMigrations);
+}
+
 function testAllowedMigrationsFieldSetup() {
+    const ns = "sharded.test2";
     assert.commandWorked(st.s.getDB("sharded").getCollection("test2").insert({_id: 0}));
     assert.commandWorked(st.s.getDB("sharded").getCollection("test2").insert({_id: 1}));
 
-    assert.commandWorked(st.s.adminCommand({shardCollection: 'sharded.test2', key: {_id: 1}}));
+    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
+
+    assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {_id: 0}, to: st.rs1.getURL()}));
+    assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {_id: 1}, to: st.rs0.getURL()}));
+
+    // If allowMigrations is true, it means that the allowMigration field is not defined in
+    // config.collections neither on config.cache.collections
+    assert.commandWorked(st.configRS.getPrimary().adminCommand(
+        {_configsvrSetAllowMigrations: ns, allowMigrations: true, writeConcern: {w: "majority"}}));
 
     assert.commandWorked(
-        st.s.adminCommand({moveChunk: 'sharded.test2', find: {_id: 0}, to: st.rs1.getURL()}));
+        st.shard0.adminCommand({_flushRoutingTableCacheUpdates: ns, syncFromConfig: true}));
     assert.commandWorked(
-        st.s.adminCommand({moveChunk: 'sharded.test2', find: {_id: 1}, to: st.rs0.getURL()}));
+        st.shard1.adminCommand({_flushRoutingTableCacheUpdates: ns, syncFromConfig: true}));
 
-    let updateResult = st.rs0.getPrimary().getDB("config").cache.collections.updateOne(
-        {_id: 'sharded.test2'}, {$set: {allowMigrations: false}});
-    assert.eq(1, updateResult.modifiedCount);
-
-    updateResult = st.rs1.getPrimary().getDB("config").cache.collections.updateOne(
-        {_id: 'sharded.test2'}, {$set: {allowMigrations: false}});
-    assert.eq(1, updateResult.modifiedCount);
+    checkAllowMigrationsOnConfigAndShardMetadata(undefined);
 }
 
 function testAllowedMigrationsFieldChecksAfterFCVDowngrade() {
-    assert.eq(undefined,
-              st.rs0.getPrimary()
-                  .getDB("config")
-                  .cache.collections.findOne({_id: 'sharded.test2'})
-                  .allowMigrations);
-    assert.eq(undefined,
-              st.rs1.getPrimary()
-                  .getDB("config")
-                  .cache.collections.findOne({_id: 'sharded.test2'})
-                  .allowMigrations);
+    checkAllowMigrationsOnConfigAndShardMetadata(undefined);
 }
 
 // testTimestampField: Check that on FCV upgrade to 5.0, a 'timestamp' is created for the existing
-// collections in config.collections and config.cache.collections On downgrade, check that the
-// 'timestamp' field is removed from config.collections and config.cache.collections.
-
+// collections in config.databases, config.cache.databases, config.collections and
+// config.cache.collections. On downgrade, check that the 'timestamp' field is removed.
+//
 // This test must be removed once 5.0 is defined as the lastLTS.
 function testTimestampFieldSetup() {
-    assert.commandWorked(
-        st.s.adminCommand({shardCollection: 'sharded.test3_created_before_upgrade', key: {x: 1}}));
+    assert.commandWorked(st.s.adminCommand({shardCollection: 'sharded.test3', key: {x: 1}}));
+    assert.commandWorked(st.s.adminCommand({split: 'sharded.test3', middle: {x: 10}}));
+    assert.commandWorked(st.s.adminCommand({split: 'sharded.test3', middle: {x: -10}}));
 }
 
 function testTimestampFieldChecksAfterUpgrade() {
+    let configDB = st.s.getDB('config');
+
+    // Check that 'timestamp' has been created in configsvr config.databases
+    let dbTimestampInConfigSvr = configDB.databases.findOne({_id: 'sharded'}).version.timestamp;
+    assert.neq(null, dbTimestampInConfigSvr);
+
+    let primaryShard = st.getPrimaryShard('sharded');
+
+    // Check that 'timestamp' propagates to the shardsvr config.cache.databases
+    assert.eq(
+        dbTimestampInConfigSvr,
+        primaryShard.getDB('config').cache.databases.findOne({_id: 'sharded'}).version.timestamp);
+
     // Check that 'timestamp' has been created in configsvr config.collections
-    let csrs_config_db = st.configRS.getPrimary().getDB('config');
-    let timestampInConfigSvr =
-        csrs_config_db.collections.findOne({_id: 'sharded.test3_created_before_upgrade'}).timestamp;
-    assert.neq(null, timestampInConfigSvr);
+    let collTimestampInConfigSvr = configDB.collections.findOne({_id: 'sharded.test3'}).timestamp;
+    assert.neq(null, collTimestampInConfigSvr);
 
-    // TODO: After SERVER-52587, check that the timestamp in the shardsvr config.cache.collection
-    // exists and matches timestampInConfigSvr
-}
+    // Check that 'timestamp' has been propagated to config.cache.collections
+    assert.eq(
+        collTimestampInConfigSvr,
+        primaryShard.getDB('config').cache.collections.findOne({_id: 'sharded.test3'}).timestamp);
 
-function testTimestampFieldSetupBeforeDowngrade() {
-    assert.commandWorked(
-        st.s.adminCommand({shardCollection: 'sharded.test3_created_after_upgrade', key: {x: 1}}));
+    // Check that 'timestamp' has been created in config.chunks
+    var cursor = findChunksUtil.findChunksByNs(st.config, 'sharded.test3');
+    assert(cursor.hasNext());
+    do {
+        assert.eq(collTimestampInConfigSvr, cursor.next().lastmodTimestamp);
+    } while (cursor.hasNext());
 }
 
 function testTimestampFieldChecksAfterFCVDowngrade() {
+    let configDB = st.s.getDB('config');
+    let primaryShard = st.getPrimaryShard('sharded');
+
+    // Check that the 'timestamp' has been removed from config.databases
+    assert.eq(null, configDB.databases.findOne({_id: 'sharded'}).version.timestamp);
+
+    // Check that the 'timestamp' has been removed from config.cache.databases.
+    assert.eq(
+        null,
+        primaryShard.getDB('config').cache.databases.findOne({_id: 'sharded'}).version.timestamp);
+
     // Check that the 'timestamp' has been removed from config.collections.
-    let csrs_config_db = st.configRS.getPrimary().getDB('config');
-    let collAfterUpgrade =
-        csrs_config_db.collections.findOne({_id: 'sharded.test3_created_before_upgrade'});
+    let collAfterUpgrade = configDB.collections.findOne({_id: 'sharded.test3'});
     assert.eq(null, collAfterUpgrade.timestamp);
 
     // Check that the 'timestamp' has been removed from config.cache.collections.
-    let primaryShard = st.getPrimaryShard('sharded');
     let timestampInShard =
-        primaryShard.getDB('config')
-            .cache.collections.findOne({_id: 'sharded.test3_created_before_upgrade'})
-            .timestamp;
+        primaryShard.getDB('config').cache.collections.findOne({_id: 'sharded.test3'}).timestamp;
     assert.eq(null, timestampInShard);
 
-    // TODO: After SERVER-52587, this is no longer needed as we can just check with
-    // test3_created_before_upgrade.
-    timestampInShard = primaryShard.getDB('config')
-                           .cache.collections.findOne({_id: 'sharded.test3_created_after_upgrade'})
-                           .timestamp;
-    assert.eq(null, timestampInShard);
+    // Check that the 'timestamp' has been removed from config.chunks
+    var cursor = findChunksUtil.findChunksByNs(st.config, 'sharded.test3');
+    assert(cursor.hasNext());
+    do {
+        assert.eq(null, cursor.next().lastmodTimestamp);
+    } while (cursor.hasNext());
 }
 
-function setupInitialStateOnOldVersion() {
+// testChunkCollectionUuidField: ensures all config.chunks entries include a collection UUID after
+// upgrading from versions prior 4.9; and that it is deleted on downgrade.
+//
+// This test must be removed once 5.0 is defined as the lastLTS (SERVER-52630)
+function testChunkCollectionUuidFieldSetup() {
+    const ns = "sharded.test_chunk_uuid";
+
+    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
+    assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 10}}));
+    assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: -10}}));
+}
+
+function testChunkCollectionUuidFieldChecksAfterUpgrade() {
+    const ns = "sharded.test_chunk_uuid";
+
+    var collUUID = st.config.collections.findOne({_id: ns}).uuid;
+    var cursor = findChunksUtil.findChunksByNs(st.config, ns);
+    assert(cursor.hasNext());
+    do {
+        assert.eq(collUUID, cursor.next().uuid);
+    } while (cursor.hasNext());
+
+    // Check no chunk with ns is left after upgrade
+    assert.eq(0, st.config.chunks.count({ns: {$exists: true}}));
+}
+
+function testChunkCollectionUuidFieldChecksAfterFCVDowngrade() {
+    const ns = "sharded.test_chunk_uuid";
+
+    var cursor = findChunksUtil.findChunksByNs(st.config, ns);
+    assert(cursor.hasNext());
+    do {
+        assert.eq(undefined, cursor.next().uuid);
+    } while (cursor.hasNext());
+}
+
+function setupInitialStateOnOldVersion(oldVersion) {
     assert.commandWorked(st.s.adminCommand({enableSharding: 'sharded'}));
 
-    testDroppedAndDistributionModeFieldsSetup();
-    testAllowedMigrationsFieldSetup();
+    testDroppedAndDistributionModeFieldsSetup(oldVersion);
     testTimestampFieldSetup();
+    testChunkCollectionUuidFieldSetup();
+}
+
+function checkConfigAndShardsFCV(expectedFCV) {
+    var configFCV = st.configRS.getPrimary()
+                        .adminCommand({getParameter: 1, featureCompatibilityVersion: 1})
+                        .featureCompatibilityVersion.version;
+    assert.eq(expectedFCV, configFCV);
+
+    var shard0FCV = st.rs0.getPrimary()
+                        .adminCommand({getParameter: 1, featureCompatibilityVersion: 1})
+                        .featureCompatibilityVersion.version;
+    assert.eq(expectedFCV, shard0FCV);
+
+    var shard1FCV = st.rs1.getPrimary()
+                        .adminCommand({getParameter: 1, featureCompatibilityVersion: 1})
+                        .featureCompatibilityVersion.version;
+    assert.eq(expectedFCV, shard1FCV);
 }
 
 function runChecksAfterUpgrade() {
-    const shardingFullDDLSupport = assert
-                                       .commandWorked(st.configRS.getPrimary().adminCommand(
-                                           {getParameter: 1, shardingFullDDLSupport: 1}))
-                                       .shardingFullDDLSupport.value;
+    const isFeatureFlagEnabled =
+        assert
+            .commandWorked(st.configRS.getPrimary().adminCommand(
+                {getParameter: 1, featureFlagShardingFullDDLSupportTimestampedVersion: 1}))
+            .featureFlagShardingFullDDLSupportTimestampedVersion.value;
+
+    checkConfigAndShardsFCV(latestFCV);
 
     testDroppedAndDistributionModeFieldsChecksAfterUpgrade();
 
-    if (shardingFullDDLSupport) {
+    if (isFeatureFlagEnabled) {
         testTimestampFieldChecksAfterUpgrade();
+        testChunkCollectionUuidFieldChecksAfterUpgrade();
     } else {
         jsTest.log(
-            'Skipping testTimestampFieldChecksAfterUpgrade because shardingFullDDLSupport is not ' +
-            'enabled');
+            'Skipping tests that require featureFlagShardingFullDDLSupportTimestampedVersion feature to be enabled');
     }
 }
 
 function setupStateBeforeDowngrade() {
-    testTimestampFieldSetupBeforeDowngrade();
+    testAllowedMigrationsFieldSetup();
 }
 
-function runChecksAfterFCVDowngrade() {
-    const shardingFullDDLSupport = assert
-                                       .commandWorked(st.configRS.getPrimary().adminCommand(
-                                           {getParameter: 1, shardingFullDDLSupport: 1}))
-                                       .shardingFullDDLSupport.value;
+function runChecksAfterFCVDowngrade(oldVersion) {
+    const isFeatureFlagEnabled =
+        assert
+            .commandWorked(st.configRS.getPrimary().adminCommand(
+                {getParameter: 1, featureFlagShardingFullDDLSupportTimestampedVersion: 1}))
+            .featureFlagShardingFullDDLSupportTimestampedVersion.value;
 
-    testAllowedMigrationsFieldChecksAfterFCVDowngrade();
+    checkConfigAndShardsFCV(oldVersion);
 
-    if (shardingFullDDLSupport) {
+    if (isFeatureFlagEnabled) {
+        testAllowedMigrationsFieldChecksAfterFCVDowngrade();
         testTimestampFieldChecksAfterFCVDowngrade();
+        testChunkCollectionUuidFieldChecksAfterFCVDowngrade();
     } else {
         jsTest.log(
-            'Skipping testTimestampFieldChecksAfterFCVDowngrade because shardingFullDDLSupport ' +
-            'is not enabled');
+            'Skipping tests that require featureFlagShardingFullDDLSupportTimestampedVersion feature to be enabled');
     }
 }
 
@@ -203,14 +294,18 @@ for (let oldVersion of [lastLTSFCV, lastContinuousFCV]) {
         }
     });
 
+    jsTest.log('oldVersion: ' + oldVersion);
+
     st.configRS.awaitReplication();
 
     // Setup initial conditions
-    setupInitialStateOnOldVersion();
+    setupInitialStateOnOldVersion(oldVersion);
 
     // Upgrade the entire cluster to the latest version.
-    jsTest.log('upgrading cluster');
+    jsTest.log('upgrading cluster binaries');
     st.upgradeCluster(latestFCV);
+
+    jsTest.log('upgrading cluster FCV');
     assert.commandWorked(st.s.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
 
     // Tests after upgrade
@@ -224,7 +319,7 @@ for (let oldVersion of [lastLTSFCV, lastContinuousFCV]) {
     assert.commandWorked(st.s.adminCommand({setFeatureCompatibilityVersion: oldVersion}));
 
     // Tests after FCV downgrade to oldVersion
-    runChecksAfterFCVDowngrade();
+    runChecksAfterFCVDowngrade(oldVersion);
 
     // Downgrade binaries back to oldVersion
     jsTest.log('downgrading cluster binaries');

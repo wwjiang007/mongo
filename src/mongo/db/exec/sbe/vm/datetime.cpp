@@ -38,14 +38,24 @@ namespace mongo {
 namespace sbe {
 namespace vm {
 
+bool isValidTimezone(value::TypeTags timezoneTag,
+                     value::Value timezoneValue,
+                     const TimeZoneDatabase* timezoneDB) {
+    if (!value::isString(timezoneTag)) {
+        return false;
+    }
+    auto timezoneStringView = value::getStringView(timezoneTag, timezoneValue);
+    return timezoneStringView.empty() || timezoneDB->isTimeZoneIdentifier(timezoneStringView);
+}
+
 TimeZone getTimezone(value::TypeTags timezoneTag,
                      value::Value timezoneVal,
                      TimeZoneDatabase* timezoneDB) {
     auto timezoneStr = value::getStringView(timezoneTag, timezoneVal);
-    if (timezoneStr == "") {
+    if (timezoneStr.empty()) {
         return timezoneDB->utcZone();
     } else {
-        return timezoneDB->getTimeZone(StringData{timezoneStr.data(), timezoneStr.size()});
+        return timezoneDB->getTimeZone(timezoneStr);
     }
 }
 
@@ -71,6 +81,11 @@ Date_t getDate(value::TypeTags dateTag, value::Value dateVal) {
         default:
             MONGO_UNREACHABLE;
     }
+}
+
+bool coercibleToDate(value::TypeTags typeTag) {
+    return typeTag == value::TypeTags::Date || typeTag == value::TypeTags::Timestamp ||
+        typeTag == value::TypeTags::ObjectId || typeTag == value::TypeTags::bsonObjectId;
 }
 
 namespace {

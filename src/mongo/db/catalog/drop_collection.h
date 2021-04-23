@@ -27,10 +27,13 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include "mongo/base/status.h"
 
+#include "mongo/db/drop_gen.h"
+
 namespace mongo {
-class BSONObjBuilder;
 class NamespaceString;
 class OperationContext;
 
@@ -44,13 +47,13 @@ enum class DropCollectionSystemCollectionMode {
 };
 
 /**
- * Drops the collection "collectionName" and populates "result" with statistics about what
+ * Drops the collection "collectionName" and populates "reply" with statistics about what
  * was removed. Aborts in-progress index builds on the collection if two phase index builds are
  * supported.
  */
 Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& collectionName,
-                      BSONObjBuilder& result,
+                      DropReply* reply,
                       DropCollectionSystemCollectionMode systemCollectionMode);
 
 /**

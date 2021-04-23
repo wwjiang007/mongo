@@ -44,7 +44,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
@@ -79,13 +79,13 @@ BSONObj appendMaxTimeToCmdObj(Milliseconds maxTimeMSOverride, const BSONObj& cmd
 
     // Remove the user provided maxTimeMS so we can attach the one from the override
     for (const auto& elem : cmdObj) {
-        if (elem.fieldNameStringData() != QueryRequest::cmdOptionMaxTimeMS) {
+        if (elem.fieldNameStringData() != query_request_helper::cmdOptionMaxTimeMS) {
             updatedCmdBuilder.append(elem);
         }
     }
 
     if (maxTimeMSOverride < Milliseconds::max()) {
-        updatedCmdBuilder.append(QueryRequest::cmdOptionMaxTimeMS,
+        updatedCmdBuilder.append(query_request_helper::cmdOptionMaxTimeMS,
                                  durationCount<Milliseconds>(maxTimeMSOverride));
     }
 
@@ -113,6 +113,11 @@ bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) 
 
         case RetryPolicy::kIdempotent: {
             return isMongosRetriableError(code);
+        } break;
+
+        case RetryPolicy::kIdempotentOrCursorInvalidated: {
+            return isRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
+                ErrorCodes::isCursorInvalidatedError(code);
         } break;
 
         case RetryPolicy::kNotIdempotent: {
@@ -348,7 +353,8 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     const NamespaceString& nss,
     const BSONObj& query,
     const BSONObj& sort,
-    boost::optional<long long> limit) {
+    boost::optional<long long> limit,
+    const boost::optional<BSONObj>& hint) {
     invariant(isConfig());
     auto const grid = Grid::get(opCtx);
 
@@ -370,17 +376,21 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     BSONObjBuilder findCmdBuilder;
 
     {
-        QueryRequest qr(nss);
-        qr.setFilter(query);
-        qr.setSort(sort);
-        qr.setReadConcern(readConcernObj);
-        qr.setLimit(limit);
-
-        if (maxTimeMS < Milliseconds::max()) {
-            qr.setMaxTimeMS(durationCount<Milliseconds>(maxTimeMS));
+        FindCommandRequest findCommand(nss);
+        findCommand.setFilter(query.getOwned());
+        findCommand.setSort(sort.getOwned());
+        findCommand.setReadConcern(readConcernObj.getOwned());
+        findCommand.setLimit(limit ? static_cast<boost::optional<std::int64_t>>(*limit)
+                                   : boost::none);
+        if (hint) {
+            findCommand.setHint(*hint);
         }
 
-        qr.asFindCommand(&findCmdBuilder);
+        if (maxTimeMS < Milliseconds::max()) {
+            findCommand.setMaxTimeMS(durationCount<Milliseconds>(maxTimeMS));
+        }
+
+        findCommand.serialize(BSONObj(), &findCmdBuilder);
     }
 
     return _runExhaustiveCursorCommand(opCtx,
@@ -413,14 +423,15 @@ void ShardRemote::runFireAndForgetCommand(OperationContext* opCtx,
 
 Status ShardRemote::runAggregation(
     OperationContext* opCtx,
-    const AggregationRequest& aggRequest,
+    const AggregateCommandRequest& aggRequest,
     std::function<bool(const std::vector<BSONObj>& batch)> callback) {
 
     BSONObj readPrefMetadata;
 
     ReadPreferenceSetting readPreference =
         uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(
-            aggRequest.getUnwrappedReadPref(), ReadPreference::SecondaryPreferred));
+            aggRequest.getUnwrappedReadPref().value_or(BSONObj()),
+            ReadPreference::SecondaryPreferred));
 
     auto swHost = _targeter->findHost(opCtx, readPreference);
     if (!swHost.isOK()) {
@@ -455,8 +466,13 @@ Status ShardRemote::runAggregation(
             }
         }
 
-        if (!callback(data.documents)) {
-            *nextAction = Fetcher::NextAction::kNoAction;
+        try {
+            if (!callback(data.documents)) {
+                *nextAction = Fetcher::NextAction::kNoAction;
+            }
+        } catch (...) {
+            status = exceptionToStatus();
+            return;
         }
 
         status = Status::OK();
@@ -470,14 +486,14 @@ Status ShardRemote::runAggregation(
 
     Milliseconds requestTimeout(-1);
     if (aggRequest.getMaxTimeMS()) {
-        requestTimeout = Milliseconds(aggRequest.getMaxTimeMS());
+        requestTimeout = Milliseconds(aggRequest.getMaxTimeMS().value_or(0));
     }
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     Fetcher fetcher(executor.get(),
                     host,
-                    aggRequest.getNamespaceString().db().toString(),
-                    aggRequest.serializeToCommandObj().toBson(),
+                    aggRequest.getNamespace().db().toString(),
+                    aggregation_request_helper::serializeToCommandObj(aggRequest),
                     fetcherCallback,
                     readPrefMetadata,
                     requestTimeout, /* command network timeout */

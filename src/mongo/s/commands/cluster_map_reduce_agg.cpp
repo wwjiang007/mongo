@@ -57,7 +57,7 @@ namespace mongo {
 namespace {
 
 auto makeExpressionContext(OperationContext* opCtx,
-                           const MapReduce& parsedMr,
+                           const MapReduceCommandRequest& parsedMr,
                            const ChunkManager& cm,
                            boost::optional<ExplainOptions::Verbosity> verbosity) {
     // Populate the collection UUID and the appropriate collation to use.
@@ -109,26 +109,28 @@ auto makeExpressionContext(OperationContext* opCtx,
     return expCtx;
 }
 
-Document serializeToCommand(BSONObj originalCmd, const MapReduce& parsedMr, Pipeline* pipeline) {
+Document serializeToCommand(BSONObj originalCmd,
+                            const MapReduceCommandRequest& parsedMr,
+                            Pipeline* pipeline) {
     MutableDocument translatedCmd;
 
     translatedCmd["aggregate"] = Value(parsedMr.getNamespace().coll());
-    translatedCmd[AggregationRequest::kPipelineName] = Value(pipeline->serialize());
-    translatedCmd[AggregationRequest::kCursorName] =
+    translatedCmd[AggregateCommandRequest::kPipelineFieldName] = Value(pipeline->serialize());
+    translatedCmd[AggregateCommandRequest::kCursorFieldName] =
         Value(Document{{"batchSize", std::numeric_limits<long long>::max()}});
-    translatedCmd[AggregationRequest::kAllowDiskUseName] = Value(true);
-    translatedCmd[AggregationRequest::kFromMongosName] = Value(true);
-    translatedCmd[AggregationRequest::kRuntimeConstantsName] =
-        Value(pipeline->getContext()->getRuntimeConstants().toBSON());
-    translatedCmd[AggregationRequest::kIsMapReduceCommandName] = Value(true);
+    translatedCmd[AggregateCommandRequest::kAllowDiskUseFieldName] = Value(true);
+    translatedCmd[AggregateCommandRequest::kFromMongosFieldName] = Value(true);
+    translatedCmd[AggregateCommandRequest::kLetFieldName] = Value(
+        pipeline->getContext()->variablesParseState.serialize(pipeline->getContext()->variables));
+    translatedCmd[AggregateCommandRequest::kIsMapReduceCommandFieldName] = Value(true);
 
     if (shouldBypassDocumentValidationForCommand(originalCmd)) {
         translatedCmd[bypassDocumentValidationCommandOption()] = Value(true);
     }
 
-    if (originalCmd[AggregationRequest::kCollationName]) {
-        translatedCmd[AggregationRequest::kCollationName] =
-            Value(originalCmd[AggregationRequest::kCollationName]);
+    if (originalCmd[AggregateCommandRequest::kCollationFieldName]) {
+        translatedCmd[AggregateCommandRequest::kCollationFieldName] =
+            Value(originalCmd[AggregateCommandRequest::kCollationFieldName]);
     }
 
     // Append generic command options.
@@ -144,7 +146,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                              const BSONObj& cmd,
                              BSONObjBuilder& result,
                              boost::optional<ExplainOptions::Verbosity> verbosity) {
-    auto parsedMr = MapReduce::parse(IDLParserErrorContext("MapReduce"), cmd);
+    auto parsedMr = MapReduceCommandRequest::parse(IDLParserErrorContext("mapReduce"), cmd);
     stdx::unordered_set<NamespaceString> involvedNamespaces{parsedMr.getNamespace()};
     auto hasOutDB = parsedMr.getOutOptions().getDatabaseName();
     auto resolvedOutNss = NamespaceString{hasOutDB ? *hasOutDB : parsedMr.getNamespace().db(),
@@ -208,6 +210,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
             case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
                 if (verbosity) {
                     explain_common::generateServerInfo(&result);
+                    explain_common::generateServerParameters(&result);
                 }
                 auto serialized = serializeToCommand(cmd, parsedMr, targeter.pipeline.get());
                 // When running explain, we don't explicitly pass the specified verbosity here

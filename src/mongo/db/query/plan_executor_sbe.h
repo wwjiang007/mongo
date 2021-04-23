@@ -46,6 +46,7 @@ public:
                     std::unique_ptr<CanonicalQuery> cq,
                     sbe::CandidatePlans candidates,
                     const CollectionPtr& collection,
+                    bool returnOwnedBson,
                     NamespaceString nss,
                     bool isOpen,
                     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
@@ -72,7 +73,7 @@ public:
     ExecState getNextDocument(Document* objOut, RecordId* dlOut) override;
 
     bool isEOF() override {
-        return _state == State::kClosed;
+        return isMarkedAsKilled() || (_stash.empty() && _root->getCommonStats()->isEOF);
     }
 
     long long executeCount() override {
@@ -110,14 +111,19 @@ public:
     }
 
     bool isDisposed() const override {
-        return !_root;
+        return _isDisposed;
     }
 
     Timestamp getLatestOplogTimestamp() const override;
     BSONObj getPostBatchResumeToken() const override;
 
+    /**
+     * Even though the leaves of '_root' will acquire AutoGet objects, the caller must acquire a top
+     * level AutoGet object outside of this PlanExecutor in order to open a storage transaction and
+     * establish a consistent view of the catalog.
+     */
     LockPolicy lockPolicy() const override {
-        return LockPolicy::kLocksInternally;
+        return LockPolicy::kLockExternally;
     }
 
     const PlanExplainer& getPlanExplainer() const final {
@@ -133,19 +139,20 @@ private:
     OperationContext* _opCtx;
 
     NamespaceString _nss;
+    const bool _mustReturnOwnedBson;
 
     // CompileCtx owns the instance pointed by _env, so we must keep it around.
-    sbe::RuntimeEnvironment* _env{nullptr};
-    sbe::CompileCtx _ctx;
-    std::unique_ptr<sbe::PlanStage> _root;
+    const std::unique_ptr<sbe::PlanStage> _root;
+    stage_builder::PlanStageData _rootData;
     std::unique_ptr<QuerySolution> _solution;
 
     sbe::value::SlotAccessor* _result{nullptr};
     sbe::value::SlotAccessor* _resultRecordId{nullptr};
+    sbe::value::TypeTags _tagLastRecordId{sbe::value::TypeTags::Nothing};
+    sbe::value::Value _valLastRecordId{0};
+
     sbe::value::SlotAccessor* _oplogTs{nullptr};
     boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
-    bool _shouldTrackLatestOplogTimestamp{false};
-    bool _shouldTrackResumeToken{false};
 
     std::queue<std::pair<BSONObj, boost::optional<RecordId>>> _stash;
 
@@ -158,6 +165,8 @@ private:
     std::unique_ptr<PlanYieldPolicySBE> _yieldPolicy;
 
     std::unique_ptr<PlanExplainer> _planExplainer;
+
+    bool _isDisposed{false};
 };
 
 /**
@@ -172,5 +181,6 @@ sbe::PlanState fetchNext(sbe::PlanStage* root,
                          sbe::value::SlotAccessor* resultSlot,
                          sbe::value::SlotAccessor* recordIdSlot,
                          BSONObj* out,
-                         RecordId* dlOut);
+                         RecordId* dlOut,
+                         bool returnOwnedBson);
 }  // namespace mongo

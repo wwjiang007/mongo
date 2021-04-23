@@ -1,6 +1,7 @@
 /build
 /src/mongo/db/modules
 /.jsdbshell
+/.cache
 /.dbshell
 /*.ninja
 /*.ninja.*
@@ -39,6 +40,7 @@
 *.*sdf
 *.psess
 *.tmp
+*.eslintcache
 *#
 .#*
 
@@ -55,6 +57,10 @@
 /src/third_party/*/*.cache
 /src/third_party/*/*.tlog
 /src/third_party/*/*.lastbuildstate
+/buildscripts/libdeps/graph_visualizer_web_stack/build
+/buildscripts/libdeps/graph_visualizer_web_stack/node_modules
+package-lock.json
+libdeps.graphml
 config.log
 settings.py
 log_config.py
@@ -195,3 +201,11 @@ resmoke.ini
 
 # UndoDB Recordings
 *.undo
+
+# Resmoke runtime trackers
+.resmoke_start_time.yml
+
+# libfuzzer artifacts
+default.profraw
+/corpora
+/corpora-merged

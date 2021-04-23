@@ -31,44 +31,54 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
 
 #include <algorithm>
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/server_options.h"
 
 namespace mongo {
 
 using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace {
-void populateOptionsMap(std::map<StringData, BSONElement>& theMap, const BSONObj& spec) {
+std::map<StringData, BSONElement> populateOptionsMapForEqualityCheck(const BSONObj& spec) {
+    std::map<StringData, BSONElement> optionsMap;
+
+    // These index options are not considered for equality.
+    static const StringDataSet kIndexOptionsNotConsideredForEqualityCheck{
+        IndexDescriptor::kKeyPatternFieldName,         // checked specially
+        IndexDescriptor::kNamespaceFieldName,          // removed in 4.4
+        IndexDescriptor::kIndexNameFieldName,          // checked separately
+        IndexDescriptor::kIndexVersionFieldName,       // not considered for equivalence
+        IndexDescriptor::kTextVersionFieldName,        // same as index version
+        IndexDescriptor::k2dsphereVersionFieldName,    // same as index version
+        IndexDescriptor::kBackgroundFieldName,         // this is a creation time option only
+        IndexDescriptor::kDropDuplicatesFieldName,     // this is now ignored
+        IndexDescriptor::kHiddenFieldName,             // not considered for equivalence
+        IndexDescriptor::kCollationFieldName,          // checked specially
+        IndexDescriptor::kPartialFilterExprFieldName,  // checked specially
+        IndexDescriptor::kUniqueFieldName,             // checked specially
+        IndexDescriptor::kSparseFieldName,             // checked specially
+        IndexDescriptor::kPathProjectionFieldName,     // checked specially
+    };
+
     BSONObjIterator it(spec);
     while (it.more()) {
         const BSONElement e = it.next();
 
         StringData fieldName = e.fieldNameStringData();
-        if (fieldName == IndexDescriptor::kKeyPatternFieldName ||  // checked specially
-            fieldName == IndexDescriptor::kNamespaceFieldName ||   // removed in 4.4
-            fieldName == IndexDescriptor::kIndexNameFieldName ||   // checked separately
-            fieldName ==
-                IndexDescriptor::kIndexVersionFieldName ||  // not considered for equivalence
-            fieldName == IndexDescriptor::kTextVersionFieldName ||      // same as index version
-            fieldName == IndexDescriptor::k2dsphereVersionFieldName ||  // same as index version
-            fieldName ==
-                IndexDescriptor::kBackgroundFieldName ||  // this is a creation time option only
-            fieldName == IndexDescriptor::kDropDuplicatesFieldName ||  // this is now ignored
-            fieldName == IndexDescriptor::kHiddenFieldName ||     // not considered for equivalence
-            fieldName == IndexDescriptor::kCollationFieldName ||  // checked specially
-            fieldName == IndexDescriptor::kPartialFilterExprFieldName  // checked specially
-        ) {
-            continue;
+        if (kIndexOptionsNotConsideredForEqualityCheck.count(fieldName) == 0) {
+            optionsMap[fieldName] = e;
         }
-        theMap[fieldName] = e;
     }
+
+    return optionsMap;
 }
 }  // namespace
 
@@ -135,34 +145,56 @@ bool IndexDescriptor::isIndexVersionSupported(IndexVersion indexVersion) {
     return false;
 }
 
-std::set<IndexVersion> IndexDescriptor::getSupportedIndexVersions() {
-    return {IndexVersion::kV1, IndexVersion::kV2};
-}
-
-Status IndexDescriptor::isIndexVersionAllowedForCreation(
-    IndexVersion indexVersion,
-    const ServerGlobalParams::FeatureCompatibility& featureCompatibility,
-    const BSONObj& indexSpec) {
-    switch (indexVersion) {
-        case IndexVersion::kV1:
-        case IndexVersion::kV2:
-            return Status::OK();
-    }
-    return {ErrorCodes::CannotCreateIndex,
-            str::stream() << "Invalid index specification " << indexSpec
-                          << "; cannot create an index with v=" << static_cast<int>(indexVersion)};
-}
-
 IndexVersion IndexDescriptor::getDefaultIndexVersion() {
     return IndexVersion::kV2;
 }
 
 IndexDescriptor::Comparison IndexDescriptor::compareIndexOptions(
-    OperationContext* opCtx, const NamespaceString& ns, const IndexCatalogEntry* other) const {
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    const IndexCatalogEntry* existingIndex) const {
+    // The compareIndexOptions method can only be reliably called on a candidate index which is
+    // being compared against an index that already exists in the catalog.
+    tassert(4765900, "This object must be a candidate index", !getEntry());
+
+    auto existingIndexDesc = existingIndex->descriptor();
+
     // We first check whether the key pattern is identical for both indexes.
     if (SimpleBSONObjComparator::kInstance.evaluate(keyPattern() !=
-                                                    other->descriptor()->keyPattern())) {
+                                                    existingIndexDesc->keyPattern())) {
         return Comparison::kDifferent;
+    }
+
+    auto fcv = serverGlobalParams.featureCompatibility.getVersion();
+    auto isFcvAtLeast50 = fcv >= ServerGlobalParams::FeatureCompatibility::Version::kVersion50;
+
+    // TODO SERVER-47766: remove this FCV check when 5.0 becomes last-lts.
+    if (isFcvAtLeast50) {
+        // The 'wildcardProjection' field is a part of index signature if FCV has been set to 5.0+.
+        // Compare 'wildcardProjection' in each index descriptor. Ignore field order when comparing.
+        // The candidate index descriptor's _projection has already been normalized upstream. The
+        // existing index's _normalizedProjection is populated when its associated IndexCatalogEntry
+        // is created.
+        static const UnorderedFieldsBSONObjComparator kUnorderedBSONCmp;
+        if (kUnorderedBSONCmp.evaluate(_projection != existingIndexDesc->_normalizedProjection)) {
+            return Comparison::kDifferent;
+        }
+    }
+
+    auto isFcvAtLeast49 =
+        isFcvAtLeast50 || fcv >= ServerGlobalParams::FeatureCompatibility::Version::kVersion49;
+
+    // TODO SERVER-47766: remove these FCV checks when 5.0 becomes last-lts.
+    if (isFcvAtLeast49) {
+        // The 'unique' field is a part of index signature if FCV has been set to 4.9+.
+        if (unique() != existingIndexDesc->unique()) {
+            return Comparison::kDifferent;
+        }
+
+        // The 'sparse' field is a part of index signature if FCV has been set to 4.9+.
+        if (isSparse() != existingIndexDesc->isSparse()) {
+            return Comparison::kDifferent;
+        }
     }
 
     // Check whether both indexes have the same collation. If not, then they are not equivalent.
@@ -170,18 +202,18 @@ IndexDescriptor::Comparison IndexDescriptor::compareIndexOptions(
         ? nullptr
         : uassertStatusOK(
               CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation()));
-    if (!CollatorInterface::collatorsMatch(collator.get(), other->getCollator())) {
+    if (!CollatorInterface::collatorsMatch(collator.get(), existingIndex->getCollator())) {
         return Comparison::kDifferent;
     }
 
     // The partialFilterExpression is only part of the index signature if FCV has been set to 4.7+.
     // TODO SERVER-47766: remove these FCV checks when 5.0 becomes last-lts.
-    auto isFCVAtLeast47 = serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-        ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
+    auto isFCVAtLeast47 =
+        isFcvAtLeast49 || fcv >= ServerGlobalParams::FeatureCompatibility::Version::kVersion47;
 
-    // If we have a partial filter expression and the other index doesn't, or vice-versa, then the
+    // If we have a partialFilterExpression and the existingIndex doesn't, or vice-versa, then the
     // two indexes are not equivalent. We therefore return Comparison::kDifferent immediately.
-    if (isFCVAtLeast47 && isPartial() != other->descriptor()->isPartial()) {
+    if (isFCVAtLeast47 && isPartial() != existingIndexDesc->isPartial()) {
         return Comparison::kDifferent;
     }
     // Compare 'partialFilterExpression' in each descriptor to see if they are equivalent. We use
@@ -190,10 +222,10 @@ IndexDescriptor::Comparison IndexDescriptor::compareIndexOptions(
     // For instance, under a case-sensitive collation, the predicates {a: "blah"} and {a: "BLAH"}
     // would match the same set of documents, but these are not currently considered equivalent.
     // TODO SERVER-47664: take collation into account while comparing string predicates.
-    if (isFCVAtLeast47 && other->getFilterExpression()) {
+    if (isFCVAtLeast47 && existingIndex->getFilterExpression()) {
         auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), ns);
         auto filter = MatchExpressionParser::parseAndNormalize(partialFilterExpression(), expCtx);
-        if (!filter->equivalent(other->getFilterExpression())) {
+        if (!filter->equivalent(existingIndex->getFilterExpression())) {
             return Comparison::kDifferent;
         }
     }
@@ -202,26 +234,48 @@ IndexDescriptor::Comparison IndexDescriptor::compareIndexOptions(
     // an index, and so the return value will be at least Comparison::kEquivalent. We now proceed to
     // compare the rest of the options to see if we should return Comparison::kIdentical instead.
 
-    std::map<StringData, BSONElement> existingOptionsMap;
-    populateOptionsMap(existingOptionsMap, infoObj());
+    auto thisOptionsMap = populateOptionsMapForEqualityCheck(infoObj());
+    auto existingIndexOptionsMap = populateOptionsMapForEqualityCheck(existingIndexDesc->infoObj());
 
-    std::map<StringData, BSONElement> newOptionsMap;
-    populateOptionsMap(newOptionsMap, other->descriptor()->infoObj());
+    // If the FCV has not been upgraded to 5.0+, add wildcardProjection to the options map. They do
+    // not contribute to the index signature, but can determine whether or not the candidate index
+    // is identical to the existing index.
+    if (!isFcvAtLeast50) {
+        thisOptionsMap[IndexDescriptor::kPathProjectionFieldName] =
+            infoObj()[IndexDescriptor::kPathProjectionFieldName];
+        existingIndexOptionsMap[IndexDescriptor::kPathProjectionFieldName] =
+            existingIndexDesc->infoObj()[IndexDescriptor::kPathProjectionFieldName];
+    }
+
+    // If the FCV has not been upgraded to 4.9+, add unique/sparse to the options map. They do not
+    // contribute to the index signature, but can determine whether or not the candidate index is
+    // identical to the existing index.
+    if (!isFcvAtLeast49) {
+        thisOptionsMap[IndexDescriptor::kUniqueFieldName] =
+            infoObj()[IndexDescriptor::kUniqueFieldName];
+        existingIndexOptionsMap[IndexDescriptor::kUniqueFieldName] =
+            existingIndexDesc->infoObj()[IndexDescriptor::kUniqueFieldName];
+
+        thisOptionsMap[IndexDescriptor::kSparseFieldName] =
+            infoObj()[IndexDescriptor::kSparseFieldName];
+        existingIndexOptionsMap[IndexDescriptor::kSparseFieldName] =
+            existingIndexDesc->infoObj()[IndexDescriptor::kSparseFieldName];
+    }
 
     // If the FCV has not been upgraded to 4.7+, add partialFilterExpression to the options map. It
     // does not contribute to the index signature, but can determine whether or not the candidate
     // index is identical to the existing index.
     if (!isFCVAtLeast47) {
-        existingOptionsMap[IndexDescriptor::kPartialFilterExprFieldName] =
-            other->descriptor()->infoObj()[IndexDescriptor::kPartialFilterExprFieldName];
-        newOptionsMap[IndexDescriptor::kPartialFilterExprFieldName] =
+        thisOptionsMap[IndexDescriptor::kPartialFilterExprFieldName] =
             infoObj()[IndexDescriptor::kPartialFilterExprFieldName];
+        existingIndexOptionsMap[IndexDescriptor::kPartialFilterExprFieldName] =
+            existingIndexDesc->infoObj()[IndexDescriptor::kPartialFilterExprFieldName];
     }
 
-    const bool optsIdentical = existingOptionsMap.size() == newOptionsMap.size() &&
-        std::equal(existingOptionsMap.begin(),
-                   existingOptionsMap.end(),
-                   newOptionsMap.begin(),
+    const bool optsIdentical = thisOptionsMap.size() == existingIndexOptionsMap.size() &&
+        std::equal(thisOptionsMap.begin(),
+                   thisOptionsMap.end(),
+                   existingIndexOptionsMap.begin(),
                    [](const std::pair<StringData, BSONElement>& lhs,
                       const std::pair<StringData, BSONElement>& rhs) {
                        return lhs.first == rhs.first &&

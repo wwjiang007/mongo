@@ -36,7 +36,7 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/remote_command_response.h"
@@ -90,6 +90,7 @@ public:
 
     enum class RetryPolicy {
         kIdempotent,
+        kIdempotentOrCursorInvalidated,
         kNotIdempotent,
         kNoRetry,
     };
@@ -216,7 +217,7 @@ public:
      */
     virtual Status runAggregation(
         OperationContext* opCtx,
-        const AggregationRequest& aggRequest,
+        const AggregateCommandRequest& aggRequest,
         std::function<bool(const std::vector<BSONObj>& batch)> callback) = 0;
 
     /**
@@ -237,13 +238,15 @@ public:
      * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
      * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
      */
-    StatusWith<QueryResponse> exhaustiveFindOnConfig(OperationContext* opCtx,
-                                                     const ReadPreferenceSetting& readPref,
-                                                     const repl::ReadConcernLevel& readConcernLevel,
-                                                     const NamespaceString& nss,
-                                                     const BSONObj& query,
-                                                     const BSONObj& sort,
-                                                     const boost::optional<long long> limit);
+    StatusWith<QueryResponse> exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const repl::ReadConcernLevel& readConcernLevel,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        const boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none);
 
     /**
      * Builds an index on a config server collection.
@@ -317,7 +320,8 @@ private:
         const NamespaceString& nss,
         const BSONObj& query,
         const BSONObj& sort,
-        boost::optional<long long> limit) = 0;
+        boost::optional<long long> limit,
+        const boost::optional<BSONObj>& hint = boost::none) = 0;
 
     /**
      * Identifier of the shard as obtained from the configuration data (i.e. shard0000).

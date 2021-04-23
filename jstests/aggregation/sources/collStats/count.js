@@ -21,9 +21,13 @@ assertErrorCode(coll, pipeline, 40602);
 
 // Test that an error is returned if count is not an object.
 pipeline = [{$collStats: {count: 1}}];
-assertErrorCode(coll, pipeline, 40480, "count spec must be an object");
+assertErrorCode(coll, pipeline, ErrorCodes.TypeMismatch, "count spec must be an object");
 pipeline = [{$collStats: {count: "1"}}];
-assertErrorCode(coll, pipeline, 40480, "count spec must be an object");
+assertErrorCode(coll, pipeline, ErrorCodes.TypeMismatch, "count spec must be an object");
+
+// Test that an error is returned if count is not an empty object.
+pipeline = [{$collStats: {count: {unrecognized: 1}}}];
+assertErrorCode(coll, pipeline, 31170, "count spec must be an empty object");
 
 // Test the accuracy of the record count as a standalone option.
 pipeline = [{$collStats: {count: {}}}];
@@ -57,15 +61,9 @@ assert.eq(0, result.count);
 
 // Test that we error when the collection does not exist.
 coll.drop();
-assertErrorCode(coll, pipeline, 40481);
+assertErrorCode(coll, pipeline, ErrorCodes.NamespaceNotFound);
 
 // Test that we error when the database does not exist.
-// TODO SERVER-35479 When running against a mongos, a non-existent database will cause all
-// aggregations to return an empty result set.
 assert.commandWorked(testDB.dropDatabase());
-if (FixtureHelpers.isMongos(testDB)) {
-    assert.eq([], coll.aggregate(pipeline).toArray());
-} else {
-    assertErrorCode(coll, pipeline, 40481);
-}
+assertErrorCode(coll, pipeline, ErrorCodes.NamespaceNotFound);
 }());

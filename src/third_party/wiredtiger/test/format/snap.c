@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2020 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -554,7 +554,7 @@ snap_repeat(WT_CURSOR *cursor, TINFO *tinfo, SNAP_OPS *snap, bool rollback_allow
         /* The only expected error is rollback. */
         ret = snap_verify(cursor, tinfo, snap);
 
-        if (ret != 0 && (!rollback_allowed || ret != WT_ROLLBACK))
+        if (ret != 0 && (!rollback_allowed || (ret != WT_ROLLBACK && ret != WT_CACHE_FULL)))
             testutil_check(ret);
     } else if (ret == EINVAL)
         snap_ts_clear(tinfo, snap->ts);

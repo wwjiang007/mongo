@@ -86,12 +86,16 @@ public:
     };
 
     void tearDown() override {
-        executor->shutdown();
-        executor.reset();
-
+        shutdownExecutor();
         resetIsInternalClient(false);
     };
 
+    void shutdownExecutor() {
+        if (executor) {
+            executor->shutdown();
+            executor.reset();
+        }
+    }
 
     /**
      * Runs the given remote command request, and returns the response.
@@ -151,16 +155,43 @@ protected:
 };
 
 TEST_F(ReplicaSetMonitorFixture, StreamableRSMWireVersion) {
-    auto rsm = ReplicaSetMonitorManager::get()->getOrCreateMonitor(replSetUri);
+    auto rsm = ReplicaSetMonitorManager::get()->getOrCreateMonitor(replSetUri, nullptr);
 
     // Schedule isMaster requests and wait for the responses.
     auto primaryFuture =
         rsm->getHostOrRefresh(ReadPreferenceSetting(mongo::ReadPreference::PrimaryOnly),
-                              CancelationToken::uncancelable());
+                              CancellationToken::uncancelable());
     primaryFuture.get();
 
     ASSERT_EQ(rsm->getMinWireVersion(), WireVersion::LATEST_WIRE_VERSION);
     ASSERT_EQ(rsm->getMaxWireVersion(), WireVersion::LATEST_WIRE_VERSION);
+}
+
+TEST_F(ReplicaSetMonitorFixture, ReplicaSetMonitorCleanup) {
+    const auto& setName = replSetUri.getSetName();
+    ReplicaSetMonitor::cleanup();
+    auto sets = ReplicaSetMonitorManager::get()->getAllSetNames();
+    ASSERT_TRUE(std::find(sets.begin(), sets.end(), setName) == sets.end());
+
+    auto mutex = MONGO_MAKE_LATCH("ReplicaSetMonitorCleanup");
+    stdx::condition_variable cv;
+    bool cleanupInvoked = false;
+    auto rsm = ReplicaSetMonitorManager::get()->getOrCreateMonitor(replSetUri,
+                                                                   [&cleanupInvoked, &mutex, &cv] {
+                                                                       stdx::unique_lock lk(mutex);
+                                                                       cleanupInvoked = true;
+                                                                       cv.notify_one();
+                                                                   });
+
+    sets = ReplicaSetMonitorManager::get()->getAllSetNames();
+    ASSERT_TRUE(std::find(sets.begin(), sets.end(), setName) != sets.end());
+
+    shutdownExecutor();
+    rsm.reset();
+
+    stdx::unique_lock lk(mutex);
+    cv.wait(lk, [&cleanupInvoked] { return cleanupInvoked; });
+    ASSERT_TRUE(cleanupInvoked);
 }
 
 }  // namespace

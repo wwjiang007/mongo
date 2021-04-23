@@ -7,12 +7,6 @@ selector:
   # These tests already run with transactions.
   - jstests/core/txns/*.js
 
-  # These tests are not expected to pass with replica-sets:
-  - jstests/core/capped_update.js
-  - jstests/core/dbadmin.js
-  - jstests/core/opcounters_write_cmd.js
-  - jstests/core/read_after_optime.js
-
   ##
   ## Limitations with the way the runner file injects transactions.
   ##
@@ -21,7 +15,6 @@ selector:
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
-  - jstests/core/capped5.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
@@ -86,6 +79,7 @@ selector:
   - jstests/core/collation.js
   - jstests/core/explain_shell_helpers.js
   - jstests/core/index_partial_read_ops.js
+  - jstests/core/explain_server_params.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
   - jstests/core/views/views_collation.js
@@ -95,9 +89,6 @@ selector:
   - jstests/core/list_all_sessions.js
   - jstests/core/list_local_sessions.js
   - jstests/core/list_sessions.js
-
-  # $indexStats
-  - jstests/core/index_stats.js
 
   # $collStats
   - jstests/core/operation_latency_histogram.js
@@ -110,17 +101,16 @@ selector:
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
-  - jstests/core/cappeda.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
   - jstests/core/field_name_validation.js
   - jstests/core/insert_illegal_doc.js
   - jstests/core/push_sort.js
-  - jstests/core/rename4.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
   - jstests/core/write_result.js
+  - jstests/core/positional_projection.js
 
   # Trick for bypassing mongo shell validation in the test doesn't work because txn_override
   # retry logic will hit the shell validation.
@@ -133,7 +123,6 @@ selector:
   - jstests/core/dbref2.js
   - jstests/core/ref3.js
   - jstests/core/update3.js
-  - jstests/core/rename3.js
 
   ##
   ## Error: Unable to acquire lock within a max lock request timeout of '0ms' milliseconds
@@ -156,15 +145,6 @@ selector:
   - jstests/core/tailable_cursor_invalidation.js
   - jstests/core/tailable_getmore_batch_size.js
 
-  # SERVER-34918 The "max" option of a capped collection can be exceeded until the next insert.
-  # The reason is that we don't update the count of a collection until a transaction commits,
-  # by which point it is too late to complain that "max" has been exceeded.
-  - jstests/core/capped_max1.js
-
-  # The "max" option of a capped collection can be temporarily exceeded before a
-  # txn is committed.
-  - jstests/core/bulk_insert_capped.js
-
   # Wrong count for top info (WriteLock)
   - jstests/core/top.js
 
@@ -175,9 +155,6 @@ selector:
   # using a single txnNumber.
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
-
-  # Fails with implicit sessions because it will use multiple sessions on the same Mongo connection.
-  - jstests/core/dropdb.js
 
   # Committing a transaction when the server is fsync locked fails.
   - jstests/core/fsync.js
@@ -193,7 +170,6 @@ selector:
   - jstests/core/getmore_invalidated_cursors.js
   - jstests/core/getmore_invalidated_documents.js
   - jstests/core/kill_cursors.js
-  - jstests/core/list_collections1.js
   - jstests/core/list_indexes.js
   - jstests/core/oro.js
 
@@ -225,7 +201,6 @@ selector:
   - jstests/core/cursora.js
 
   # Expect drops/creates to fail or have a certain response:
-  - jstests/core/drop.js
   - jstests/core/explain_upsert.js
 
   # Expect certain responses, but retries of successfully completed commands may return
@@ -236,11 +211,6 @@ selector:
   # Expect results to return in a certain order, secondaries may apply ops out of order.
   - jstests/core/coveredIndex1.js
   - jstests/core/sortc.js
-
-  # Assert on the isWritablePrimary field of a hello response. If a primary steps down after
-  # accepting a hello command and returns before its connection is closed, the response can
-  # contain isWritablePrimary: false.
-  - jstests/core/hello_response_validation.js
 
   - jstests/core/bench_test*.js # benchRun() used for writes
   - jstests/core/benchrun_pipeline_updates.js # benchRun() used for writes
@@ -260,6 +230,7 @@ selector:
   - jstests/core/find_and_modify_server7660.js
   - jstests/core/upsert_shell.js
   exclude_with_any_tags:
+  - assumes_standalone_mongod
   ##
   # The next four tags correspond to the special errors thrown by the auto_retry_on_network_error.js
   # override when it refuses to run a certain command. Above each tag are the message(s) that cause
@@ -305,13 +276,15 @@ selector:
   - requires_profiling
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
-  # $out is not supported in transactions
-  - uses_$out
+  - does_not_support_transactions
   # Operations in the main test shell aren't guaranteed to be causally consistent with operations
   # performed earlier in a parallel shell if multiple nodes are electable because the latest
   # operation and cluster times aren't shared between shells.
   # "Cowardly refusing to run test with network retries enabled when it uses startParallelShell()"
   - uses_parallel_shell
+  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
+  # cannot be run with transactions.
+  - uses_api_parameters
 
 executor:
   archive:

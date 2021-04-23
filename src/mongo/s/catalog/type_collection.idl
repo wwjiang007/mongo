@@ -34,6 +34,7 @@ imports:
     - "mongo/db/keypattern.idl"
     - "mongo/s/chunk_version.idl"
     - "mongo/s/resharding/type_collection_fields.idl"
+    - "mongo/s/type_collection_timeseries_fields.idl"
 
 structs:
     CollectionTypeBase:
@@ -128,8 +129,19 @@ structs:
                               collection is the temporary resharding collection."
                 optional: true
             allowMigrations:
+                cpp_name: pre50CompatibleAllowMigrations
                 type: bool
                 description: "Whether this collection allows chunks to move. It is required by
                               almost all DDL operations in order to guarantee that the set of
-                              shards, which comprise a collection will not change."
-                default: true
+                              shards, which comprise a collection will not change.
+
+                              If the flag is not present it defaults to true.
+
+                              It is optional for serialisation purposes, because in versions of
+                              MongoDB prior to 5.0, this value would be missing."
+                optional: true
+            timeseriesFields:
+                type: TypeCollectionTimeseriesFields
+                description: "Time-series collection fields. Only set when this is a time-series
+                              buckets collection."
+                optional: true

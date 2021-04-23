@@ -27,14 +27,17 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
@@ -349,7 +352,7 @@ public:
 
         configTargeterMock()->setFindHostReturnValue(kConfigHostAndPort);
 
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+        WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 
         // Set up 2 default shards.
         for (const auto& shard : kShardList) {
@@ -372,8 +375,7 @@ public:
     // and loading all collections when a database is loaded for the first time by the CatalogCache.
     class StaticCatalogClient final : public ShardingCatalogClientMock {
     public:
-        StaticCatalogClient(std::vector<ShardType> shards)
-            : ShardingCatalogClientMock(nullptr), _shards(std::move(shards)) {}
+        StaticCatalogClient(std::vector<ShardType> shards) : _shards(std::move(shards)) {}
 
         StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
             OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -397,15 +399,18 @@ public:
     };
 
     UUID createCollectionAndGetUUID(const NamespaceString& nss) {
-        DBDirectClient client(operationContext());
-        client.createCollection(nss.ns());
+        {
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(operationContext());
+            uassertStatusOK(createCollection(
+                operationContext(), nss.db().toString(), BSON("create" << nss.coll())));
+        }
 
-        AutoGetCollection autoColl(operationContext(), kNss, MODE_IX);
+        AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
         return autoColl.getCollection()->uuid();
     }
 
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
         auto mockCatalogClient = std::make_unique<StaticCatalogClient>(kShardList);
         // Stash a pointer to the mock so its return values can be set.
         _mockCatalogClient = mockCatalogClient.get();
@@ -547,7 +552,7 @@ TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUU
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(coll);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({coll});
     forceShardFilteringMetadataRefresh(opCtx, kNss);
 
@@ -575,7 +580,7 @@ TEST_F(
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(coll);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({coll});
 
     // The task should have been submitted successfully.
@@ -607,7 +612,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     auto matchingColl = makeCollectionType(collectionUUID, kEpoch);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(matchingColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(10, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(10, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({matchingColl});
 
     // The task should have been submitted successfully.
@@ -627,7 +632,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(staleColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, staleEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, staleEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({staleColl});
     forceShardFilteringMetadataRefresh(opCtx, kNss);
 
@@ -644,7 +649,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     auto matchingColl = makeCollectionType(collectionUUID, kEpoch);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(matchingColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(10, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(10, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({matchingColl});
 
     // The task should have been submitted successfully.
@@ -670,7 +675,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(otherColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, otherEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, otherEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({otherColl});
 
     // The task should not have been submitted, and the task's entry should have been removed from

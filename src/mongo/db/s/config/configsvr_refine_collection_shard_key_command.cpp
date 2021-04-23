@@ -36,9 +36,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_key_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/refine_collection_shard_key_gen.h"
 #include "mongo/s/stale_shard_version_helpers.h"
@@ -65,24 +65,42 @@ public:
                     "refineCollectionShardKey must be called with majority writeConcern",
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
+            const boost::optional<bool>& isFromPrimaryShard = request().getIsFromPrimaryShard();
+            if (isFromPrimaryShard && *isFromPrimaryShard) {
+                // If the request has been received from the primary shard, the distributed lock has
+                // already been acquired.
+                return _internalRun(opCtx);
+            }
+
+            // TODO SERVER-54810 don't acquire distributed lock on CSRS after 5.0 has branched out.
+            // The request has been received from a last-lts router, acquire distlocks on the
+            // namespace's database and collection.
+            DistLockManager::ScopedDistLock dbDistLock(uassertStatusOK(
+                DistLockManager::get(opCtx)->lock(opCtx,
+                                                  nss.db(),
+                                                  "refineCollectionShardKey",
+                                                  DistLockManager::kDefaultLockTimeout)));
+            DistLockManager::ScopedDistLock collDistLock(uassertStatusOK(
+                DistLockManager::get(opCtx)->lock(opCtx,
+                                                  nss.ns(),
+                                                  "refineCollectionShardKey",
+                                                  DistLockManager::kDefaultLockTimeout)));
+
+            _internalRun(opCtx);
+        }
+
+    private:
+        void _internalRun(OperationContext* opCtx) {
+            const NamespaceString& nss = ns();
+
+            audit::logRefineCollectionShardKey(opCtx->getClient(), nss.ns(), request().getKey());
+
             // Set the operation context read concern level to local for reads into the config
             // database.
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
             const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-            // Acquire distlocks on the namespace's database and collection.
-            DistLockManager::ScopedDistLock dbDistLock(uassertStatusOK(
-                catalogClient->getDistLockManager()->lock(opCtx,
-                                                          nss.db(),
-                                                          "refineCollectionShardKey",
-                                                          DistLockManager::kDefaultLockTimeout)));
-            DistLockManager::ScopedDistLock collDistLock(uassertStatusOK(
-                catalogClient->getDistLockManager()->lock(opCtx,
-                                                          nss.ns(),
-                                                          "refineCollectionShardKey",
-                                                          DistLockManager::kDefaultLockTimeout)));
 
             // Validate the given namespace is (i) sharded, (ii) doesn't already have the proposed
             // key, and (iii) has the same epoch as the router that received
@@ -97,11 +115,11 @@ public:
                               << "refineCollectionShardKey namespace " << nss << " is not sharded");
             }
 
-            const auto oldShardKeyPattern = ShardKeyPattern(collType.getKeyPattern());
-            const auto proposedKey = request().getKey().getOwned();
+            const ShardKeyPattern oldShardKeyPattern(collType.getKeyPattern());
+            const ShardKeyPattern newShardKeyPattern(request().getKey());
 
             if (SimpleBSONObjComparator::kInstance.evaluate(oldShardKeyPattern.toBSON() ==
-                                                            proposedKey)) {
+                                                            newShardKeyPattern.toBSON())) {
                 repl::ReplClientInfo::forClient(opCtx->getClient())
                     .setLastOpToSystemLastOpTime(opCtx);
                 return;
@@ -115,12 +133,11 @@ public:
 
             // Validate the given shard key (i) extends the current shard key, (ii) has a "useful"
             // index, and (iii) the index in question has no null entries.
-            const auto newShardKeyPattern = ShardKeyPattern(proposedKey);
-
             uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "refineCollectionShardKey shard key " << proposedKey.toString()
+                    str::stream() << "refineCollectionShardKey shard key "
+                                  << newShardKeyPattern.toString()
                                   << " does not extend the current shard key "
-                                  << collType.getKeyPattern().toString(),
+                                  << oldShardKeyPattern.toString(),
                     oldShardKeyPattern.isExtendedBy(newShardKeyPattern));
 
             // Indexes are loaded using shard versions, so validating the shard key may need to be
@@ -136,7 +153,6 @@ public:
                                   shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
                                       opCtx,
                                       nss,
-                                      proposedKey,
                                       newShardKeyPattern,
                                       boost::none,
                                       collType.getUnique(),
@@ -148,13 +164,10 @@ public:
                   "CMD: refineCollectionShardKey",
                   "request"_attr = request().toBSON({}));
 
-            audit::logRefineCollectionShardKey(opCtx->getClient(), nss.ns(), proposedKey);
-
             ShardingCatalogManager::get(opCtx)->refineCollectionShardKey(
                 opCtx, nss, newShardKeyPattern);
         }
 
-    private:
         NamespaceString ns() const override {
             return request().getCommandParameter();
         }

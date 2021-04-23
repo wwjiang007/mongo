@@ -3,7 +3,10 @@
  * a failpoint that causes initial sync to fail partway through its first attempt and makes sure it
  * does not hit a WiredTiger assertion on the second attempt.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {

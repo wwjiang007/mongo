@@ -33,10 +33,12 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
@@ -59,13 +61,15 @@ TenantDatabaseCloner::TenantDatabaseCloner(const std::string& dbName,
           "TenantDatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _dbName(dbName),
       _listCollectionsStage("listCollections", this, &TenantDatabaseCloner::listCollectionsStage),
+      _listExistingCollectionsStage(
+          "listExistingCollections", this, &TenantDatabaseCloner::listExistingCollectionsStage),
       _tenantId(tenantId) {
     invariant(!dbName.empty());
     _stats.dbname = dbName;
 }
 
 BaseCloner::ClonerStages TenantDatabaseCloner::getStages() {
-    return {&_listCollectionsStage};
+    return {&_listCollectionsStage, &_listExistingCollectionsStage};
 }
 
 void TenantDatabaseCloner::preStage() {
@@ -128,7 +132,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
         ListCollectionResult result;
         try {
             result = ListCollectionResult::parse(
-                IDLParserErrorContext("DatabaseCloner::listCollectionsStage"), info);
+                IDLParserErrorContext("TenantDatabaseCloner::listCollectionsStage"), info);
         } catch (const DBException& e) {
             uasserted(
                 ErrorCodes::FailedToParse,
@@ -137,7 +141,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
                     .reason());
         }
         NamespaceString collectionNamespace(_dbName, result.getName());
-        if (collectionNamespace.isSystem() && !collectionNamespace.isLegalClientSystemNS()) {
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(4881602,
                         1,
                         "Database cloner skipping 'system' collection",
@@ -165,6 +169,110 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
         result.getOptions().uuid = result.getInfo().getUuid();
         _collections.emplace_back(collectionNamespace, result.getOptions());
     }
+    return kContinueNormally;
+}
+
+BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStage() {
+    auto opCtx = cc().makeOperationContext();
+    DBDirectClient client(opCtx.get());
+    tenantMigrationRecipientInfo(opCtx.get()) =
+        boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
+
+    long long sizeOfCurrCollOnDisk = 0;
+    long long approxTotalDBSizeOnDisk = 0;
+
+    std::vector<UUID> clonedCollectionUUIDs;
+    auto collectionInfos =
+        client.getCollectionInfos(_dbName, ListCollectionsFilter::makeTypeCollectionFilter());
+    for (auto&& info : collectionInfos) {
+        ListCollectionResult result;
+        try {
+            result = ListCollectionResult::parse(
+                IDLParserErrorContext("TenantDatabaseCloner::listExistingCollectionsStage"), info);
+        } catch (const DBException& e) {
+            uasserted(
+                ErrorCodes::FailedToParse,
+                e.toStatus()
+                    .withContext(str::stream() << "Collection info could not be parsed : " << info)
+                    .reason());
+        }
+        NamespaceString collectionNamespace(_dbName, result.getName());
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
+            LOGV2_DEBUG(5271600,
+                        1,
+                        "Tenant database cloner skipping 'system' collection",
+                        "migrationId"_attr = getSharedData()->getMigrationId(),
+                        "tenantId"_attr = _tenantId,
+                        "namespace"_attr = collectionNamespace.ns());
+            continue;
+        }
+        clonedCollectionUUIDs.emplace_back(result.getInfo().getUuid());
+
+        BSONObj res;
+        client.runCommand(_dbName, BSON("collStats" << result.getName()), res);
+        if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
+            LOGV2_WARNING(5522901,
+                          "Skipping recording of data size metrics for database due to failure "
+                          "in the 'collStats' command, tenant migration stats may be inaccurate.",
+                          "db"_attr = _dbName,
+                          "coll"_attr = result.getName(),
+                          "migrationId"_attr = getSharedData()->getMigrationId(),
+                          "tenantId"_attr = _tenantId,
+                          "status"_attr = status);
+        } else {
+            sizeOfCurrCollOnDisk = res.getField("size").safeNumberLong();
+            approxTotalDBSizeOnDisk += sizeOfCurrCollOnDisk;
+        }
+    }
+
+    if (!getSharedData()->isResuming()) {
+        uassert(ErrorCodes::NamespaceExists,
+                str::stream() << "Tenant '" << _tenantId
+                              << "': collections already exist prior to data sync",
+                clonedCollectionUUIDs.empty());
+        return kContinueNormally;
+    }
+
+    // We are resuming, restart from the collection whose UUID compared greater than or equal to
+    // the last collection we have on disk.
+    if (!clonedCollectionUUIDs.empty()) {
+        const auto& lastClonedCollectionUUID = clonedCollectionUUIDs.back();
+        const auto& startingCollection = std::lower_bound(
+            _collections.begin(),
+            _collections.end(),
+            lastClonedCollectionUUID,
+            [](const auto& collection, const auto& uuid) { return collection.second.uuid < uuid; });
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            if (startingCollection != _collections.end() &&
+                startingCollection->second.uuid == lastClonedCollectionUUID) {
+                _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size() - 1;
+
+                // When the last collection is partially cloned, we exclude it from the total size
+                // on disk, as the partially cloned collections stats will be added by the cloner
+                // on demand.
+                _stats.approxTotalBytesCopied = approxTotalDBSizeOnDisk - sizeOfCurrCollOnDisk;
+            } else {
+                _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size();
+                _stats.approxTotalBytesCopied = approxTotalDBSizeOnDisk;
+            }
+        }
+        _collections.erase(_collections.begin(), startingCollection);
+        if (!_collections.empty()) {
+            LOGV2(5271601,
+                  "Tenant DatabaseCloner resumes cloning",
+                  "migrationId"_attr = getSharedData()->getMigrationId(),
+                  "tenantId"_attr = _tenantId,
+                  "resumeFrom"_attr = _collections.front().first);
+        } else {
+            LOGV2(5271602,
+                  "Tenant DatabaseCloner has already cloned all collections",
+                  "migrationId"_attr = getSharedData()->getMigrationId(),
+                  "tenantId"_attr = _tenantId,
+                  "dbName"_attr = _dbName);
+        }
+    }
+
     return kContinueNormally;
 }
 
@@ -219,6 +327,8 @@ void TenantDatabaseCloner::postStage() {
         {
             stdx::lock_guard<Latch> lk(_mutex);
             _stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
+            _stats.approxTotalBytesCopied +=
+                _stats.collectionStats[_stats.clonedCollections].approxTotalBytesCopied;
             _currentCollectionCloner = nullptr;
             // Abort the tenant database cloner if the collection clone failed.
             if (!collStatus.isOK())
@@ -235,6 +345,8 @@ TenantDatabaseCloner::Stats TenantDatabaseCloner::getStats() const {
     TenantDatabaseCloner::Stats stats = _stats;
     if (_currentCollectionCloner) {
         stats.collectionStats[_stats.clonedCollections] = _currentCollectionCloner->getStats();
+        stats.approxTotalBytesCopied +=
+            stats.collectionStats[stats.clonedCollections].approxTotalBytesCopied;
     }
     return stats;
 }
@@ -251,8 +363,10 @@ BSONObj TenantDatabaseCloner::Stats::toBSON() const {
 }
 
 void TenantDatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
-    builder->appendNumber("collections", collections);
-    builder->appendNumber("clonedCollections", clonedCollections);
+    builder->appendNumber("clonedCollectionsBeforeFailover",
+                          static_cast<long long>(clonedCollectionsBeforeFailover));
+    builder->appendNumber("collections", static_cast<long long>(collections));
+    builder->appendNumber("clonedCollections", static_cast<long long>(clonedCollections));
     if (start != Date_t()) {
         builder->appendDate("start", start);
         if (end != Date_t()) {

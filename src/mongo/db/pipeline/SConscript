@@ -19,7 +19,7 @@ env.Library(
         'aggregation.cpp',
     ],
     LIBDEPS=[
-        'aggregation_request',
+        'aggregation_request_helper',
         'expression_context',
         'pipeline',
     ]
@@ -36,9 +36,10 @@ env.Library(
     )
 
 env.Library(
-    target='aggregation_request',
+    target='aggregation_request_helper',
     source=[
-        'aggregation_request.cpp',
+        'aggregation_request_helper.cpp',
+        'aggregate_command.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -50,6 +51,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/write_concern_options',
+        '$BUILD_DIR/mongo/idl/idl_parser',
         'document_sources_idl',
     ]
 )
@@ -70,12 +72,14 @@ env.Library(
         'expression_context.cpp',
         'expression_function.cpp',
         'expression_js_emit.cpp',
+        'expression_test_api_version.cpp',
         'expression_trigonometric.cpp',
         'javascript_execution.cpp',
         'make_js_function.cpp',
         'variables.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
@@ -87,7 +91,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/intrusive_counter',
         '$BUILD_DIR/mongo/util/regex_util',
         '$BUILD_DIR/mongo/util/summation',
-        'aggregation_request',
+        'aggregation_request_helper',
         'dependencies',
         'variable_validation',
     ],
@@ -114,14 +118,21 @@ env.Library(
         'accumulation_statement.cpp',
         'accumulator_add_to_set.cpp',
         'accumulator_avg.cpp',
+        'accumulator_covariance.cpp',
+        'accumulator_exp_moving_avg.cpp',
         'accumulator_first.cpp',
         'accumulator_js_reduce.cpp',
         'accumulator_last.cpp',
         'accumulator_merge_objects.cpp',
         'accumulator_min_max.cpp',
         'accumulator_push.cpp',
+        'accumulator_rank.cpp',
         'accumulator_std_dev.cpp',
         'accumulator_sum.cpp',
+        'window_function/window_bounds.cpp',
+        'window_function/window_function_covariance.cpp',
+        'window_function/window_function_expression.cpp',
+        'window_function/window_function_sum.cpp'
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
@@ -167,7 +178,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/async_requests_sender',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
-        '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/s/query/cluster_query',
         'aggregation',
     ],
@@ -181,7 +191,7 @@ env.Library(
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/stats/counters',
-        'aggregation_request',
+        'aggregation_request_helper',
     ]
 )
 
@@ -208,6 +218,7 @@ pipelineEnv.Library(
         'document_source_change_stream.cpp',
         'document_source_change_stream_close_cursor.cpp',
         'document_source_change_stream_transform.cpp',
+        'document_source_change_stream_unwind_transactions.cpp',
         'document_source_check_invalidate.cpp',
         'document_source_check_resume_token.cpp',
         'document_source_coll_stats.cpp',
@@ -241,6 +252,7 @@ pipelineEnv.Library(
         'document_source_sample.cpp',
         'document_source_sample_from_random_cursor.cpp',
         'document_source_sequential_document_cache.cpp',
+        'document_source_set_window_fields.cpp',
         'document_source_single_document_transformation.cpp',
         'document_source_skip.cpp',
         'document_source_sort.cpp',
@@ -248,11 +260,18 @@ pipelineEnv.Library(
         'document_source_tee_consumer.cpp',
         'document_source_union_with.cpp',
         'document_source_unwind.cpp',
+        'document_source_internal_unpack_bucket.cpp',
+        'document_source_internal_convert_bucket_index_stats.cpp',
         'pipeline.cpp',
         'semantic_analysis.cpp',
         'sequential_document_cache.cpp',
         'skip_and_limit.cpp',
         'tee_buffer.cpp',
+        'window_function/partition_iterator.cpp',
+        'window_function/window_function_exec.cpp',
+        'window_function/window_function_exec_derivative.cpp',
+        'window_function/window_function_exec_removable_document.cpp',
+        'window_function/window_function_exec_removable_range.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
@@ -260,6 +279,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
+        '$BUILD_DIR/mongo/db/exec/bucket_unpacker',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/exec/projection_executor',
         '$BUILD_DIR/mongo/db/exec/scoped_timer',
@@ -272,6 +292,8 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/pipeline/lite_parsed_document_source',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
+        '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
+        '$BUILD_DIR/mongo/db/query/query_knobs',
         '$BUILD_DIR/mongo/db/query/sort_pattern',
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
@@ -296,6 +318,8 @@ pipelineEnv.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/timeseries/timeseries_idl',
+        '$BUILD_DIR/mongo/db/timeseries/timeseries_index_schema_conversion_functions',
         '$BUILD_DIR/mongo/rpc/command_status',
     ]
 )
@@ -303,7 +327,7 @@ pipelineEnv.Library(
 env.Library(
     target='runtime_constants_idl',
     source=[
-        'runtime_constants.idl',
+        'legacy_runtime_constants.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/idl_parser',
@@ -314,15 +338,19 @@ env.Library(
     target='document_sources_idl',
     source=[
         'document_source_change_stream.idl',
+        'document_source_coll_stats.idl',
         'document_source_list_sessions.idl',
         'document_source_merge.idl',
         'document_source_merge_modes.idl',
+        'document_source_merge_spec.cpp',
+        'document_source_parsing_validators.cpp',
         'document_source_replace_root.idl',
+        'document_source_set_window_fields.idl',
         'document_source_union_with.idl',
         'exchange_spec.idl',
+        'resume_token.cpp',
+        'storage_stats_spec.idl',
         'value.idl',
-        'document_source_merge_spec.cpp',
-        'resume_token.cpp'
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -371,10 +399,22 @@ env.CppUnitTest(
         'document_source_replace_root_test.cpp',
         'document_source_sample_test.cpp',
         'document_source_sequential_document_cache_test.cpp',
+        'document_source_set_window_fields_test.cpp',
         'document_source_skip_test.cpp',
         'document_source_sort_by_count_test.cpp',
         'document_source_sort_test.cpp',
         'document_source_union_with_test.cpp',
+        'document_source_internal_unpack_bucket_test/extract_or_build_project_to_internalize_test.cpp',
+        'document_source_internal_unpack_bucket_test/create_predicates_on_bucket_level_field_test.cpp',
+        'document_source_internal_unpack_bucket_test/extract_project_for_pushdown_test.cpp',
+        'document_source_internal_unpack_bucket_test/group_reorder_test.cpp',
+        'document_source_internal_unpack_bucket_test/internalize_project_test.cpp',
+        'document_source_internal_unpack_bucket_test/optimize_pipeline_test.cpp',
+        'document_source_internal_unpack_bucket_test/pushdown_computed_meta_projections_test.cpp',
+        'document_source_internal_unpack_bucket_test/sample_reorder_test.cpp',
+        'document_source_internal_unpack_bucket_test/sort_reorder_test.cpp',
+        'document_source_internal_unpack_bucket_test/split_match_on_meta_and_rename_test.cpp',
+        'document_source_internal_unpack_bucket_test/unpack_bucket_exec_test.cpp',
         'document_source_unwind_test.cpp',
         'expression_and_test.cpp',
         'expression_compare_test.cpp',
@@ -389,6 +429,7 @@ env.CppUnitTest(
         'expression_or_test.cpp',
         'expression_replace_test.cpp',
         'expression_test.cpp',
+        'expression_test_api_version_test.cpp',
         'expression_trigonometric_test.cpp',
         'expression_trim_test.cpp',
         'expression_walker_test.cpp',
@@ -405,6 +446,18 @@ env.CppUnitTest(
         'sharded_union_test.cpp',
         'skip_and_limit_test.cpp',
         'tee_buffer_test.cpp',
+        'window_function/partition_iterator_test.cpp',
+        'window_function/window_function_add_to_set_test.cpp',
+        'window_function/window_function_covariance_test.cpp',
+        'window_function/window_function_exec_derivative_test.cpp',
+        'window_function/window_function_exec_non_removable_test.cpp',
+        'window_function/window_function_exec_removable_test.cpp',
+        'window_function/window_function_min_max_test.cpp',
+        'window_function/window_function_push_test.cpp',
+        'window_function/window_function_std_dev_test.cpp',
+        'window_function/window_function_exec_first_last_test.cpp',
+        'window_function/window_function_avg_test.cpp',
+        'window_function/window_function_sum_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -428,7 +481,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         'accumulator',
-        'aggregation_request',
+        'aggregation_request_helper',
         'document_source_mock',
         'document_sources_idl',
         'expression_context',

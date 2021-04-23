@@ -210,7 +210,7 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                shellVersion()),
     // To-be-updated when we branch for the next release.
-    new MongoRunner.VersionSub("last-continuous", "4.8"),
+    new MongoRunner.VersionSub("last-continuous", "4.9"),
     // To be updated when we branch for the next LTS release.
     new MongoRunner.VersionSub("last-lts", "4.4")
 ];
@@ -761,6 +761,11 @@ MongoRunner.mongodOptions = function(opts = {}) {
         opts.auditDestination = jsTestOptions().auditDestination;
     }
 
+    if (opts.hasOwnProperty("auditPath")) {
+        // We need to reformat the auditPath to include the proper port
+        opts.auditPath = MongoRunner.toRealPath(opts.auditPath, opts);
+    }
+
     if (opts.noReplSet)
         opts.replSet = null;
     if (opts.arbiter)
@@ -817,6 +822,11 @@ MongoRunner.mongosOptions = function(opts) {
 
     if (!opts.hasOwnProperty('binVersion') && testOptions.mongosBinVersion) {
         opts.binVersion = MongoRunner.getBinVersionFor(testOptions.mongosBinVersion);
+    }
+
+    if (opts.hasOwnProperty("auditPath")) {
+        // We need to reformat the auditPath to include the proper port
+        opts.auditPath = MongoRunner.toRealPath(opts.auditPath, opts);
     }
 
     _removeSetParameterIfBeforeVersion(
@@ -1187,7 +1197,9 @@ function appendSetParameterArgs(argArray) {
             }
 
             // Disable background cache refreshing to avoid races in tests
-            argArray.push(...['--setParameter', "disableLogicalSessionCacheRefresh=true"]);
+            if (!argArrayContainsSetParameterValue('disableLogicalSessionCacheRefresh=')) {
+                argArray.push(...['--setParameter', "disableLogicalSessionCacheRefresh=true"]);
+            }
         }
 
         // Since options may not be backward compatible, mongos options are not
@@ -1229,6 +1241,18 @@ function appendSetParameterArgs(argArray) {
                 }
             }
 
+            // New mongod-specific option in 4.9.x.
+            if (programMajorMinorVersion >= 490) {
+                const parameters = jsTest.options().setParameters;
+                if ((parameters === undefined ||
+                     parameters['reshardingMinimumOperationDurationMillis'] === undefined) &&
+                    !argArrayContainsSetParameterValue(
+                        'reshardingMinimumOperationDurationMillis=')) {
+                    argArray.push(
+                        ...['--setParameter', "reshardingMinimumOperationDurationMillis=5000"]);
+                }
+            }
+
             // New mongod-specific option in 4.5.x.
             if (programMajorMinorVersion >= 450) {
                 // Allow the parameter to be overridden if set explicitly via TestData.
@@ -1258,8 +1282,6 @@ function appendSetParameterArgs(argArray) {
                 }
             }
 
-            // TODO (SERVER-49407): Enable this parameter for 4.4 nodes after SERVER-21700 has been
-            // backported to v4.4.
             // New mongod-specific option in 4.5.
             if (programMajorMinorVersion >= 450) {
                 // Allow the parameter to be overridden if set explicitly via TestData.
@@ -1363,6 +1385,11 @@ function appendSetParameterArgs(argArray) {
 
                         if (paramName === 'enableIndexBuildCommitQuorum' &&
                             argArrayContains("enableIndexBuildCommitQuorum")) {
+                            continue;
+                        }
+
+                        if (paramName === "reshardingMinimumOperationDurationMillis" &&
+                            argArrayContains("reshardingMinimumOperationDurationMillis")) {
                             continue;
                         }
 

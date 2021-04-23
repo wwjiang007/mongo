@@ -43,7 +43,6 @@
 #include <winhttp.h>
 
 #include "mongo/base/init.h"
-#include "mongo/base/initializer_context.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
@@ -63,6 +62,7 @@
 #include "mongo/util/net/ssl_parameters_gen.h"
 #include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
+#include "mongo/util/net/ssl_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
 #include "mongo/util/uuid.h"
@@ -269,8 +269,7 @@ public:
      */
     Status initSSLContext(SCHANNEL_CRED* cred,
                           const SSLParams& params,
-                          const TransientSSLParams& transientParams,
-                          ConnectionDirection direction) override final;
+                          ConnectionDirection direction) final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
 
@@ -393,12 +392,21 @@ SSLConnectionWindows::~SSLConnectionWindows() {}
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(
+    const SSLParams& params,
+    const std::optional<TransientSSLParams>& transientSSLParams,
+    bool isServer) {
+    return std::make_shared<SSLManagerWindows>(params, isServer);
+}
+
 std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return std::make_shared<SSLManagerWindows>(params, isServer);
 }
 
 namespace {
+
+StatusWith<std::vector<std::string>> getSubjectAlternativeNames(PCCERT_CONTEXT cert);
 
 SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
     : _weakValidation(params.sslWeakCertificateValidation),
@@ -416,8 +424,7 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
 
     uassertStatusOK(_loadCertificates(params));
 
-    uassertStatusOK(
-        initSSLContext(&_clientCred, params, TransientSSLParams(), ConnectionDirection::kOutgoing));
+    uassertStatusOK(initSSLContext(&_clientCred, params, ConnectionDirection::kOutgoing));
 
     // Certificates may not have been loaded. This typically occurs in unit tests.
     if (_clientCertificates[0] != nullptr) {
@@ -427,8 +434,7 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
 
     // SSL server specific initialization
     if (isServer) {
-        uassertStatusOK(initSSLContext(
-            &_serverCred, params, TransientSSLParams(), ConnectionDirection::kIncoming));
+        uassertStatusOK(initSSLContext(&_serverCred, params, ConnectionDirection::kIncoming));
 
         if (_serverCertificates[0] != nullptr) {
             SSLX509Name subjectName;
@@ -437,6 +443,16 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
                                      &subjectName,
                                      &_sslConfiguration.serverCertificateExpirationDate));
             uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(subjectName)));
+
+            auto swSans = getSubjectAlternativeNames(_serverCertificates[0]);
+            const bool hasSan = swSans.isOK() && (0 != swSans.getValue().size());
+            if (!hasSan) {
+                LOGV2_WARNING_OPTIONS(
+                    551192,
+                    {logv2::LogTag::kStartupWarnings},
+                    "Server certificate has no compatible Subject Alternative Name. "
+                    "This may prevent TLS clients from connecting");
+            }
         }
 
         // Monitor the server certificate's expiration
@@ -603,35 +619,6 @@ StatusWith<std::string> readFile(StringData fileName) {
     return buf;
 }
 
-// Find a specific kind of PEM blob marked by BEGIN and END in a string
-StatusWith<StringData> findPEMBlob(StringData blob,
-                                   StringData type,
-                                   size_t position = 0,
-                                   bool allowEmpty = false) {
-    std::string header = str::stream() << "-----BEGIN " << type << "-----";
-    std::string trailer = str::stream() << "-----END " << type << "-----";
-
-    size_t headerPosition = blob.find(header, position);
-    if (headerPosition == std::string::npos) {
-        if (allowEmpty) {
-            return StringData();
-        } else {
-            return Status(ErrorCodes::InvalidSSLConfiguration,
-                          str::stream() << "Failed to find PEM blob header: " << header);
-        }
-    }
-
-    size_t trailerPosition = blob.find(trailer, headerPosition);
-    if (trailerPosition == std::string::npos) {
-        return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Failed to find PEM blob trailer: " << trailer);
-    }
-
-    trailerPosition += trailer.size();
-
-    return StringData(blob.rawData() + headerPosition, trailerPosition - headerPosition);
-}
-
 // Decode a base-64 PEM blob with headers into a binary blob
 StatusWith<std::vector<BYTE>> decodePEMBlob(StringData blob) {
     DWORD decodeLen{0};
@@ -706,7 +693,7 @@ StatusWith<std::vector<UniqueCertificate>> readCAPEMBuffer(StringData buffer) {
     bool found_one = false;
 
     while (pos < buffer.size()) {
-        auto swBlob = findPEMBlob(buffer, "CERTIFICATE"_sd, pos, pos != 0);
+        auto swBlob = ssl_util::findPEMBlob(buffer, "CERTIFICATE"_sd, pos, pos != 0);
 
         // We expect to find at least one certificate
         if (!swBlob.isOK()) {
@@ -784,7 +771,7 @@ StatusWith<UniqueCertificateWithPrivateKey> readCertPEMFile(StringData fileName,
     }
 
     // Search the buffer for the various strings that make up a PEM file
-    auto swPublicKeyBlob = findPEMBlob(buf, "CERTIFICATE"_sd);
+    auto swPublicKeyBlob = ssl_util::findPEMBlob(buf, "CERTIFICATE"_sd);
     if (!swPublicKeyBlob.isOK()) {
         return swPublicKeyBlob.getStatus();
     }
@@ -858,11 +845,11 @@ StatusWith<UniqueCertificateWithPrivateKey> readCertPEMFile(StringData fileName,
 
     // PEM files can have either private key format
     // Also the private key can either come before or after the certificate
-    auto swPrivateKeyBlob = findPEMBlob(buf, "RSA PRIVATE KEY"_sd);
+    auto swPrivateKeyBlob = ssl_util::findPEMBlob(buf, "RSA PRIVATE KEY"_sd);
     // We expect to find at least one certificate
     if (!swPrivateKeyBlob.isOK()) {
         // A "PRIVATE KEY" is actually a PKCS #8 PrivateKeyInfo ASN.1 type.
-        swPrivateKeyBlob = findPEMBlob(buf, "PRIVATE KEY"_sd);
+        swPrivateKeyBlob = ssl_util::findPEMBlob(buf, "PRIVATE KEY"_sd);
         if (!swPrivateKeyBlob.isOK()) {
             return swPrivateKeyBlob.getStatus();
         }
@@ -1055,7 +1042,7 @@ Status readCRLPEMFile(HCERTSTORE certStore, StringData fileName) {
     bool found_one = false;
 
     while (pos < buf.size()) {
-        auto swBlob = findPEMBlob(buf, "X509 CRL"_sd, pos, pos != 0);
+        auto swBlob = ssl_util::findPEMBlob(buf, "X509 CRL"_sd, pos, pos != 0);
 
         // We expect to find at least one CRL
         if (!swBlob.isOK()) {
@@ -1374,7 +1361,6 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
 
 Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
                                          const SSLParams& params,
-                                         const TransientSSLParams& transientParams,
                                          ConnectionDirection direction) {
 
     memset(cred, 0, sizeof(*cred));
@@ -1469,7 +1455,6 @@ SSLConnectionInterface* SSLManagerWindows::accept(Socket* socket,
 void SSLManagerWindows::_handshake(SSLConnectionWindows* conn, bool client) {
     initSSLContext(conn->_cred,
                    getSSLGlobalParams(),
-                   TransientSSLParams(),
                    client ? SSLManagerInterface::ConnectionDirection::kOutgoing
                           : SSLManagerInterface::ConnectionDirection::kIncoming);
 

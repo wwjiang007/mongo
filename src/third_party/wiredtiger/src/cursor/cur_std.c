@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -736,8 +736,7 @@ __wt_cursor_cache_release(WT_SESSION_IMPL *session, WT_CURSOR *cursor, bool *rel
      * caching fails, we'll decrement the statistics after reopening the cursor (and getting the
      * data handle back).
      */
-    WT_STAT_CONN_INCR(session, cursor_cache);
-    WT_STAT_DATA_INCR(session, cursor_cache);
+    WT_STAT_CONN_DATA_INCR(session, cursor_cache);
     WT_ERR(cursor->cache(cursor));
     WT_ASSERT(session, F_ISSET(cursor, WT_CURSTD_CACHED));
     *released = true;
@@ -751,8 +750,7 @@ __wt_cursor_cache_release(WT_SESSION_IMPL *session, WT_CURSOR *cursor, bool *rel
 err:
         WT_TRET(cursor->reopen(cursor, false));
         WT_ASSERT(session, !F_ISSET(cursor, WT_CURSTD_CACHED));
-        WT_STAT_CONN_DECR(session, cursor_cache);
-        WT_STAT_DATA_DECR(session, cursor_cache);
+        WT_STAT_CONN_DATA_DECR(session, cursor_cache);
     }
 
     return (ret);
@@ -796,6 +794,10 @@ __wt_cursor_cache_get(WT_SESSION_IMPL *session, const char *uri, WT_CURSOR *to_d
          */
         WT_RET(__wt_config_gets_def(session, cfg, "bulk", 0, &cval));
         if (cval.val)
+            return (WT_NOTFOUND);
+
+        WT_RET(__wt_config_gets_def(session, cfg, "debug", 0, &cval));
+        if (cval.len != 0)
             return (WT_NOTFOUND);
 
         WT_RET(__wt_config_gets_def(session, cfg, "dump", 0, &cval));
@@ -883,8 +885,12 @@ __wt_cursor_cache_get(WT_SESSION_IMPL *session, const char *uri, WT_CURSOR *to_d
                 }
             }
 
-            WT_STAT_CONN_INCR(session, cursor_reopen);
-            WT_STAT_DATA_INCR(session, cursor_reopen);
+            /*
+             * A side effect of a cursor open is to leave the session's data handle set. Honor that
+             * for a "reopen".
+             */
+            if (cbt != NULL)
+                session->dhandle = cbt->dhandle;
 
             *cursorp = cursor;
             return (0);
@@ -1107,8 +1113,11 @@ __wt_cursor_init(
 
     session = CUR2S(cursor);
 
-    if (cursor->internal_uri == NULL)
+    if (cursor->internal_uri == NULL) {
+        /* Various cursor code assumes there is an internal URI, so there better be one to set. */
+        WT_ASSERT(session, uri != NULL);
         WT_RET(__wt_strdup(session, uri, &cursor->internal_uri));
+    }
 
     /*
      * append The append flag is only relevant to column stores.

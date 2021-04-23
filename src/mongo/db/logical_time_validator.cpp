@@ -51,6 +51,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(alwaysValidateClientsClusterTime);
+MONGO_FAIL_POINT_DEFINE(externalClientsNeverAuthorizedToAdvanceLogicalClock);
 MONGO_FAIL_POINT_DEFINE(throwClientDisconnectInSignLogicalTimeForExternalClients);
 
 const auto getLogicalTimeValidator =
@@ -64,7 +65,6 @@ MONGO_INITIALIZER(InitializeAdvanceClusterTimePrivilegeVector)(InitializerContex
     ActionSet actions;
     actions.addAction(ActionType::advanceClusterTime);
     advanceClusterTimePrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
-    return Status::OK();
 }
 
 Milliseconds kRefreshIntervalIfErrored(200);
@@ -165,23 +165,34 @@ Status LogicalTimeValidator::validate(OperationContext* opCtx, const SignedLogic
         }
     }
 
-    auto keyStatus =
-        _getKeyManagerCopy()->getKeyForValidation(opCtx, newTime.getKeyId(), newTime.getTime());
-    uassertStatusOK(keyStatus.getStatus());
+    auto keyStatusWith =
+        _getKeyManagerCopy()->getKeysForValidation(opCtx, newTime.getKeyId(), newTime.getTime());
+    auto status = keyStatusWith.getStatus();
 
-    const auto& key = keyStatus.getValue().getKey();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    auto keys = keyStatusWith.getValue();
+    invariant(!keys.empty());
 
     const auto newProof = newTime.getProof();
     // Cluster time is only sent if a server's clock can verify and sign cluster times, so any
     // received cluster times should have proofs.
     invariant(newProof);
 
-    auto res = _timeProofService.checkProof(newTime.getTime(), newProof.get(), key);
-    if (res != Status::OK()) {
-        return res;
+    auto firstError = Status::OK();
+    for (const auto& key : keys) {
+        auto proofStatus =
+            _timeProofService.checkProof(newTime.getTime(), newProof.get(), key.getKey());
+        if (proofStatus.isOK()) {
+            return Status::OK();
+        } else if (firstError.isOK()) {
+            firstError = proofStatus;
+        }
     }
 
-    return Status::OK();
+    return firstError;
 }
 
 void LogicalTimeValidator::init(ServiceContext* service) {
@@ -199,6 +210,12 @@ void LogicalTimeValidator::enableKeyGenerator(OperationContext* opCtx, bool doEn
 }
 
 bool LogicalTimeValidator::isAuthorizedToAdvanceClock(OperationContext* opCtx) {
+    if (MONGO_unlikely(externalClientsNeverAuthorizedToAdvanceLogicalClock.shouldFail())) {
+        auto isInternalClient = opCtx->getClient()->session() &&
+            (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
+        return isInternalClient;
+    }
+
     auto client = opCtx->getClient();
     // Note: returns true if auth is off, courtesy of
     // AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks.
@@ -208,6 +225,11 @@ bool LogicalTimeValidator::isAuthorizedToAdvanceClock(OperationContext* opCtx) {
 
 bool LogicalTimeValidator::shouldGossipLogicalTime() {
     return _getKeyManagerCopy()->hasSeenKeys();
+}
+
+void LogicalTimeValidator::cacheExternalKey(ExternalKeysCollectionDocument key) {
+    invariant(_keyManager);
+    _keyManager->cacheExternalKey(std::move(key));
 }
 
 void LogicalTimeValidator::resetKeyManagerCache() {

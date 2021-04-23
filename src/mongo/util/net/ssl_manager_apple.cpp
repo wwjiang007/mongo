@@ -38,7 +38,6 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
-#include "mongo/base/initializer_context.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/crypto/sha1_block.h"
@@ -545,6 +544,29 @@ StatusWith<std::vector<std::string>> extractSubjectAlternateNames(::CFDictionary
         ret.push_back(swNameStr.getValue());
     }
     return ret;
+}
+
+StatusWith<::SecCertificateRef> getCertificate(::CFArrayRef certs);
+
+StatusWith<std::vector<std::string>> extractSubjectAlternateNames(::CFArrayRef certs) {
+    auto swCert = getCertificate(certs);
+    if (!swCert.isOK()) {
+        return swCert.getStatus();
+    }
+    CFUniquePtr<::SecCertificateRef> cert(swCert.getValue());
+
+    CFUniquePtr<::CFMutableArrayRef> oids(
+        ::CFArrayCreateMutable(nullptr, 1, &::kCFTypeArrayCallBacks));
+    ::CFArrayAppendValue(oids.get(), ::kSecOIDSubjectAltName);
+
+    ::CFErrorRef err = nullptr;
+    CFUniquePtr<::CFDictionaryRef> cfdict(::SecCertificateCopyValues(cert.get(), oids.get(), &err));
+    CFUniquePtr<::CFErrorRef> cferror(err);
+    if (cferror) {
+        return Status(ErrorCodes::NoSuchKey, "Could not find Subject Alternative Name");
+    }
+
+    return extractSubjectAlternateNames(cfdict.get());
 }
 
 bool isCFDataEqual(::CFDataRef a, ::CFDataRef b) {
@@ -1251,8 +1273,7 @@ public:
 
     Status initSSLContext(asio::ssl::apple::Context* context,
                           const SSLParams& params,
-                          const TransientSSLParams& transientParams,
-                          ConnectionDirection direction) override final;
+                          ConnectionDirection direction) final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
@@ -1311,22 +1332,30 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
       _allowInvalidHostnames(params.sslAllowInvalidHostnames),
       _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning) {
 
-    uassertStatusOK(
-        initSSLContext(&_clientCtx, params, TransientSSLParams(), ConnectionDirection::kOutgoing));
+    uassertStatusOK(initSSLContext(&_clientCtx, params, ConnectionDirection::kOutgoing));
     if (_clientCtx.certs) {
         _sslConfiguration.clientSubjectName =
             uassertStatusOK(certificateGetSubject(_clientCtx.certs.get()));
     }
 
     if (isServer) {
-        uassertStatusOK(initSSLContext(
-            &_serverCtx, params, TransientSSLParams(), ConnectionDirection::kIncoming));
+        uassertStatusOK(initSSLContext(&_serverCtx, params, ConnectionDirection::kIncoming));
         if (_serverCtx.certs) {
             uassertStatusOK(
                 _sslConfiguration.setServerSubjectName(uassertStatusOK(certificateGetSubject(
                     _serverCtx.certs.get(), &_sslConfiguration.serverCertificateExpirationDate))));
             CertificateExpirationMonitor::get()->updateExpirationDeadline(
                 _sslConfiguration.serverCertificateExpirationDate);
+
+            auto swSans = extractSubjectAlternateNames(_serverCtx.certs.get());
+            const bool hasSan = swSans.isOK() && (0 != swSans.getValue().size());
+            if (!hasSan) {
+                LOGV2_WARNING_OPTIONS(
+                    551191,
+                    {logv2::LogTag::kStartupWarnings},
+                    "Server certificate has no compatible Subject Alternative Name. "
+                    "This may prevent TLS clients from connecting");
+            }
         }
     }
 
@@ -1394,7 +1423,6 @@ StatusWith<std::pair<::SSLProtocol, ::SSLProtocol>> parseProtocolRange(const SSL
 
 Status SSLManagerApple::initSSLContext(asio::ssl::apple::Context* context,
                                        const SSLParams& params,
-                                       const TransientSSLParams& transientParams,
                                        ConnectionDirection direction) {
     // Protocol Version.
     const auto swProto = parseProtocolRange(params);
@@ -1739,8 +1767,12 @@ Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
 int SSLManagerApple::SSL_read(SSLConnectionInterface* conn, void* buf, int num) {
     auto ssl = checked_cast<SSLConnectionApple*>(conn)->get();
     size_t read = 0;
-    uassertOSStatusOK(::SSLRead(ssl, static_cast<uint8_t*>(buf), num, &read),
-                      SocketErrorKind::RECV_ERROR);
+
+    const auto status = ::SSLRead(ssl, static_cast<uint8_t*>(buf), num, &read);
+    if (status != ::errSSLWouldBlock) {
+        uassertOSStatusOK(status, SocketErrorKind::RECV_ERROR);
+    }
+
     return read;
 }
 
@@ -1823,6 +1855,13 @@ bool isSSLServer = false;
 extern SSLManagerInterface* theSSLManager;
 extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(
+    const SSLParams& params,
+    const std::optional<TransientSSLParams>& transientSSLParams,
+    bool isServer) {
+    return std::make_shared<SSLManagerApple>(params, isServer);
+}
+
 std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return std::make_shared<SSLManagerApple>(params, isServer);
@@ -1836,7 +1875,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManagerCoordinator = new SSLManagerCoordinator();
     }
-    return Status::OK();
 }
 
 }  // namespace mongo

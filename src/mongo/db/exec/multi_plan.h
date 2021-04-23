@@ -36,6 +36,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_solution.h"
@@ -100,8 +101,8 @@ public:
     /** Return true if a best plan has been chosen  */
     bool bestPlanChosen() const;
 
-    /** Return the index of the best plan chosen, for testing */
-    int bestPlanIdx() const;
+    /** Return the index of the best plan chosen, or boost::none if there is no such plan. */
+    boost::optional<size_t> bestPlanIdx() const;
 
     /**
      * Returns the QuerySolution for the best plan, or NULL if no best plan.

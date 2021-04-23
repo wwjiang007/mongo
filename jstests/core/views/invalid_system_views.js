@@ -3,6 +3,7 @@
  * collections.
  *
  * @tags: [
+ *   assumes_unsharded_collection,
  *   # applyOps is not available on mongos.
  *   assumes_against_mongod_not_mongos,
  *   assumes_superuser_permissions,
@@ -10,6 +11,8 @@
  *   requires_non_retryable_writes,
  *   # applyOps uses the oplog that require replication support
  *   requires_replication,
+ *   # The drop of offending views may not happen on the donor after a committed migration.
+ *   tenant_migration_incompatible,
  * ]
  */
 

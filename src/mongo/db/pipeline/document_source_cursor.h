@@ -99,16 +99,30 @@ public:
         return _latestOplogTimestamp;
     }
 
+    /**
+     * Returns a postBatchResumeToken compatible with resharding oplog sync, if available.
+     * Otherwise, returns an empty object.
+     */
+    BSONObj getPostBatchResumeToken() const;
+
     const std::string& getPlanSummaryStr() const {
         return _planSummary;
     }
 
     const PlanSummaryStats& getPlanSummaryStats() const {
-        return _planSummaryStats;
+        return _stats.planSummaryStats;
     }
 
     bool usedDisk() final {
-        return _planSummaryStats.usedDisk;
+        return _stats.planSummaryStats.usedDisk;
+    }
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
+
+    const PlanExplainer::ExplainVersion& getExplainVersion() const {
+        return _exec->getPlanExplainer().getVersion();
     }
 
 protected:
@@ -229,7 +243,6 @@ private:
     Status _execStatus = Status::OK();
 
     std::string _planSummary;
-    PlanSummaryStats _planSummaryStats;
 
     // Used only for explain() queries. Stores the stats of the winning plan when a plan was
     // selected by the multi-planner. When the query is executed (with exec->executePlan()), it will
@@ -239,9 +252,12 @@ private:
     // True if we are tracking the latest observed oplog timestamp, false otherwise.
     bool _trackOplogTS = false;
 
-    // If we are tailing the oplog and tracking the latest observed oplog time, this is the latest
-    // timestamp seen in the collection. Otherwise, this is a null timestamp.
+    // If we are tracking the latest observed oplog time, this is the latest timestamp seen in the
+    // oplog. Otherwise, this is a null timestamp.
     Timestamp _latestOplogTimestamp;
+
+    // Specific stats for $cursor stage.
+    DocumentSourceCursorStats _stats;
 };
 
 }  // namespace mongo

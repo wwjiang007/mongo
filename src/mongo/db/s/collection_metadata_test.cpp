@@ -32,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/sharding_test_fixture_common.h"
@@ -42,23 +43,25 @@ namespace {
 
 using unittest::assertGet;
 
+const NamespaceString kNss("test.foo");
+const ShardId kThisShard("thisShard");
+const ShardId kOtherShard("otherShard");
+
 CollectionMetadata makeCollectionMetadataImpl(
     const KeyPattern& shardKeyPattern,
     const std::vector<std::pair<BSONObj, BSONObj>>& thisShardsChunks,
     bool staleChunkManager,
-    CoordinatorStateEnum state = CoordinatorStateEnum::kInitializing) {
+    UUID uuid = UUID::gen(),
+    boost::optional<TypeCollectionReshardingFields> reshardingFields = boost::none) {
 
     const OID epoch = OID::gen();
-    const NamespaceString kNss("test.foo");
-    const ShardId kThisShard("thisShard");
-    const ShardId kOtherShard("otherShard");
 
     const Timestamp kRouting(100, 0);
     const Timestamp kChunkManager(staleChunkManager ? 99 : 100, 0);
 
     std::vector<ChunkType> allChunks;
     auto nextMinKey = shardKeyPattern.globalMin();
-    ChunkVersion version{1, 0, epoch};
+    ChunkVersion version{1, 0, epoch, boost::none /* timestamp */};
     for (const auto& myNextChunk : thisShardsChunks) {
         if (SimpleBSONObjComparator::kInstance.evaluate(nextMinKey < myNextChunk.first)) {
             // Need to add a chunk to the other shard from nextMinKey to myNextChunk.first.
@@ -80,20 +83,19 @@ CollectionMetadata makeCollectionMetadataImpl(
         allChunks.back().setHistory({ChunkHistory(kRouting, kOtherShard)});
     }
 
-    TypeCollectionReshardingFields reshardingFields;
-    reshardingFields.setState(state);
-
     return CollectionMetadata(
         ChunkManager(kThisShard,
-                     DatabaseVersion(UUID::gen()),
+                     DatabaseVersion(uuid),
                      ShardingTestFixtureCommon::makeStandaloneRoutingTableHistory(
                          RoutingTableHistory::makeNew(kNss,
-                                                      UUID::gen(),
+                                                      uuid,
                                                       shardKeyPattern,
                                                       nullptr,
                                                       false,
                                                       epoch,
-                                                      reshardingFields,
+                                                      boost::none /* timestamp */,
+                                                      boost::none /* timeseriesFields */,
+                                                      std::move(reshardingFields),
                                                       true,
                                                       allChunks)),
                      kChunkManager),
@@ -108,8 +110,32 @@ struct ConstructedRangeMap : public RangeMap {
 class NoChunkFixture : public unittest::Test {
 protected:
     CollectionMetadata makeCollectionMetadata(
+        UUID existingUuid = UUID::gen(),
+        UUID reshardingUuid = UUID::gen(),
         CoordinatorStateEnum state = CoordinatorStateEnum::kInitializing) const {
-        return makeCollectionMetadataImpl(KeyPattern(BSON("a" << 1)), {}, false, state);
+
+        TypeCollectionReshardingFields reshardingFields{reshardingUuid};
+        reshardingFields.setState(state);
+
+        if (state == CoordinatorStateEnum::kDecisionPersisted) {
+            TypeCollectionRecipientFields recipientFields{
+                {kThisShard, kOtherShard}, existingUuid, kNss, 5000};
+            reshardingFields.setRecipientFields(std::move(recipientFields));
+        } else if (state == CoordinatorStateEnum::kBlockingWrites) {
+            TypeCollectionDonorFields donorFields{
+                constructTemporaryReshardingNss(kNss.db(), existingUuid),
+                KeyPattern{BSON("newKey" << 1)},
+                {kThisShard, kOtherShard}};
+            reshardingFields.setDonorFields(std::move(donorFields));
+        }
+
+        auto metadataUuid = (state >= CoordinatorStateEnum::kDecisionPersisted &&
+                             state != CoordinatorStateEnum::kError)
+            ? reshardingUuid
+            : existingUuid;
+
+        return makeCollectionMetadataImpl(
+            KeyPattern(BSON("a" << 1)), {}, false, metadataUuid, reshardingFields);
     }
 };
 
@@ -180,28 +206,76 @@ TEST_F(NoChunkFixture, OrphanedDataRangeEnd) {
     ASSERT(!metadata.getNextOrphanRange(pending, metadata.getMaxKey()));
 }
 
-TEST_F(NoChunkFixture, WritesShouldRunInDistributedTxnRenamingCheck) {
-    auto metadata(makeCollectionMetadata(CoordinatorStateEnum::kRenaming));
-    // We are in kRenaming by default.
-    OID originalEpoch = OID::gen();
-    OID reshardingEpoch = OID::gen();
+TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedWithOrigUUID) {
+    UUID originalUUID = UUID::gen();
+    UUID reshardingUUID = UUID::gen();
 
-    // Writes should run in a distributed txn if the collection metadata's epoch matches
-    // the original collection's epoch.
-    ASSERT(metadata.writesShouldRunInDistributedTransaction(metadata.getCollVersion().epoch(),
-                                                            reshardingEpoch));
+    auto metadata = makeCollectionMetadata(
+        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
 
-    // Writes should NOT run in a distributed txn when the epoch matches the temp collection's
-    // epoch.
-    ASSERT(!metadata.writesShouldRunInDistributedTransaction(originalEpoch,
-                                                             metadata.getCollVersion().epoch()));
+    // Writes should be disallowed if the collection metadata's UUID matches the original
+    // collection's UUID.
+    ASSERT(metadata.disallowWritesForResharding(originalUUID));
+}
 
-    // If the collection's epoch matches neither the original epoch nor the resharding epoch,
-    // expect a throw.
-    ASSERT_THROWS_CODE(
-        metadata.writesShouldRunInDistributedTransaction(originalEpoch, reshardingEpoch),
-        AssertionException,
-        5169400);
+TEST_F(NoChunkFixture, AllowWritesInDecisionPersistedWithReshardingUUID) {
+    UUID originalUUID = UUID::gen();
+    UUID reshardingUUID = UUID::gen();
+
+    auto metadata = makeCollectionMetadata(
+        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
+
+    // Writes should NOT be disallowed when the UUID matches the temp collection's
+    // UUID.
+    ASSERT(!metadata.disallowWritesForResharding(reshardingUUID));
+}
+
+TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedThrows) {
+    UUID originalUUID = UUID::gen();
+    UUID reshardingUUID = UUID::gen();
+    UUID rogueUUID = UUID::gen();
+
+    auto metadata = makeCollectionMetadata(
+        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
+
+    // If the collection's UUID matches neither the original UUID nor the resharding UUID,
+    // expect an exception.
+    ASSERT_THROWS_CODE(metadata.disallowWritesForResharding(rogueUUID),
+                       AssertionException,
+                       ErrorCodes::InvalidUUID);
+}
+
+TEST_F(NoChunkFixture, DisallowWritesInApplyingWithOrigUUID) {
+    UUID originalUUID = UUID::gen();
+    UUID reshardingUUID = UUID::gen();
+
+    auto metadata =
+        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kApplying);
+
+    // Writes should NOT be disallowed if the coordinator state is applying.
+    ASSERT(!metadata.disallowWritesForResharding(originalUUID));
+}
+
+TEST_F(NoChunkFixture, DisallowWritesInBlockingWritesWithOrigUUID) {
+    UUID originalUUID = UUID::gen();
+    UUID reshardingUUID = UUID::gen();
+
+    auto metadata =
+        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kBlockingWrites);
+
+    // Writes should be disallowed if the coordinator state is blocking-writes.
+    ASSERT(metadata.disallowWritesForResharding(originalUUID));
+}
+
+TEST_F(NoChunkFixture, DisallowWritesInErrorWithOrigUUID) {
+    UUID originalUUID = UUID::gen();
+    UUID reshardingUUID = UUID::gen();
+
+    auto metadata =
+        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kError);
+
+    // Writes should NOT be disallowed if the coordinator state is error.
+    ASSERT(!metadata.disallowWritesForResharding(originalUUID));
 }
 
 /**

@@ -41,6 +41,7 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/resharding/resume_token_gen.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
@@ -69,7 +70,8 @@ bool DocumentSourceCursor::Batch::isEmpty() const {
 void DocumentSourceCursor::Batch::enqueue(Document&& doc) {
     switch (_type) {
         case CursorType::kRegular: {
-            _batchOfDocs.push_back(doc.getOwned());
+            invariant(doc.isOwned());
+            _batchOfDocs.push_back(std::move(doc));
             _memUsageBytes += _batchOfDocs.back().getApproximateSize();
             break;
         }
@@ -136,11 +138,12 @@ void DocumentSourceCursor::loadBatch() {
     Document resultObj;
 
     boost::optional<AutoGetCollectionForReadMaybeLockFree> autoColl;
-    if (_exec->lockPolicy() == PlanExecutor::LockPolicy::kLockExternally) {
-        autoColl.emplace(pExpCtx->opCtx, _exec->nss());
-        uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
-                            ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
-    }
+    tassert(5565800,
+            "Expected PlanExecutor to use an external lock policy",
+            _exec->lockPolicy() == PlanExecutor::LockPolicy::kLockExternally);
+    autoColl.emplace(pExpCtx->opCtx, _exec->nss());
+    uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
+                        ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
 
     _exec->restoreState(autoColl ? &autoColl->getCollection() : nullptr);
 
@@ -163,9 +166,10 @@ void DocumentSourceCursor::loadBatch() {
 
         invariant(state == PlanExecutor::IS_EOF);
 
-        // Special case for tailable cursor -- EOF doesn't preclude more results, so keep
-        // the PlanExecutor alive.
-        if (pExpCtx->isTailableAwaitData()) {
+        // Keep the inner PlanExecutor alive if the cursor is tailable, since more results may
+        // become available in the future, or if we are tracking the latest oplog timestamp, since
+        // we will need to retrieve the last timestamp the executor observed before hitting EOF.
+        if (_trackOplogTS || pExpCtx->isTailableAwaitData()) {
             _exec->saveState();
             return;
         }
@@ -175,8 +179,8 @@ void DocumentSourceCursor::loadBatch() {
         throw;
     }
 
-    // If we got here, there won't be any more documents, so destroy our PlanExecutor. Note we must
-    // hold a collection lock to destroy '_exec'.
+    // If we got here, there won't be any more documents and we no longer need our PlanExecutor, so
+    // destroy it.
     cleanupExecutor();
 }
 
@@ -195,7 +199,7 @@ void DocumentSourceCursor::_updateOplogTimestamp() {
 
 void DocumentSourceCursor::recordPlanSummaryStats() {
     invariant(_exec);
-    _exec->getPlanExplainer().getSummaryStats(&_planSummaryStats);
+    _exec->getPlanExplainer().getSummaryStats(&_stats.planSummaryStats);
 }
 
 Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
@@ -277,6 +281,13 @@ void DocumentSourceCursor::cleanupExecutor() {
     }
 }
 
+BSONObj DocumentSourceCursor::getPostBatchResumeToken() const {
+    if (_trackOplogTS) {
+        return ResumeTokenOplogTimestamp{getLatestOplogTimestamp()}.toBSON();
+    }
+    return BSONObj{};
+}
+
 DocumentSourceCursor::~DocumentSourceCursor() {
     if (pExpCtx->explain) {
         invariant(_exec->isDisposed());  // _exec should have at least been disposed.
@@ -314,7 +325,7 @@ DocumentSourceCursor::DocumentSourceCursor(
 
     if (collection) {
         CollectionQueryInfo::get(collection)
-            .notifyOfQuery(pExpCtx->opCtx, collection, _planSummaryStats);
+            .notifyOfQuery(pExpCtx->opCtx, collection, _stats.planSummaryStats);
     }
 }
 
