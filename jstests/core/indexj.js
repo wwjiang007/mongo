@@ -3,18 +3,20 @@
 // change depending on whether/how many documents are filtered out by the SHARDING_FILTER stage.
 // @tags: [
 //   assumes_unsharded_collection,
+//   # This test makes assertions about the types of plans produced by the query engine, which has
+//   # changed from the classic engine starting in version 5.0.
+//   requires_fcv_50,
 // ]
 
 (function() {
 "use strict";
 
+load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
+
 const t = db[jsTestName()];
 t.drop();
 
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSBEEnabled = checkSBEEnabled(db);
 
 function keysExamined(query, hint, sort) {
     if (!hint) {

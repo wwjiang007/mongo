@@ -80,50 +80,49 @@ static optional<boost::intrusive_ptr<ExpressionFieldPath>> exprFromSort(
 
 PartitionIterator::PartitionIterator(ExpressionContext* expCtx,
                                      DocumentSource* source,
+                                     MemoryUsageTracker* tracker,
                                      optional<boost::intrusive_ptr<Expression>> partitionExpr,
                                      const optional<SortPattern>& sortPattern)
     : _expCtx(expCtx),
       _source(source),
       _partitionExpr(std::move(partitionExpr)),
       _sortExpr(exprFromSort(_expCtx, sortPattern)),
-      _state(IteratorState::kNotInitialized) {}
+      _state(IteratorState::kNotInitialized),
+      _cache(std::make_unique<SpillableCache>(_expCtx, tracker)),
+      _tracker(tracker) {}
 
 optional<Document> PartitionIterator::operator[](int index) {
-    auto desired = _currentCacheIndex + index;
+    auto docDesired = _indexOfCurrentInPartition + index;
 
-    if (_state == IteratorState::kAdvancedToEOF)
+    if (_state == IteratorState::kAdvancedToEOF) {
         return boost::none;
-
-    // Check that the caller is not attempting to access a document which has been released
-    // already.
-    tassert(5371202,
-            str::stream() << "Invalid access of expired document in partition at index " << desired,
-            desired >= 0 || ((_currentPartitionIndex + index) < 0));
+    }
 
     // Case 0: Outside of lower bound of partition.
-    if (desired < 0)
+    if (docDesired < 0)
         return boost::none;
-
     // Case 1: Document is in the cache already.
-    if (desired >= 0 && desired < (int)_cache.size())
-        return _cache[desired];
+    if (_cache->isIdInCache(docDesired)) {
+        return _cache->getDocumentById(docDesired);
+    }
 
     // Case 2: Attempting to access index greater than what the cache currently holds. If we've
     // already exhausted the partition, then early return. Otherwise continue to pull in
     // documents from the prior stage until we get to the desired index or reach the next partition.
     if (_state == IteratorState::kAwaitingAdvanceToNext ||
-        _state == IteratorState::kAwaitingAdvanceToEOF)
+        _state == IteratorState::kAwaitingAdvanceToEOF) {
         return boost::none;
-    for (int i = _cache.size(); i <= desired; i++) {
+    }
+    for (int i = _cache->getHighestIndex(); i < docDesired; i++) {
         // Pull in document from prior stage.
         getNextDocument();
         // Check for EOF or the next partition.
         if (_state == IteratorState::kAwaitingAdvanceToNext ||
-            _state == IteratorState::kAwaitingAdvanceToEOF)
+            _state == IteratorState::kAwaitingAdvanceToEOF) {
             return boost::none;
+        }
     }
-
-    return _cache[desired];
+    return _cache->getDocumentById(docDesired);
 }
 
 void PartitionIterator::releaseExpired() {
@@ -136,37 +135,27 @@ void PartitionIterator::releaseExpired() {
     // * All executors have expired at least index N
     // * The current index has advanced past N. We need to keep around the "current" document since
     //   the aggregation stage hasn't projected the output fields yet.
-    auto minIndex = _slots[0];
+    auto minIndex = std::min(_slots[0], _indexOfCurrentInPartition - 1);
     for (auto&& cacheIndex : _slots) {
         minIndex = std::min(minIndex, cacheIndex);
     }
 
-    auto newCurrent = _currentCacheIndex;
-    for (auto i = 0; i <= minIndex && i < _currentCacheIndex; i++) {
-        _cache.pop_front();
-        newCurrent--;
-    }
-
-    // Adjust the expired indexes for each slot since some documents may have been freed
-    // from the front of the cache.
-    if (newCurrent == _currentCacheIndex)
-        return;
-    for (size_t slot = 0; slot < _slots.size(); slot++) {
-        _slots[slot] -= (_currentCacheIndex - newCurrent);
-    }
-    _currentCacheIndex = newCurrent;
+    _cache->freeUpTo(minIndex);
 }
 
 PartitionIterator::AdvanceResult PartitionIterator::advance() {
-    // After advancing the iterator, check whether there are any documents that can be released from
-    // the cache.
-    ON_BLOCK_EXIT([&] { releaseExpired(); });
+    auto retVal = advanceInternal();
+    // After advancing the iterator, check whether there are any documents that can be
+    // released from the cache.
+    releaseExpired();
+    return retVal;
+}
 
+PartitionIterator::AdvanceResult PartitionIterator::advanceInternal() {
     // Check if the next document is in the cache.
-    if ((_currentCacheIndex + 1) < (int)_cache.size()) {
+    if ((_indexOfCurrentInPartition + 1) <= _cache->getHighestIndex()) {
         // Same partition, update the current index.
-        _currentCacheIndex++;
-        _currentPartitionIndex++;
+        _indexOfCurrentInPartition++;
         return AdvanceResult::kAdvanced;
     }
 
@@ -186,8 +175,7 @@ PartitionIterator::AdvanceResult PartitionIterator::advance() {
                 return AdvanceResult::kNewPartition;
             } else {
                 // Same partition, update the current index.
-                _currentCacheIndex++;
-                _currentPartitionIndex++;
+                _indexOfCurrentInPartition++;
                 return AdvanceResult::kAdvanced;
             }
         case IteratorState::kAwaitingAdvanceToNext:
@@ -427,8 +415,9 @@ optional<std::pair<int, int>> PartitionIterator::getEndpointsDocumentBased(
         cacheWholePartition();
     }
 
-    // Valid offsets into the cache are any 'i' such that '_cache[_currentCacheIndex + i]' is valid.
-    // We know the cache is nonempty because it contains the current document.
+    // Valid offsets into the cache are any 'i' such that
+    // '_cache->getDocumentById(_indexOfCurrentInPartition + i)' is valid. We know the cache is
+    // nonempty because it contains the current document.
     int cacheOffsetMin = getMinCachedOffset();
     int cacheOffsetMax = getMaxCachedOffset();
 
@@ -482,33 +471,27 @@ void PartitionIterator::getNextDocument() {
         return;
 
     auto doc = getNextRes.releaseDocument();
+
+    // Greedily populate the internal document cache to enable easier memory tracking versus
+    // detecting the changing document size during execution of each function.
+    doc.fillCache();
+
     if (_partitionExpr) {
-        // Because partitioning is achieved by sorting in $setWindowFields, and missing fields and
-        // nulls are considered equivalent in sorting, documents with missing fields and nulls may
-        // interleave with each other, resulting in these documents processed into many separate
-        // partitions (null, missing, null, missing). However, it is still guranteed that all nulls
-        // and missing values will be grouped together after sorting. To address this issue, we
-        // coerce documents with the missing fields to null partition, which is also consistent with
-        // the approach in $group.
-        auto retValue = (*_partitionExpr)->evaluate(doc, &_expCtx->variables);
-        auto curKey = retValue.missing() ? Value(BSONNULL) : std::move(retValue);
-        uassert(ErrorCodes::TypeMismatch,
-                "Cannot 'partitionBy' an expression of type array",
-                !curKey.isArray());
         if (_state == IteratorState::kNotInitialized) {
-            _nextPartition = NextPartitionState{std::move(doc), std::move(curKey)};
+            _partitionComparator =
+                std::make_unique<PartitionKeyComparator>(_expCtx, *_partitionExpr, doc);
+            _nextPartitionDoc = std::move(doc);
+            _tracker->update(getNextPartitionStateSize());
             advanceToNextPartition();
-        } else if (_expCtx->getValueComparator().compare(curKey, _partitionKey) != 0) {
-            _nextPartition = NextPartitionState{std::move(doc), std::move(curKey)};
-            _memUsageBytes += getNextPartitionStateSize();
+        } else if (_partitionComparator->isDocumentNewPartition(doc)) {
+            _nextPartitionDoc = std::move(doc);
+            _tracker->update(getNextPartitionStateSize());
             _state = IteratorState::kAwaitingAdvanceToNext;
         } else {
-            _memUsageBytes += doc.getApproximateSize();
-            _cache.emplace_back(std::move(doc));
+            _cache->addDocument(std::move(doc));
         }
     } else {
-        _memUsageBytes += doc.getApproximateSize();
-        _cache.emplace_back(std::move(doc));
+        _cache->addDocument(std::move(doc));
         _state = IteratorState::kIntraPartition;
     }
 }

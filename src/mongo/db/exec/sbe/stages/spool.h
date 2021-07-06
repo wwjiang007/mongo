@@ -45,6 +45,10 @@ namespace mongo::sbe {
  * This producer spool can be connected with multiple consumer spools via a shared 'SpoolBuffer'.
  * This stage will be responsible for populating the buffer, while consumers will read from the
  * buffer once its populated, each using its own read pointer.
+ *
+ * Debug string representation:
+ *
+ *   espool spoolId [<vals>] childStage
  */
 class SpoolEagerProducerStage final : public PlanStage {
 public:
@@ -92,6 +96,10 @@ private:
  * This spool can be parameterized with an optional predicate which can be used to filter the input
  * and store only portion of input data into the buffer. Filtered out input data is passed through
  * without being stored into the buffer.
+ *
+ * Debug string representation:
+ *
+ *   lspool spoolId [<vals>] { predicate }? childStage
  */
 class SpoolLazyProducerStage final : public PlanStage {
 public:
@@ -113,13 +121,16 @@ public:
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
 
+protected:
+    void doSaveState() final;
+
 private:
     std::shared_ptr<SpoolBuffer> _buffer{nullptr};
     const SpoolId _spoolId;
 
     const value::SlotVector _vals;
     std::vector<value::SlotAccessor*> _inAccessors;
-    value::SlotMap<value::ViewOfValueAccessor> _outAccessors;
+    value::SlotMap<value::OwnedValueAccessor> _outAccessors;
 
     std::unique_ptr<EExpression> _predicate;
     std::unique_ptr<vm::CodeFragment> _predicateCode;
@@ -142,6 +153,11 @@ private:
  * example, the lazy spool can add values [1,2,3], then the stack consumer spool will read and
  * delete 3, then another two values can be added to the buffer [1,2,4,5], then the consumer spool
  * will read and delete 5, and so on.
+ *
+ * Debug string representations:
+ *
+ *   cspool spoolId [<vals>]
+ *   sspool spoolId [<vals>]
  */
 template <bool IsStack>
 class SpoolConsumerStage final : public PlanStage {
@@ -217,7 +233,7 @@ public:
     void close() {
         auto optTimer(getOptTimer(_opCtx));
 
-        _commonStats.closes++;
+        trackClose();
     }
 
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const {

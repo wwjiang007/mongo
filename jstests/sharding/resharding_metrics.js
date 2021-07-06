@@ -29,28 +29,37 @@ function verifyMetrics(metrics, expected) {
     }
 }
 
-function verifyServerStatusOutput(reshardingTest, inputCollection, expectedMetrics) {
-    function testMetricsArePresent(mongo) {
-        const stats = mongo.getDB('admin').serverStatus({});
-        assert(stats.hasOwnProperty('shardingStatistics'), stats);
-        const shardingStats = stats.shardingStatistics;
-        assert(shardingStats.hasOwnProperty('resharding'),
-               `Missing resharding section in ${tojson(shardingStats)}`);
+function testMetricsArePresent(mongo, expectedMetrics) {
+    const stats = mongo.getDB('admin').serverStatus({});
+    assert(stats.hasOwnProperty('shardingStatistics'), stats);
+    const shardingStats = stats.shardingStatistics;
+    assert(shardingStats.hasOwnProperty('resharding'),
+           `Missing resharding section in ${tojson(shardingStats)}`);
 
-        const metrics = shardingStats.resharding;
-        verifyMetrics(metrics, expectedMetrics);
-    }
+    const metrics = shardingStats.resharding;
+    verifyMetrics(metrics, expectedMetrics);
+}
 
+function verifyParticipantServerStatusOutput(reshardingTest, inputCollection, expectedMetrics) {
     const donorShardNames = reshardingTest.donorShardNames;
     const recipientShardNames = reshardingTest.recipientShardNames;
 
     const mongos = inputCollection.getMongo();
     const topology = DiscoverTopology.findConnectedNodes(mongos);
 
-    testMetricsArePresent(new Mongo(topology.shards[donorShardNames[0]].primary));
-    testMetricsArePresent(new Mongo(topology.shards[donorShardNames[1]].primary));
-    testMetricsArePresent(new Mongo(topology.shards[recipientShardNames[0]].primary));
-    testMetricsArePresent(new Mongo(topology.shards[recipientShardNames[1]].primary));
+    testMetricsArePresent(new Mongo(topology.shards[donorShardNames[0]].primary), expectedMetrics);
+    testMetricsArePresent(new Mongo(topology.shards[donorShardNames[1]].primary), expectedMetrics);
+    testMetricsArePresent(new Mongo(topology.shards[recipientShardNames[0]].primary),
+                          expectedMetrics);
+    testMetricsArePresent(new Mongo(topology.shards[recipientShardNames[1]].primary),
+                          expectedMetrics);
+}
+
+function verifyCoordinatorServerStatusOutput(inputCollection, expectedMetrics) {
+    const mongos = inputCollection.getMongo();
+    const topology = DiscoverTopology.findConnectedNodes(mongos);
+
+    testMetricsArePresent(new Mongo(topology.configsvr.primary), expectedMetrics);
 }
 
 // Tests the currentOp output for each donor, each recipient, and the coordinator.
@@ -91,10 +100,9 @@ function verifyCurrentOpOutput(reshardingTest, inputCollection) {
             "op": "command",
             "ns": kNamespace,
             "originatingCommand": undefined,
-            "totalOperationTimeElapsed": undefined,
-            "remainingOperationTimeEstimated": undefined,
+            "totalOperationTimeElapsedSecs": undefined,
             "countWritesDuringCriticalSection": 0,
-            "totalCriticalSectionTimeElapsed": undefined,
+            "totalCriticalSectionTimeElapsedSecs": undefined,
             "donorState": undefined,
             "opStatus": "running",
         });
@@ -106,16 +114,16 @@ function verifyCurrentOpOutput(reshardingTest, inputCollection) {
             "op": "command",
             "ns": kNamespace,
             "originatingCommand": undefined,
-            "totalOperationTimeElapsed": undefined,
-            "remainingOperationTimeEstimated": undefined,
+            "totalOperationTimeElapsedSecs": undefined,
+            "remainingOperationTimeEstimatedSecs": undefined,
             "approxDocumentsToCopy": undefined,
             "approxBytesToCopy": undefined,
             "documentsCopied": undefined,
             "bytesCopied": undefined,
-            "totalCopyTimeElapsed": undefined,
+            "totalCopyTimeElapsedSecs": undefined,
             "oplogEntriesFetched": undefined,
             "oplogEntriesApplied": undefined,
-            "totalApplyTimeElapsed": undefined,
+            "totalApplyTimeElapsedSecs": undefined,
             "recipientState": undefined,
             "opStatus": "running",
         });
@@ -126,8 +134,7 @@ function verifyCurrentOpOutput(reshardingTest, inputCollection) {
         "op": "command",
         "ns": kNamespace,
         "originatingCommand": undefined,
-        "totalOperationTimeElapsed": undefined,
-        "remainingOperationTimeEstimated": undefined,
+        "totalOperationTimeElapsedSecs": undefined,
         "coordinatorState": undefined,
         "opStatus": "running",
     });
@@ -155,9 +162,11 @@ var initialServerStatusMetrics = {
     "bytesCopied": 0,
     "oplogEntriesApplied": 0,
     "countWritesDuringCriticalSection": 0,
+    "lastOpEndingChunkImbalance": 0,
 };
 
-verifyServerStatusOutput(reshardingTest, inputCollection, initialServerStatusMetrics);
+verifyParticipantServerStatusOutput(reshardingTest, inputCollection, initialServerStatusMetrics);
+verifyCoordinatorServerStatusOutput(inputCollection, {lastOpEndingChunkImbalance: 0});
 
 var documentsInserted = [
     {_id: "stays on shard0", oldKey: -10, newKey: -10},
@@ -174,7 +183,10 @@ reshardingTest.withReshardingInBackground(  //
         newShardKeyPattern: {newKey: 1},
         newChunks: [
             {min: {newKey: MinKey}, max: {newKey: 0}, shard: recipientShardNames[0]},
-            {min: {newKey: 0}, max: {newKey: MaxKey}, shard: recipientShardNames[1]},
+            {min: {newKey: 0}, max: {newKey: 10}, shard: recipientShardNames[1]},
+            {min: {newKey: 10}, max: {newKey: 20}, shard: recipientShardNames[1]},
+            {min: {newKey: 20}, max: {newKey: 30}, shard: recipientShardNames[1]},
+            {min: {newKey: 30}, max: {newKey: MaxKey}, shard: recipientShardNames[1]},
         ],
     },
     (tempNs) => {
@@ -188,11 +200,13 @@ var finalServerStatusMetrics = {
     "countReshardingCanceled": 0,
     "documentsCopied": 2,
     "bytesCopied": Object.bsonsize(documentsInserted[1]) + Object.bsonsize(documentsInserted[2]),
-    "oplogEntriesApplied": 0,
+    "oplogEntriesApplied": 2,
     "countWritesDuringCriticalSection": 0,
+    "lastOpEndingChunkImbalance": 0,
 };
 
-verifyServerStatusOutput(reshardingTest, inputCollection, finalServerStatusMetrics);
+verifyParticipantServerStatusOutput(reshardingTest, inputCollection, finalServerStatusMetrics);
+verifyCoordinatorServerStatusOutput(inputCollection, {lastOpEndingChunkImbalance: 3});
 
 reshardingTest.teardown();
 })();

@@ -231,7 +231,8 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
         for (size_t i = 0; i < indexSpecs.size(); i++) {
             BSONObj info = indexSpecs[i];
             StatusWith<BSONObj> statusWithInfo =
-                collection->getIndexCatalog()->prepareSpecForCreate(opCtx, info, resumeInfo);
+                collection->getIndexCatalog()->prepareSpecForCreate(
+                    opCtx, collection.get(), info, resumeInfo);
             Status status = statusWithInfo.getStatus();
             if (!status.isOK()) {
                 // If we were given two identical indexes to build, we will run into an error trying
@@ -444,10 +445,13 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
                       RecoveryUnit::toString(opCtx->recoveryUnit()->getTimestampReadSource()),
                   "duration"_attr = duration_cast<Milliseconds>(Seconds(timer.seconds())));
         } catch (DBException& ex) {
-            if (ex.code() == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
+            if (ex.code() == ErrorCodes::ReadConcernMajorityNotAvailableYet ||
+                ex.code() == ErrorCodes::CappedPositionLost) {
                 // Forced replica set re-configs will clear the majority committed snapshot,
                 // which may be used by the collection scan. The collection scan will restart
-                // from the beginning in this case.
+                // from the beginning in this case. Capped cursors are invalidated when the document
+                // they were positioned on gets deleted. The collection scan will restart in both
+                // cases.
                 restartCollectionScan = true;
                 logAndBackoff(
                     5470300,
@@ -590,7 +594,7 @@ void MultiIndexBlock::_doCollectionScan(OperationContext* opCtx,
 
         // The external sorter is not part of the storage engine and therefore does not need
         // a WriteUnitOfWork to write keys.
-        uassertStatusOK(_insert(opCtx, objToIndex, loc));
+        uassertStatusOK(_insert(opCtx, collection, objToIndex, loc));
 
         _failPointHangDuringBuild(opCtx,
                                   &hangIndexBuildDuringCollectionScanPhaseAfterInsertion,
@@ -604,13 +608,18 @@ void MultiIndexBlock::_doCollectionScan(OperationContext* opCtx,
     }
 }
 
-Status MultiIndexBlock::insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
-                                                                     const BSONObj& doc,
-                                                                     const RecordId& loc) {
-    return _insert(opCtx, doc, loc);
+Status MultiIndexBlock::insertSingleDocumentForInitialSyncOrRecovery(
+    OperationContext* opCtx,
+    const CollectionPtr& collection,
+    const BSONObj& doc,
+    const RecordId& loc) {
+    return _insert(opCtx, collection, doc, loc);
 }
 
-Status MultiIndexBlock::_insert(OperationContext* opCtx, const BSONObj& doc, const RecordId& loc) {
+Status MultiIndexBlock::_insert(OperationContext* opCtx,
+                                const CollectionPtr& collection,
+                                const BSONObj& doc,
+                                const RecordId& loc) {
     invariant(!_buildIsCleanedUp);
     for (size_t i = 0; i < _indexes.size(); i++) {
         if (_indexes[i].filterExpression && !_indexes[i].filterExpression->matchesBSON(doc)) {
@@ -622,7 +631,7 @@ Status MultiIndexBlock::_insert(OperationContext* opCtx, const BSONObj& doc, con
         // When calling insert, BulkBuilderImpl's Sorter performs file I/O that may result in an
         // exception.
         try {
-            idxStatus = _indexes[i].bulk->insert(opCtx, doc, loc, _indexes[i].options);
+            idxStatus = _indexes[i].bulk->insert(opCtx, collection, doc, loc, _indexes[i].options);
         } catch (...) {
             return exceptionToStatus();
         }

@@ -67,7 +67,7 @@ public:
     virtual ~ReplicationCoordinatorMock();
 
     virtual void startup(OperationContext* opCtx,
-                         LastStorageEngineShutdownState lastStorageEngineShutdownState);
+                         StorageEngine::LastShutdownState lastShutdownState);
 
     virtual void enterTerminalShutdown();
 
@@ -99,7 +99,7 @@ public:
 
     virtual Seconds getSecondaryDelaySecs() const;
 
-    virtual void clearSyncSourceBlacklist();
+    virtual void clearSyncSourceDenylist();
 
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
@@ -197,6 +197,31 @@ public:
 
     virtual ReplSetConfig getConfig() const;
 
+    virtual ConnectionString getConfigConnectionString() const override;
+
+    virtual Milliseconds getConfigElectionTimeoutPeriod() const override;
+
+    virtual std::vector<MemberConfig> getConfigVotingMembers() const override;
+
+    virtual std::int64_t getConfigTerm() const override;
+
+    virtual std::int64_t getConfigVersion() const override;
+
+    virtual ConfigVersionAndTerm getConfigVersionAndTerm() const override;
+
+    virtual int getConfigNumMembers() const override;
+
+    virtual Milliseconds getConfigHeartbeatTimeoutPeriodMillis() const override;
+
+    virtual BSONObj getConfigBSON() const override;
+
+    virtual const MemberConfig* findConfigMemberByHostAndPort(
+        const HostAndPort& hap) const override;
+
+    virtual bool isConfigLocalHostAllowed() const override;
+
+    virtual Milliseconds getConfigHeartbeatInterval() const override;
+
     virtual void processReplSetGetConfig(BSONObjBuilder* result,
                                          bool commitmentStatus = false,
                                          bool includeNewlyAdded = false);
@@ -246,7 +271,7 @@ public:
 
     virtual HostAndPort chooseNewSyncSource(const OpTime& lastOpTimeFetched);
 
-    virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
+    virtual void denylistSyncSource(const HostAndPort& host, Date_t until);
 
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx);
 

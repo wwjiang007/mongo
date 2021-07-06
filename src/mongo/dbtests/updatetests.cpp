@@ -44,6 +44,7 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/idl/server_parameter_test_util.h"
 
 namespace UpdateTests {
 
@@ -65,16 +66,6 @@ public:
     }
 
 protected:
-    void insert(const char* ns, BSONObj o) {
-        _client.insert(ns, o);
-    }
-    void update(const char* ns, BSONObj q, BSONObj o, bool upsert = 0) {
-        _client.update(ns, Query(q), o, upsert);
-    }
-    bool error() {
-        return !_client.getLastError().empty();
-    }
-
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
     DBDirectClient _client;
@@ -85,9 +76,8 @@ public:
     virtual ~Fail() {}
     void run() {
         prep();
-        ASSERT(!error());
-        doIt();
-        ASSERT(error());
+        BSONObj response = doIt();
+        ASSERT_NOT_OK(getStatusFromWriteCommandReply(response));
     }
 
 protected:
@@ -95,70 +85,66 @@ protected:
         return "unittests.UpdateTests_Fail";
     }
     virtual void prep() {
-        insert(ns(), fromjson("{a:1}"));
+        auto response = _client.insertAcknowledged(ns(), {fromjson("{a:1}")});
+        ASSERT_EQ(1, response["n"].Int());
     }
-    virtual void doIt() = 0;
+    virtual BSONObj doIt() = 0;
 };
 
 class ModId : public Fail {
-    void doIt() {
-        update(ns(), BSONObj(), fromjson("{$set:{'_id':4}}"));
+    BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$set:{'_id':4}}"));
     }
 };
 
 class ModNonmodMix : public Fail {
-    void doIt() {
-        update(ns(), BSONObj(), fromjson("{$set:{a:4},z:3}"));
+    BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$set:{a:4},z:3}"));
     }
 };
 
 class InvalidMod : public Fail {
-    void doIt() {
-        update(ns(), BSONObj(), fromjson("{$awk:{a:4}}"));
+    BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$awk:{a:4}}"));
     }
 };
 
 class ModNotFirst : public Fail {
-    void doIt() {
-        update(ns(), BSONObj(), fromjson("{z:3,$set:{a:4}}"));
+    BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{z:3,$set:{a:4}}"));
     }
 };
 
 class ModDuplicateFieldSpec : public Fail {
-    void doIt() {
-        update(ns(), BSONObj(), fromjson("{$set:{a:4},$inc:{a:1}}"));
+    BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$set:{a:4},$inc:{a:1}}"));
     }
 };
 
 class IncNonNumber : public Fail {
-    void doIt() {
-        update(ns(), BSONObj(), fromjson("{$inc:{a:'d'}}"));
+    BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$inc:{a:'d'}}"));
     }
 };
 
 class PushAllNonArray : public Fail {
-    void doIt() {
-        insert(ns(), fromjson("{a:[1]}"));
-        update(ns(), BSONObj(), fromjson("{$pushAll:{a:'d'}}"));
+    BSONObj doIt() {
+        _client.insert(ns(), fromjson("{a:[1]}"));
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$pushAll:{a:'d'}}"));
     }
 };
 
 class PullAllNonArray : public Fail {
-    void doIt() {
-        insert(ns(), fromjson("{a:[1]}"));
-        update(ns(), BSONObj(), fromjson("{$pullAll:{a:'d'}}"));
+    BSONObj doIt() {
+        _client.insert(ns(), fromjson("{a:[1]}"));
+        return _client.updateAcknowledged(ns(), BSONObj(), fromjson("{$pullAll:{a:'d'}}"));
     }
 };
 
 class IncTargetNonNumber : public Fail {
-    void doIt() {
-        insert(ns(),
-               BSON("a"
-                    << "a"));
-        update(ns(),
-               BSON("a"
-                    << "a"),
-               fromjson("{$inc:{a:1}}"));
+    BSONObj doIt() {
+        _client.insert(ns(), fromjson("{a:'a'}"));
+        return _client.updateAcknowledged(ns(), fromjson("{a:'a'}"), fromjson("{$inc:{a:1}}"));
     }
 };
 
@@ -541,8 +527,8 @@ public:
 
 class InvalidEmbeddedSet : public Fail {
 public:
-    virtual void doIt() {
-        _client.update(ns(), Query(), BSON("$set" << BSON("a." << 1)));
+    virtual BSONObj doIt() {
+        return _client.updateAcknowledged(ns(), Query(), BSON("$set" << BSON("a." << 1)));
     }
 };
 
@@ -1740,8 +1726,9 @@ public:
 class CheckNoMods : public SetBase {
 public:
     void run() {
-        _client.update(ns(), BSONObj(), BSON("i" << 5 << "$set" << BSON("q" << 3)), true);
-        ASSERT(error());
+        _client.update(ns(), BSONObj(), BSON("_id" << 52307 << "$set" << BSON("q" << 3)), true);
+        ASSERT_BSONOBJ_EQ(fromjson("{'_id':52307,$set:{q:3}}"),
+                          _client.findOne(ns(), Query(BSON("_id" << 52307))));
     }
 };
 

@@ -46,7 +46,10 @@ namespace mongo::sbe {
 CandidatePlans MultiPlanner::plan(
     std::vector<std::unique_ptr<QuerySolution>> solutions,
     std::vector<std::pair<std::unique_ptr<PlanStage>, stage_builder::PlanStageData>> roots) {
-    auto candidates = collectExecutionStats(std::move(solutions), std::move(roots));
+    auto candidates =
+        collectExecutionStats(std::move(solutions),
+                              std::move(roots),
+                              trial_period::getTrialPeriodMaxWorks(_opCtx, _collection));
     auto decision = uassertStatusOK(mongo::plan_ranker::pickBestPlan<PlanStageStats>(candidates));
     return finalizeExecutionPlans(std::move(decision), std::move(candidates));
 }
@@ -77,7 +80,7 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
 
     auto& winner = candidates[winnerIdx];
     tassert(5323803,
-            str::stream() << "winning candidate retruned an error: " << winner.status,
+            str::stream() << "winning candidate returned an error: " << winner.status,
             winner.status.isOK());
 
     LOGV2_DEBUG(

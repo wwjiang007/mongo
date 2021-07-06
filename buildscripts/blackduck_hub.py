@@ -109,7 +109,7 @@ class HTTPHandler(object):
             retry_status = [500, 502, 503, 504]  # Retry for these statuses.
             retry = urllib3_retry.Retry(
                 backoff_factor=0.1,  # Enable backoff starting at 0.1s.
-                method_whitelist=False,  # Support all HTTP verbs.
+                allowed_methods=False,  # Support all HTTP verbs.
                 status_forcelist=retry_status)
 
             adapter = requests.adapters.HTTPAdapter(max_retries=retry)
@@ -338,11 +338,16 @@ class VersionInfo:
             # yaml-cpp has this problem where Black Duck sourced the wrong version information
             self.ver_str = self.ver_str.replace("-", ".")
 
+            # If we trimmed the string to nothing, treat it as a beta version
+            if self.ver_str == '':
+                self.production_version = False
+                return
+
             # Versions are generally a multi-part integer tuple
             self.ver_array = [int(part) for part in self.ver_str.split(".")]
 
         except:
-            LOGGER.error("Failed to parse version '%s', exception", ver_str)
+            LOGGER.error("Failed to parse version '%s' as '%s', exception", ver_str, self.ver_str)
             raise
 
     def __repr__(self):
@@ -476,6 +481,22 @@ class Component:
             if name == "Mozilla Firefox":
                 versions = [ver for ver in versions if "esr" in ver]
 
+            # For yaml-cpp, we need to clean the list of versions a little
+            # yaml-cpp uses #.#.# but there are some entires with #.#.#.# so the later needs to
+            # be filtered out.
+            if name == "jbeder/yaml-cpp":
+                ver_regex = re.compile(r"\d+\.\d+\.\d+$")
+                versions = [ver for ver in versions if ver_regex.match(ver)]
+
+            # For Boost C++ Libraries - boost, we need to clean the list of versions a little
+            # All boost versions for the last 10 years start with 1.x.x. Black Duck thinks some
+            # versions are 4.x.x which are bogus and throw off the sorting.
+            # Also, boost uses #.#.# but there are some entires with #.#.#.# so the later needs to
+            # be filtered out.
+            if name == "Boost C++ Libraries - boost":
+                ver_regex = re.compile(r"\d+\.\d+\.\d+$")
+                versions = [ver for ver in versions if ver.startswith("1") and ver_regex.match(ver)]
+
             ver_info = [VersionInfo(ver) for ver in versions]
             ver_info = [ver for ver in ver_info if ver.production_version]
             LOGGER.info("Filtered versions: %s ", ver_info)
@@ -547,7 +568,9 @@ def _query_blackduck():
     LOGGER.info("Getting version components from blackduck")
     bom_components = hub.get_version_components(version)
 
-    components = [Component.parse(hub, comp) for comp in bom_components["items"]]
+    components = [
+        Component.parse(hub, comp) for comp in bom_components["items"] if comp['ignored'] is False
+    ]
 
     BLACKDUCK_PROJECT_URL = version["_meta"]["href"]
 
@@ -654,17 +677,17 @@ def _get_default(list1, idx, default):
 class TableWriter:
     """Generate an ASCII table that summarizes the results of all the reports generated."""
 
-    def __init__(self, headers: [str]):
+    def __init__(self, headers: List[str]):
         """Init writer."""
         self._headers = headers
         self._rows = []
 
-    def add_row(self, row: [str]):
+    def add_row(self, row: List[str]):
         """Add a row to the table."""
         self._rows.append(row)
 
     @staticmethod
-    def _write_row(col_sizes: [int], row: [str], writer: io.StringIO):
+    def _write_row(col_sizes: List[int], row: List[str], writer: io.StringIO):
         writer.write("|")
         for idx, row_value in enumerate(row):
             writer.write(" ")
@@ -707,7 +730,7 @@ class TableData:
 
         self._rows[col].append(value)
 
-    def write(self, headers: [str], writer: io.StringIO):
+    def write(self, headers: List[str], writer: io.StringIO):
         """Write table data as nice prettty table to writer."""
         tw = TableWriter(headers)
 
@@ -754,7 +777,7 @@ class ReportManager:
 
         self._data.add_value(comp_name, metric)
 
-    def finish(self, reports_file: Optional[str]):
+    def finish(self, reports_file: Optional[str], vulnerabilties_only: bool):
         """Generate final summary of all reports run."""
 
         if reports_file:
@@ -762,8 +785,12 @@ class ReportManager:
 
         stream = io.StringIO()
 
-        self._data.write(
-            ["Component", "Vulnerability", "Upgrade", "Current Version", "Newest Version"], stream)
+        if vulnerabilties_only:
+            self._data.write(["Component", "Vulnerability"], stream)
+        else:
+            self._data.write(
+                ["Component", "Vulnerability", "Upgrade", "Current Version", "Newest Version"],
+                stream)
 
         print(stream.getvalue())
 
@@ -1026,16 +1053,20 @@ class Analyzer:
         self.black_duck_components = None
         self.mgr = None
 
-    def _do_reports(self):
+    def _do_reports(self, vulnerabilties_only: bool):
         for comp in self.black_duck_components:
             # 1. Validate if this is in the YAML file
-            if self._verify_yaml_contains_component(comp):
+            if self._verify_yaml_contains_component(comp, vulnerabilties_only):
 
                 # 2. Validate there are no security issues
                 self._verify_vulnerability_status(comp)
 
-                # 3. Check for upgrade issues
-                self._verify_upgrade_status(comp)
+                # 3. Check for upgrade issue
+                if not vulnerabilties_only:
+                    self._verify_upgrade_status(comp)
+
+        if vulnerabilties_only:
+            return
 
         # 4. Validate that each third_party directory is in the YAML file
         self._verify_directories_in_yaml()
@@ -1043,11 +1074,12 @@ class Analyzer:
         # 5. Verify the YAML file has all the entries in Black Duck
         self._verify_components_in_yaml()
 
-    def _verify_yaml_contains_component(self, comp: Component):
+    def _verify_yaml_contains_component(self, comp: Component, vulnerabilties_only: bool):
         # It should be rare that Black Duck detects something that is not in the YAML file
         # As a result, we do not generate a "pass" report for simply be consistent between Black Duck and the yaml file
         if comp.name not in [c.name for c in self.third_party_components]:
-            _generate_report_missing_yaml_component(self.mgr, comp)
+            if not vulnerabilties_only:
+                _generate_report_missing_yaml_component(self.mgr, comp)
             return False
 
         return True
@@ -1105,7 +1137,7 @@ class Analyzer:
 
         return mcomp
 
-    def run(self, logger: ReportLogger, report_file: Optional[str]):
+    def run(self, logger: ReportLogger, report_file: Optional[str], vulnerabilties_only: bool):
         """Run analysis of Black Duck scan and local files."""
 
         self.third_party_directories = _get_third_party_directories()
@@ -1120,7 +1152,8 @@ class Analyzer:
         # Rather then constantly have to supress this in Black Duck itself which will generate false positives
         # We filter ourself our of the list of components.
         self.black_duck_components = [
-            comp for comp in self.black_duck_components if not comp.name == "MongoDB"
+            comp for comp in self.black_duck_components
+            if not (comp.name == "MongoDB" or comp.name == "WiredTiger")
         ]
 
         # Remove duplicate Black Duck components. We only care about the component with highest version number
@@ -1142,9 +1175,9 @@ class Analyzer:
 
         self.mgr = ReportManager(logger)
 
-        self._do_reports()
+        self._do_reports(vulnerabilties_only)
 
-        self.mgr.finish(report_file)
+        self.mgr.finish(report_file, vulnerabilties_only)
 
 
 # Derived from buildscripts/resmokelib/logging/buildlogger.py
@@ -1189,7 +1222,7 @@ def _generate_reports_args(args):
         logger = BuildLoggerReportLogger(build_logger)
 
     analyzer = Analyzer()
-    analyzer.run(logger, args.report_file)
+    analyzer.run(logger, args.report_file, args.vulnerabilities_only)
 
 
 def _scan_and_report_args(args):
@@ -1223,6 +1256,8 @@ def main() -> None:
                                       help="build logger task id")
     generate_reports_cmd.add_argument("--build_logger_local", action='store_true',
                                       help="Log to local build logger, logs to disk by default")
+    generate_reports_cmd.add_argument("--vulnerabilities_only", action='store_true',
+                                      help="Only check for security vulnerabilities")
     generate_reports_cmd.set_defaults(func=_generate_reports_args)
 
     scan_cmd = sub.add_parser('scan', help='Do Black Duck Scan')
@@ -1241,6 +1276,8 @@ def main() -> None:
                                      help="build logger task id")
     scan_and_report_cmd.add_argument("--build_logger_local", action='store_true',
                                      help="Log to local build logger, logs to disk by default")
+    scan_and_report_cmd.add_argument("--vulnerabilities_only", action='store_true',
+                                     help="Only check for security vulnerabilities")
     scan_and_report_cmd.set_defaults(func=_scan_and_report_args)
 
     args = parser.parse_args()

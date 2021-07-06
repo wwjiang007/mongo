@@ -35,6 +35,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
@@ -290,6 +291,17 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
             // error.
             cursorState = ClusterCursorManager::CursorState::Exhausted;
             break;
+        } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+            // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+            // to the resume token of the invalidating event, and mark the cursor response as
+            // invalidated. We always expect to have ExtraInfo for this error code.
+            const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+            tassert(5493706, "Missing ChangeStreamInvalidationInfo on exception", extraInfo);
+
+            responseBuilder.setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+            responseBuilder.setInvalidated();
+            cursorState = ClusterCursorManager::CursorState::Exhausted;
+            break;
         }
 
         // Check whether we have exhausted the pipeline's results.
@@ -397,14 +409,15 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
 
         consumerPipelines.emplace_back(std::move(consumerPipeline), nullptr, boost::none);
 
-        auto consumerCmdObj = sharded_agg_helpers::createCommandForTargetedShards(
-            expCtx, serializedCommand, consumerPipelines.back(), boost::none, false);
+        auto consumerCmdObj =
+            sharded_agg_helpers::createCommandForTargetedShards(expCtx,
+                                                                serializedCommand,
+                                                                consumerPipelines.back(),
+                                                                boost::none, /* exchangeSpec */
+                                                                false /* needsMerge */);
 
         requests.emplace_back(shardDispatchResults->exchangeSpec->consumerShards[idx],
-                              applyReadWriteConcern(opCtx,
-                                                    true,             /* appendRC */
-                                                    !expCtx->explain, /* appendWC */
-                                                    consumerCmdObj));
+                              consumerCmdObj);
     }
     auto cursors = establishCursors(opCtx,
                                     Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
@@ -607,13 +620,11 @@ Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& 
 
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
-    BSONObj cmdObj =
-        applyReadWriteConcern(opCtx,
-                              true,     /* appendRC */
-                              !explain, /* appendWC */
-                              CommandHelpers::filterCommandRequestForPassthrough(
-                                  sharded_agg_helpers::createPassthroughCommandForShard(
-                                      expCtx, serializedCommand, explain, nullptr, BSONObj())));
+    BSONObj cmdObj = sharded_agg_helpers::createPassthroughCommandForShard(expCtx,
+                                                                           serializedCommand,
+                                                                           explain,
+                                                                           nullptr, /* pipeline */
+                                                                           BSONObj());
 
     const auto shardId = cm.dbPrimary();
     const auto cmdObjWithShardVersion = (shardId != ShardId::kConfigServerId)

@@ -59,6 +59,27 @@ var $config = extendWorkload($config, function($config, $super) {
         }
     };
 
+    $config.setup = function setup(db, collName, cluster) {
+        // The default WC is majority and this workload may not be able to satisfy majority writes.
+        if (cluster.isSharded()) {
+            cluster.executeOnMongosNodes(function(db) {
+                assert.commandWorked(db.adminCommand({
+                    setDefaultRWConcern: 1,
+                    defaultWriteConcern: {w: 1},
+                    writeConcern: {w: "majority"}
+                }));
+            });
+        } else if (cluster.isReplication()) {
+            assert.commandWorked(db.adminCommand({
+                setDefaultRWConcern: 1,
+                defaultWriteConcern: {w: 1},
+                writeConcern: {w: "majority"}
+            }));
+        }
+
+        $super.setup.apply(this, arguments);
+    };
+
     $config.teardown = function teardown(db, collname, cluster) {
         // Interrupted map-reduce operations should still be able to clean up the temp collections
         // that they create within the database of the output collection and within the "local"

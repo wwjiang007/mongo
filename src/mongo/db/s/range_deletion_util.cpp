@@ -127,13 +127,14 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
                                 int numDocsToRemovePerBatch) {
     invariant(collection);
 
-    auto const& nss = collection->ns();
+    auto const nss = collection->ns();
 
     // The IndexChunk has a keyPattern that may apply to more than one index - we need to
     // select the index and get the full index keyPattern here.
     auto catalog = collection->getIndexCatalog();
-    const IndexDescriptor* idx = catalog->findShardKeyPrefixedIndex(opCtx, keyPattern, false);
-    if (!idx) {
+    auto shardKeyIdx = catalog->findShardKeyPrefixedIndex(
+        opCtx, collection, keyPattern, /*requireSingleKey=*/false);
+    if (!shardKeyIdx) {
         LOGV2_ERROR_OPTIONS(23765,
                             {logv2::UserAssertAfterLog(ErrorCodes::InternalError)},
                             "Unable to find shard key index for {keyPattern} in {namespace}",
@@ -143,7 +144,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
     }
 
     // Extend bounds to match the index we found
-    const KeyPattern indexKeyPattern(idx->keyPattern());
+    const KeyPattern indexKeyPattern(shardKeyIdx->keyPattern());
     const auto extend = [&](const auto& key) {
         return Helpers::toKeyFormat(indexKeyPattern.extendRangeBound(key, false));
     };
@@ -159,7 +160,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
                 "max"_attr = max,
                 "namespace"_attr = nss.ns());
 
-    const auto indexName = idx->indexName();
+    const auto indexName = shardKeyIdx->indexName();
     const IndexDescriptor* descriptor =
         collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
     if (!descriptor) {
@@ -352,6 +353,7 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
                 ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist ||
                 swNumDeleted.getStatus() ==
                 ErrorCodes::RangeDeletionAbandonedBecauseTaskDocumentDoesNotExist ||
+                swNumDeleted.getStatus().code() == ErrorCodes::KeyPatternShorterThanBound ||
                 ErrorCodes::isShutdownError(swNumDeleted.getStatus()) ||
                 ErrorCodes::isNotPrimaryError(swNumDeleted.getStatus());
         })
@@ -431,10 +433,17 @@ std::vector<RangeDeletionTask> getPersistentRangeDeletionTasks(OperationContext*
 void snapshotRangeDeletionsForRename(OperationContext* opCtx,
                                      const NamespaceString& fromNss,
                                      const NamespaceString& toNss) {
-    auto rangeDeletionTasks = getPersistentRangeDeletionTasks(opCtx, fromNss);
+    // Clear out eventual snapshots associated with the target collection: always restart from a
+    // clean state in case of stepdown or primary killed.
     PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionForRenameNamespace);
+    store.remove(opCtx, QUERY(RangeDeletionTask::kNssFieldName << toNss.ns()));
+
+    auto rangeDeletionTasks = getPersistentRangeDeletionTasks(opCtx, fromNss);
     for (auto& task : rangeDeletionTasks) {
-        task.setNss(toNss);  // Associate task to the new namespace
+        // Associate task to the new namespace
+        task.setNss(toNss);
+        // Assign a new id to prevent duplicate key conflicts with the source range deletion task
+        task.setId(UUID::gen());
         store.add(opCtx, task);
     }
 }
@@ -447,13 +456,12 @@ void restoreRangeDeletionTasksForRename(OperationContext* opCtx, const Namespace
 
     const auto query = QUERY(RangeDeletionTask::kNssFieldName << nss.ns());
 
-    // Remove eventual leftovers from a previously uncompleted restore
-    rangeDeletionsStore.remove(opCtx, query);
-
     rangeDeletionsForRenameStore.forEach(opCtx, query, [&](const RangeDeletionTask& deletionTask) {
-        auto task = deletionTask;
-        task.setId(UUID::gen());  // Assign a new id to prevent duplicate key errors
-        rangeDeletionsStore.add(opCtx, task);
+        try {
+            rangeDeletionsStore.add(opCtx, deletionTask);
+        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+            // Task already scheduled in a previous call of this method
+        }
         return true;
     });
 }

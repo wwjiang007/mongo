@@ -60,6 +60,7 @@
 #include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_validation.h"
@@ -73,6 +74,7 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -303,6 +305,7 @@ void ExecCommandClient::_epilogue() {
     if (_invocation->supportsWriteConcern()) {
         failCommand.executeIf(
             [&](const BSONObj& data) {
+                rpc::RewriteStateChangeErrors::onActiveFailCommand(opCtx, data);
                 result->getBodyBuilder().append(data["writeConcernError"]);
                 if (data.hasField(kErrorLabelsFieldName) &&
                     data[kErrorLabelsFieldName].type() == Array) {
@@ -600,6 +603,8 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         ClientMetadata::setFromMetadata(opCtx->getClient(), metaElem);
     }
 
+    enforceRequireAPIVersion(opCtx, command);
+
     auto& apiParams = APIParameters::get(opCtx);
     auto& apiVersionMetrics = APIVersionMetrics::get(opCtx->getServiceContext());
     if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
@@ -644,7 +649,10 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         return appendStatusToReplyAndSkipCommandExecution({ErrorCodes::InvalidOptions, errorMsg});
     }
 
-    bool clientSuppliedWriteConcern = !_parc->_wc->usedDefault;
+    // This is the WC extracted from the command object, so the CWWC or implicit default hasn't been
+    // applied yet, which is why "usedDefaultConstructedWC" flag can be used an indicator of whether
+    // the client supplied a WC or not.
+    bool clientSuppliedWriteConcern = !_parc->_wc->usedDefaultConstructedWC;
     bool customDefaultWriteConcernWasApplied = false;
     bool isInternalClient =
         (opCtx->getClient()->session() &&
@@ -654,18 +662,27 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         (!TransactionRouter::get(opCtx) || isTransactionCommand(_parc->_commandName)) &&
         !opCtx->getClient()->isInDirectClient()) {
         if (isInternalClient) {
-            tassert(
-                5569901,
+            uassert(
+                5569900,
                 "received command without explicit writeConcern on an internalClient connection {}"_format(
                     redact(request.body.toString())),
                 request.body.hasField(WriteConcernOptions::kWriteConcernField));
         } else {
             // This command is not from a DBDirectClient or internal client, and supports WC, but
             // wasn't given one - so apply the default, if there is one.
-            if (const auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                           .getDefaultWriteConcern(opCtx)) {
+            const auto rwcDefaults =
+                ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
+            if (const auto wcDefault = rwcDefaults.getDefaultWriteConcern()) {
                 _parc->_wc = *wcDefault;
-                customDefaultWriteConcernWasApplied = true;
+                if (repl::feature_flags::gDefaultWCMajority.isEnabled(
+                        serverGlobalParams.featureCompatibility)) {
+                    const auto defaultWriteConcernSource =
+                        rwcDefaults.getDefaultWriteConcernSource();
+                    customDefaultWriteConcernWasApplied = defaultWriteConcernSource &&
+                        defaultWriteConcernSource == DefaultWriteConcernSourceEnum::kGlobal;
+                } else {
+                    customDefaultWriteConcernWasApplied = true;
+                }
                 LOGV2_DEBUG(22766,
                             2,
                             "Applying default writeConcern on {command} of {writeConcern}",
@@ -717,31 +734,55 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     bool clientSuppliedReadConcern = readConcernArgs.isSpecified();
     bool customDefaultReadConcernWasApplied = false;
 
-    auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
-    if (readConcernSupport.defaultReadConcernPermit.isOK() &&
-        (startTransaction || !TransactionRouter::get(opCtx))) {
+    auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel(),
+                                                              readConcernArgs.isImplicitDefault());
+
+    auto applyDefaultReadConcern = [&](const repl::ReadConcernArgs rcDefault) -> void {
+        // We must obtain the client lock to set ReadConcernArgs, because it's an
+        // in-place reference to the object on the operation context, which may be
+        // concurrently used elsewhere (eg. read by currentOp).
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        LOGV2_DEBUG(22767,
+                    2,
+                    "Applying default readConcern on {command} of {readConcern}",
+                    "Applying default readConcern on command",
+                    "command"_attr = invocation->definition()->getName(),
+                    "readConcern"_attr = rcDefault);
+        readConcernArgs = std::move(rcDefault);
+        // Update the readConcernSupport, since the default RC was applied.
+        readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel(),
+                                                             !customDefaultReadConcernWasApplied);
+    };
+
+    auto shouldApplyDefaults = startTransaction || !TransactionRouter::get(opCtx);
+    if (readConcernSupport.defaultReadConcernPermit.isOK() && shouldApplyDefaults) {
         if (readConcernArgs.isEmpty()) {
-            const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                       .getDefaultReadConcern(opCtx);
+            const auto rwcDefaults =
+                ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
+            const auto rcDefault = rwcDefaults.getDefaultReadConcern();
             if (rcDefault) {
-                {
-                    // We must obtain the client lock to set ReadConcernArgs, because it's an
-                    // in-place reference to the object on the operation context, which may be
-                    // concurrently used elsewhere (eg. read by currentOp).
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    readConcernArgs = std::move(*rcDefault);
-                }
-                customDefaultReadConcernWasApplied = true;
-                LOGV2_DEBUG(22767,
-                            2,
-                            "Applying default readConcern on {command} of {readConcern}",
-                            "Applying default readConcern on command",
-                            "command"_attr = invocation->definition()->getName(),
-                            "readConcern"_attr = *rcDefault);
-                // Update the readConcernSupport, since the default RC was applied.
-                readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
+                const bool isDefaultRCLocalFeatureFlagEnabled =
+                    serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                    repl::feature_flags::gDefaultRCLocal.isEnabled(
+                        serverGlobalParams.featureCompatibility);
+                const auto readConcernSource = rwcDefaults.getDefaultReadConcernSource();
+                customDefaultReadConcernWasApplied = !isDefaultRCLocalFeatureFlagEnabled ||
+                    (readConcernSource &&
+                     readConcernSource.get() == DefaultReadConcernSourceEnum::kGlobal);
+
+                applyDefaultReadConcern(*rcDefault);
             }
         }
+    }
+
+    // Apply the implicit default read concern even if the command does not support a cluster wide
+    // read concern.
+    if (!readConcernSupport.defaultReadConcernPermit.isOK() &&
+        readConcernSupport.implicitDefaultReadConcernPermit.isOK() && shouldApplyDefaults &&
+        readConcernArgs.isEmpty()) {
+        const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
+                                   .getImplicitDefaultReadConcern();
+        applyDefaultReadConcern(rcDefault);
     }
 
     auto& provenance = readConcernArgs.getProvenance();
@@ -813,9 +854,6 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     // Remember whether or not this operation is starting a transaction, in case something later in
     // the execution needs to adjust its behavior based on this.
     opCtx->setIsStartingMultiDocumentTransaction(startTransaction);
-
-    // Once API params and txn state are set on opCtx, enforce the "requireApiVersion" setting.
-    enforceRequireAPIVersion(opCtx, command);
 
     command->incrementCommandsExecuted();
 
@@ -1018,15 +1056,13 @@ void ParseAndRunCommand::RunInvocation::_tapOnError(const Status& status) {
     //    delegated to the shards. Mongos simply propagates the shard's response up to the client.
     // 2. For other commands in a transaction, they shouldn't get a writeConcern error so this
     //    setting doesn't apply.
-    //
-    // isInternalClient is set to true to suppress mongos from returning the RetryableWriteError
-    // label.
     auto errorLabels = getErrorLabels(opCtx,
                                       *_parc->_osi,
                                       command->getName(),
                                       status.code(),
                                       boost::none,
-                                      true /* isInternalClient */);
+                                      false /* isInternalClient */,
+                                      true /* isMongos */);
     _parc->_errorBuilder->appendElements(errorLabels);
 }
 
@@ -1085,6 +1121,7 @@ Future<void> ParseAndRunCommand::run() {
 
 DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     globalOpCounters.gotQuery();
+    globalOpCounters.gotQueryDeprecated();
 
     ON_BLOCK_EXIT([opCtx] {
         Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
@@ -1325,6 +1362,11 @@ DbResponse ClientCommand::_produceResponse() {
             dbResponse.nextInvocation = reply->getNextInvocation();
         }
     }
+    if (auto doc = rpc::RewriteStateChangeErrors::rewrite(reply->getBodyBuilder().asTempObj(),
+                                                          _rec->getOpCtx())) {
+        reply->reset();
+        reply->getBodyBuilder().appendElements(*doc);
+    }
     dbResponse.response = reply->done();
 
     return dbResponse;
@@ -1352,6 +1394,7 @@ DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss
     const long long cursorId = dbm->pullInt64();
 
     globalOpCounters.gotGetMore();
+    globalOpCounters.gotGetMoreDeprecated();
 
     // TODO: Handle stale config exceptions here from coll being dropped or sharded during op for
     // now has same semantics as legacy request.
@@ -1406,7 +1449,7 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
                           << ".",
             numCursors >= 1 && numCursors < 30000);
 
-    globalOpCounters.gotOp(dbKillCursors, false);
+    globalOpCounters.gotKillCursorsDeprecated();
 
     ConstDataCursor cursors(dbm->getArray(numCursors));
 
@@ -1468,12 +1511,16 @@ void Strategy::writeOp(std::shared_ptr<RequestExecutionContext> rec) {
     rec->setRequest([msg = rec->getMessage()]() {
         switch (msg.operation()) {
             case dbInsert: {
-                return InsertOp::parseLegacy(msg).serialize({});
+                auto op = InsertOp::parseLegacy(msg);
+                globalOpCounters.gotInsertsDeprecated(op.getDocuments().size());
+                return op.serialize({});
             }
             case dbUpdate: {
+                globalOpCounters.gotUpdateDeprecated();
                 return UpdateOp::parseLegacy(msg).serialize({});
             }
             case dbDelete: {
+                globalOpCounters.gotDeleteDeprecated();
                 return DeleteOp::parseLegacy(msg).serialize({});
             }
             default:

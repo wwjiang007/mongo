@@ -538,7 +538,8 @@ StatusWith<TransportLayerASIO::ASIOSessionHandle> TransportLayerASIO::_doSyncCon
 #ifdef TCP_FASTOPEN_CONNECT
     const auto family = protocol.family();
     if ((family == AF_INET) || (family == AF_INET6)) {
-        sock.set_option(TCPFastOpenConnect(gTCPFastOpenClient), ec);
+        setSocketOption(
+            sock, TCPFastOpenConnect(gTCPFastOpenClient), ec, "connect (sync) TCP fast open");
         if (tcpFastOpenIsConfigured) {
             return errorCodeToStatus(ec);
         }
@@ -689,7 +690,10 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(
 
 #ifdef TCP_FASTOPEN_CONNECT
             std::error_code ec;
-            connector->socket.set_option(TCPFastOpenConnect(gTCPFastOpenClient), ec);
+            setSocketOption(connector->socket,
+                            TCPFastOpenConnect(gTCPFastOpenClient),
+                            ec,
+                            "connect (async) TCP fast open");
             if (tcpFastOpenIsConfigured) {
                 return futurize(ec);
             }
@@ -984,12 +988,13 @@ Status TransportLayerASIO::setup() {
 
             throw;
         }
-        acceptor.set_option(GenericAcceptor::reuse_address(true));
+        setSocketOption(acceptor, GenericAcceptor::reuse_address(true), "acceptor reuse address");
 
         std::error_code ec;
 #ifdef TCP_FASTOPEN
         if (gTCPFastOpenServer && ((addr.family() == AF_INET) || (addr.family() == AF_INET6))) {
-            acceptor.set_option(TCPFastOpen(gTCPFastOpenQueueSize), ec);
+            setSocketOption(
+                acceptor, TCPFastOpen(gTCPFastOpenQueueSize), ec, "acceptor TCP fast open");
             if (tcpFastOpenIsConfigured) {
                 return errorCodeToStatus(ec);
             }
@@ -997,7 +1002,7 @@ Status TransportLayerASIO::setup() {
         }
 #endif
         if (addr.family() == AF_INET6) {
-            acceptor.set_option(asio::ip::v6_only(true));
+            setSocketOption(acceptor, asio::ip::v6_only(true), "acceptor v6 only");
         }
 
         acceptor.non_blocking(true, ec);
@@ -1228,7 +1233,10 @@ SSLParams::SSLModes TransportLayerASIO::_sslMode() const {
 
 Status TransportLayerASIO::rotateCertificates(std::shared_ptr<SSLManagerInterface> manager,
                                               bool asyncOCSPStaple) {
-
+    if (manager && manager->isTransient()) {
+        return Status(ErrorCodes::InternalError,
+                      "Should not rotate transient SSL manager's certificates");
+    }
     auto contextOrStatus = _createSSLContext(manager, _sslMode(), asyncOCSPStaple);
     if (!contextOrStatus.isOK()) {
         return contextOrStatus.getStatus();
@@ -1257,6 +1265,8 @@ TransportLayerASIO::_createSSLContext(std::shared_ptr<SSLManagerInterface>& mana
             return status;
         }
 
+        std::weak_ptr<const SSLConnectionContext> weakContextPtr = newSSLContext;
+        manager->registerOwnedBySSLContext(weakContextPtr);
         auto resp = newSSLContext->manager->stapleOCSPResponse(
             newSSLContext->ingress->native_handle(), asyncOCSPStaple);
 
@@ -1292,9 +1302,7 @@ TransportLayerASIO::createTransientSSLContext(const TransientSSLParams& transien
                       "SSLManagerCoordinator is not initialized");
     }
     auto manager = coordinator->createTransientSSLManager(transientSSLParams);
-    if (!manager) {
-        return Status(ErrorCodes::InvalidSSLConfiguration, "TransportLayerASIO has no SSL manager");
-    }
+    invariant(manager);
 
     return _createSSLContext(manager, _sslMode(), true /* asyncOCSPStaple */);
 }

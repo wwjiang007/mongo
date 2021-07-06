@@ -6,6 +6,7 @@
  *
  * @tags: [
  *   requires_fcv_47,
+ *   does_not_support_stepdowns,
  * ]
  */
 (function() {
@@ -16,7 +17,7 @@ load('jstests/libs/parallel_shell_helpers.js');
 load("jstests/sharding/libs/find_chunks_util.js");
 load("jstests/sharding/libs/shard_versioning_util.js");
 
-const st = new ShardingTest({config: 1, shards: 2});
+const st = new ShardingTest({shards: 2});
 const configDB = st.s.getDB("config");
 const dbName = 'AllowMigrations';
 
@@ -28,39 +29,40 @@ const setUpDb = function setUpDatabaseAndEnableSharding() {
 };
 
 // Tests that moveChunk does not succeed when {allowMigrations: false}
-(function testAllowMigrationsFalsePreventsMoveChunk() {
-    setUpDb();
+// (function testAllowMigrationsFalsePreventsMoveChunk() {
+//     setUpDb();
 
-    const collName = "collA";
-    const ns = dbName + "." + collName;
+//     const collName = "collA";
+//     const ns = dbName + "." + collName;
 
-    assert.commandWorked(st.s.getDB(dbName).getCollection(collName).insert({_id: 0}));
-    assert.commandWorked(st.s.getDB(dbName).getCollection(collName).insert({_id: 1}));
-    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
+//     assert.commandWorked(st.s.getDB(dbName).getCollection(collName).insert({_id: 0}));
+//     assert.commandWorked(st.s.getDB(dbName).getCollection(collName).insert({_id: 1}));
+//     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
-    // Confirm that an inProgress moveChunk fails once {allowMigrations: false}
-    const fp = configureFailPoint(st.shard0, "moveChunkHangAtStep5");
-    const awaitResult = startParallelShell(
-        funWithArgs(function(ns, toShardName) {
-            assert.commandFailedWithCode(
-                db.adminCommand({moveChunk: ns, find: {_id: 0}, to: toShardName}),
-                ErrorCodes.ConflictingOperationInProgress);
-        }, ns, st.shard1.shardName), st.s.port);
-    fp.wait();
-    assert.commandWorked(
-        configDB.collections.update({_id: ns}, {$set: {allowMigrations: false}}, {upsert: true}));
-    fp.off();
-    awaitResult();
+//     // Confirm that an inProgress moveChunk fails once {allowMigrations: false}
+//     const fp = configureFailPoint(st.shard0, "moveChunkHangAtStep5");
+//     const awaitResult = startParallelShell(
+//         funWithArgs(function(ns, toShardName) {
+//             assert.commandFailedWithCode(
+//                 db.adminCommand({moveChunk: ns, find: {_id: 0}, to: toShardName}),
+//                 ErrorCodes.ConflictingOperationInProgress);
+//         }, ns, st.shard1.shardName), st.s.port);
+//     fp.wait();
+//     assert.commandWorked(
+//         configDB.collections.update({_id: ns}, {$set: {allowMigrations: false}}, {upsert:
+//         true}));
+//     fp.off();
+//     awaitResult();
 
-    // {allowMigrations: false} is set, sending a new moveChunk command should also fail.
-    assert.commandFailedWithCode(
-        st.s.adminCommand({moveChunk: ns, find: {_id: 0}, to: st.shard1.shardName}),
-        ErrorCodes.ConflictingOperationInProgress);
+//     // {allowMigrations: false} is set, sending a new moveChunk command should also fail.
+//     assert.commandFailedWithCode(
+//         st.s.adminCommand({moveChunk: ns, find: {_id: 0}, to: st.shard1.shardName}),
+//         ErrorCodes.ConflictingOperationInProgress);
 
-    // Confirm shard0 reports {allowMigrations: false} in the local cache as well
-    const cachedEntry = st.shard0.getDB("config").cache.collections.findOne({_id: ns});
-    assert.eq(false, cachedEntry.allowMigrations);
-})();
+//     // Confirm shard0 reports {allowMigrations: false} in the local cache as well
+//     const cachedEntry = st.shard0.getDB("config").cache.collections.findOne({_id: ns});
+//     assert.eq(false, cachedEntry.allowMigrations);
+// })();
 
 // Tests {allowMigrations: false} disables balancing for collB and does not interfere with balancing
 // for collA.
@@ -172,6 +174,29 @@ const testConfigsvrSetAllowMigrationsCommand = function() {
 
     // Check that the collection version has been bumped and the shard has refreshed.
     ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(3, 0));
+
+    // Check that _configsvrSetAllowMigrations validates the 'collectionUUID' parameter if passed
+    const collectionUUID = configDB.collections.findOne({_id: ns}).uuid;
+    const anotherUUID = UUID();
+
+    assert.commandFailedWithCode(st.configRS.getPrimary().adminCommand({
+        _configsvrSetAllowMigrations: ns,
+        allowMigrations: false,
+        collectionUUID: anotherUUID,
+        writeConcern: {w: "majority"}
+    }),
+                                 ErrorCodes.InvalidUUID);
+    assert.eq(undefined, configDB.collections.findOne({_id: ns}).allowMigrations);
+    ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(3, 0));
+
+    assert.commandWorked(st.configRS.getPrimary().adminCommand({
+        _configsvrSetAllowMigrations: ns,
+        allowMigrations: false,
+        collectionUUID: collectionUUID,
+        writeConcern: {w: "majority"}
+    }));
+    assert.eq(false, configDB.collections.findOne({_id: ns}).allowMigrations);
+    ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(4, 0));
 };
 
 // Test cases that should disable the balancer.

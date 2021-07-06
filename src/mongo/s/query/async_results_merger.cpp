@@ -36,9 +36,11 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/kill_cursors_gen.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -121,6 +123,12 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
 
         // A remote cannot be flagged as 'partialResultsReturned' if 'allowPartialResults' is false.
         invariant(!(_remotes.back().partialResultsReturned && !_params.getAllowPartialResults()));
+
+        // For the first batch, cursor should never be invalidated.
+        tassert(
+            5493704, "Found invalidated cursor on the first batch", !_remotes.back().invalidated);
+
+        _remotes.back().shardId = remote.getShardId().toString();
 
         // We don't check the return value of _addBatchToBuffer here; if there was an error,
         // it will be stored in the remote and the first call to ready() will return true.
@@ -435,13 +443,13 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
         adjustedBatchSize = *_params.getBatchSize() - remote.fetchedCount;
     }
 
-    BSONObj cmdObj = GetMoreRequest(remote.cursorNss,
-                                    remote.cursorId,
-                                    adjustedBatchSize,
-                                    _awaitDataTimeout,
-                                    boost::none,
-                                    boost::none)
-                         .toBSON();
+    GetMoreCommandRequest getMoreRequest(remote.cursorId, remote.cursorNss.coll().toString());
+    getMoreRequest.setBatchSize(adjustedBatchSize);
+    if (_awaitDataTimeout) {
+        getMoreRequest.setMaxTimeMS(
+            static_cast<std::int64_t>(durationCount<Milliseconds>(*_awaitDataTimeout)));
+    }
+    BSONObj cmdObj = getMoreRequest.toBSON({});
 
     if (_params.getSessionId()) {
         BSONObjBuilder newCmdBob(std::move(cmdObj));
@@ -462,11 +470,8 @@ Status AsyncResultsMerger::_askForNextBatch(WithLock, size_t remoteIndex) {
         cmdObj = newCmdBob.obj();
     }
 
-    // Never pass API parameters with getMore.
-    IgnoreAPIParametersBlock ignoreApiParametersBlock(_opCtx);
     executor::RemoteCommandRequest request(
         remote.getTargetHost(), remote.cursorNss.db().toString(), cmdObj, _opCtx);
-    ignoreApiParametersBlock.release();
 
     auto callbackStatus =
         _executor->scheduleRemoteCommand(request, [this, remoteIndex](auto const& cbData) {
@@ -488,6 +493,11 @@ Status AsyncResultsMerger::scheduleGetMores() {
 }
 
 Status AsyncResultsMerger::_scheduleGetMores(WithLock lk) {
+    // Before scheduling more work, check whether the cursor has been invalidated.
+    if (feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV()) {
+        _assertNotInvalidated(lk);
+    }
+
     // Schedule remote work on hosts for which we need more results.
     for (size_t i = 0; i < _remotes.size(); ++i) {
         auto& remote = _remotes[i];
@@ -552,6 +562,15 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     return eventToReturn;
 }
 
+void AsyncResultsMerger::_assertNotInvalidated(WithLock lk) {
+    if (auto minPromisedSortKey = _getMinPromisedSortKey(lk)) {
+        const auto& minRemote = _remotes[minPromisedSortKey->second];
+        uassert(ChangeStreamInvalidationInfo{minPromisedSortKey->first.firstElement().Obj()},
+                "Change stream invalidated",
+                !(minRemote.invalidated && !_ready(lk)));
+    }
+}
+
 StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
     const BSONObj& responseObj, const RemoteCursorData& remote) {
 
@@ -579,6 +598,14 @@ void AsyncResultsMerger::_updateRemoteMetadata(WithLock lk,
     // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
     auto& remote = _remotes[remoteIndex];
     remote.cursorId = response.getCursorId();
+
+    // If the response indicates that the cursor has been invalidated, mark the corresponding
+    // remote as invalidated. This also signifies that the shard cursor has been closed.
+    remote.invalidated = response.getInvalidated();
+    tassert(5493705,
+            "Unexpectedly encountered invalidated cursor with non-zero ID",
+            !(remote.invalidated && remote.cursorId > 0));
+
     if (response.getPostBatchResumeToken()) {
         // We only expect to see this for change streams.
         invariant(_params.getSort());

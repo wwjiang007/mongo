@@ -1,10 +1,8 @@
 """Extracts `mongo-debugsymbols.tgz`."""
 
 import glob
-import logging
 import os
 import shutil
-import sys
 import tarfile
 import time
 
@@ -15,11 +13,13 @@ from buildscripts.resmokelib.setup_multiversion.setup_multiversion import SetupM
 _DEBUG_FILE_BASE_NAMES = ['mongo', 'mongod', 'mongos']
 
 
-def extract_debug_symbols(root_logger):
+def extract_debug_symbols(root_logger, download_url=None):
     """
     Extract debug symbols. Idempotent.
 
     :param root_logger: logger to use
+    :param download_url: optional url to download the debug symbols. We conditionally download
+                         the symbols for performance reasons.
     :return: None
     """
     sym_files = []
@@ -31,7 +31,11 @@ def extract_debug_symbols(root_logger):
         pass
 
     if len(sym_files) < len(_DEBUG_FILE_BASE_NAMES):
-        download_symbols_from_patch_build(root_logger)
+        if download_url is not None:
+            download_debug_symbols(root_logger, download_url)
+        else:
+            root_logger.info("Skipping downloading debug symbols")
+
         try:
             _extract_tar(root_logger)
         # We never want this to cause the whole task to fail.
@@ -49,7 +53,10 @@ def _extract_tar(root_logger):
         if os.path.exists(dest):
             root_logger.debug('Debug symbol %s already exists, not copying from %s.', dest, src)
             continue
-        shutil.copy(src, dest)
+        if os.path.isdir(src):
+            shutil.copytree(src, dest)
+        else:
+            shutil.copy(src, dest)
         root_logger.debug('Copied debug symbol %s.', dest)
     return sym_files
 
@@ -64,26 +71,26 @@ def _extracted_files_to_copy():
     return out
 
 
-def download_symbols_from_patch_build(root_logger):
-    """Download debug symbol from patch build."""
-    if config.DEBUG_SYMBOL_PATCH_URL is not None:
-        retry_secs = 10
+def download_debug_symbols(root_logger, download_url):
+    """Download debug symbols."""
+    retry_secs = 10
 
-        while True:
-            try:
-                SetupMultiversion.setup_mongodb(artifacts_url=None, binaries_url=None,
-                                                symbols_url=config.DEBUG_SYMBOL_PATCH_URL,
-                                                install_dir=os.getcwd())
-                break
-            except tarfile.ReadError:
-                root_logger.info("Debug symbols unavailable after %s secs, retrying in %s secs",
-                                 compare_start_time(time.time()), retry_secs)
-                time.sleep(retry_secs)
+    while True:
+        try:
+            SetupMultiversion.setup_mongodb(artifacts_url=None, binaries_url=None,
+                                            symbols_url=download_url, install_dir=os.getcwd())
 
-            ten_min = 10 * 60
-            if compare_start_time(time.time()) > ten_min:
-                root_logger.info(
-                    'Debug-symbols archive-file does not exist after %s secs; '
-                    'Hang-Analyzer may not complete successfully. Download URL: %s', ten_min,
-                    config.DEBUG_SYMBOL_PATCH_URL)
-                break
+            break
+
+        except tarfile.ReadError:
+            root_logger.info("Debug symbols unavailable after %s secs, retrying in %s secs",
+                             compare_start_time(time.time()), retry_secs)
+            time.sleep(retry_secs)
+
+        ten_min = 10 * 60
+        if compare_start_time(time.time()) > ten_min:
+            root_logger.info(
+                'Debug-symbols archive-file does not exist after %s secs; '
+                'Hang-Analyzer may not complete successfully. Download URL: %s', ten_min,
+                download_url)
+            break

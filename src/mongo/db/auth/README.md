@@ -294,6 +294,22 @@ execute commands.
 [Here](https://github.com/mongodb/mongo/blob/r4.4.0/src/mongo/db/auth/authorization_session_impl.cpp#L126)
 is the authorization session calling into the authorization manager to acquire a user.
 
+Clients are expected to authenticate at most one time on a connection, and a
+client which opts into API Version 1 will receive an error if it attempts to
+authenticate more than once.  However, legacy clients which have not opted into
+an API Version may authenticate multiple times.  If a legacy client
+authenticates as UserA on a database and then authenticates as UserB on the
+same database, its AuthorizationSession will implicitly logout UserA and
+replace its cached User object with that of UserB. Alternatively, if a legacy
+client authenticates as UserA on one database and then authenticates as UserB
+on a second database, its AuthorizationSession will store User objects for both
+UserA and UserB, and will consider itself authorized for the union of the two
+users' privileges.  Because modern drivers no longer allow applications to
+authenticate with multiple user identities, this behavior in
+AuthorizationSession is deprecated, and support for it will eventually be
+removed.
+
+
 ### User
 
 `User` objects contain authorization information with regards to a specific user in a database. The
@@ -455,7 +471,7 @@ For users possessing a given set of roles, their effective privileges and
 Each role imparts privileges in the form of a set of `actions` permitted
 against a given `resource`.  The strings in the `actions` list correspond
 1:1 with `ActionType` values as specified [here](https://github.com/mongodb/mongo/blob/92cc84b0171942375ccbd2312a052bc7e9f159dd/src/mongo/db/auth/action_type.h).
-Resources may be specified in any of the following five formats:
+Resources may be specified in any of the following nine formats:
 
 | `resource` | Meaning |
 | --- | --- |
@@ -464,6 +480,10 @@ Resources may be specified in any of the following five formats:
 | { db: '', collection: 'system.views' } | The specific named collection on all DBs |
 | { db: 'test', collection: 'system.view' } | The specific namespace (db+collection) as written |
 | { cluster: true } | Used only by cluster-level actions such as `replsetConfigure`. |
+| { system_bucket: '' } | Any collection with a prefix of `system.buckets.` in any db|
+| { db: '', system_buckets: 'example' } | A collection named `system.buckets.example` in any db|
+| { db: 'test', system_buckets: '' } | Any collection with a prefix of `system.buckets.` in `test` db|
+| { db: 'test', system_buckets: 'example' } | A collected named `system.buckets.example` in `test` db|
 
 #### Normal resources
 

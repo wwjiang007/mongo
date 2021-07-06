@@ -151,6 +151,10 @@ function runHangAnalyzer(pids) {
     const args =
         ['python', scriptPath, 'hang-analyzer', '-k', '-o', 'file', '-o', 'stdout', '-d', pids];
 
+    if (jsTest.options().evergreenDebugSymbolsUrl) {
+        args.push('-ds', jsTest.options().evergreenDebugSymbolsUrl);
+    }
+
     // Enable core dumps if not an ASAN build.
     if (!_isAddressSanitizerActive()) {
         args.push('-c');
@@ -691,6 +695,9 @@ MongoRunner.mongodOptions = function(opts = {}) {
     _removeSetParameterIfBeforeVersion(opts, "shutdownTimeoutMillisForSignaledShutdown", "4.5.0");
     _removeSetParameterIfBeforeVersion(
         opts, "failpoint.PrimaryOnlyServiceSkipRebuildingInstances", "4.8.0");
+    _removeSetParameterIfBeforeVersion(
+        opts, "enableDefaultWriteConcernUpdatesForInitiate", "5.0.0");
+    _removeSetParameterIfBeforeVersion(opts, "enableReconfigRollbackCommittedWritesCheck", "5.0.0");
 
     if (!opts.logFile && opts.useLogFiles) {
         opts.logFile = opts.dbpath + "/mongod.log";
@@ -1414,14 +1421,15 @@ function appendSetParameterArgs(argArray) {
 /**
  * Continuously tries to establish a connection to the server on the specified port.
  *
- * If a connection cannot be established within a time limit, an exception will be thrown. If
- * the process for the given 'pid' is found to no longer be running, this function will
- * terminate and return null.
+ * If a connection cannot be established within a time limit, or if the process terminated
+ * with a non-zero exit code, an exception will be thrown. If the process for the given
+ * 'pid' is found to have gracefully terminated, this function will terminate and return
+ * null.
  *
  * @param {int} [pid] the process id of the node to connect to.
  * @param {int} [port] the port of the node to connect to.
  * @param {int} [undoLiveRecordPid=null] the process id of the `live-record` process.
- * @returns a new Mongo connection object, or null if the process is not running.
+ * @returns a new Mongo connection object, or null if the process gracefully terminated.
  */
 MongoRunner.awaitConnection = function({pid, port, undoLiveRecordPid = null} = {}) {
     var conn = null;
@@ -1439,6 +1447,9 @@ MongoRunner.awaitConnection = function({pid, port, undoLiveRecordPid = null} = {
                 serverExitCodeMap[port] = res.exitCode;
                 if (undoLiveRecordPid) {
                     _stopUndoLiveRecord(undoLiveRecordPid);
+                }
+                if (res.exitCode !== MongoRunner.EXIT_CLEAN) {
+                    throw new MongoRunner.StopError(res.exitCode);
                 }
                 return true;
             }
@@ -1459,7 +1470,7 @@ var _stopUndoLiveRecord = function(undoLiveRecordPid) {
     if (undoReturnCode !== 0) {
         throw new Error(
             "Undo live-record failed to terminate correctly. This is likely a bug in Undo. " +
-            "Please record any logs and send them to the #server-tig Slack channel");
+            "Please record any logs and send them to the #server-testing Slack channel");
     }
 };
 
@@ -1561,12 +1572,6 @@ runMongoProgram = function() {
                      '--authenticationDatabase=admin');
     }
 
-    if (progName == 'mongo' && !_useWriteCommandsDefault()) {
-        progName = args[0];
-        args = args.slice(1);
-        args.unshift(progName, '--useLegacyWriteOps');
-    }
-
     return _runMongoProgram.apply(null, args);
 };
 
@@ -1586,11 +1591,6 @@ startMongoProgramNoConnect = function() {
                      '-p',
                      jsTestOptions().authPassword,
                      '--authenticationDatabase=admin');
-    }
-
-    if (progName == 'mongo' && !_useWriteCommandsDefault()) {
-        args = args.slice(1);
-        args.unshift(progName, '--useLegacyWriteOps');
     }
 
     return _startMongoProgram.apply(null, args);

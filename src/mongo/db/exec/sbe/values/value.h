@@ -33,6 +33,7 @@
 #include <absl/container/flat_hash_set.h>
 #include <array>
 #include <bitset>
+#include <boost/predef/hardware/simd.h>
 #include <cstdint>
 #include <ostream>
 #include <pcre.h>
@@ -47,7 +48,9 @@
 #include "mongo/db/fts/fts_matcher.h"
 #include "mongo/db/query/bson_typemask.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/platform/bits.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/platform/endian.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/represent_as.h"
 
@@ -75,6 +78,7 @@ class SortSpec;
 static constexpr size_t kStringMaxDisplayLength = 160;
 static constexpr size_t kBinDataMaxDisplayLength = 80;
 static constexpr size_t kNewUUIDLength = 16;
+static constexpr size_t kArrayObjectOrNestingMaxDepth = 10;
 
 /**
  * Type dispatch tags.
@@ -120,6 +124,7 @@ enum class TypeTags : uint8_t {
     bsonRegex,
     bsonJavascript,
     bsonDBPointer,
+    bsonCodeWScope,
 
     // KeyString::Value
     ksValue,
@@ -664,27 +669,6 @@ constexpr size_t kSmallStringMaxLength = 7;
 using ObjectIdType = std::array<uint8_t, 12>;
 static_assert(sizeof(ObjectIdType) == 12);
 
-template <typename T>
-T readFromMemory(const char* memory) noexcept {
-    T val;
-    memcpy(&val, memory, sizeof(T));
-    return val;
-}
-
-template <typename T>
-T readFromMemory(const unsigned char* memory) noexcept {
-    T val;
-    memcpy(&val, memory, sizeof(T));
-    return val;
-}
-
-template <typename T>
-size_t writeToMemory(unsigned char* memory, const T val) noexcept {
-    memcpy(memory, &val, sizeof(T));
-
-    return sizeof(T);
-}
-
 /**
  * getRawStringView() returns a char* or const char* that points to the first character of a given
  * string (or a null terminator byte if the string is empty). Where possible, getStringView() should
@@ -713,7 +697,56 @@ inline const char* getRawStringView(TypeTags tag, const Value& val) noexcept {
  */
 inline size_t getStringLength(TypeTags tag, const Value& val) noexcept {
     if (tag == TypeTags::StringSmall) {
-        return strlen(reinterpret_cast<const char*>(&val));
+        // This path turned out to be very hot in our benchmarks, so we avoid calling 'strlen()' and
+        // use an alternative approach to compute string length.
+        // NOTE: Small string value always contains exactly one zero byte, marking the end of the
+        // string. Bytes after this zero byte can have arbitrary value.
+#if defined(BOOST_HW_SIMD_X86_AVAILABLE) && BOOST_HW_SIMD_X86 >= BOOST_HW_SIMD_X86_SSE2_VERSION
+        // If SSE2 instruction set is available, we use SIMD instructions. There are several steps:
+        //  (1) _mm_cvtsi64_si128(val) - Copy string value into the 128-bit register
+        //  (2) _mm_cmpeq_epi8 - Make each zero byte equal to 0xFF. Other bytes become zero
+        //  (3) _mm_movemask_epi8 - Copy most significant bit of each byte into int
+        //  (4) countTrailingZerosNonZeroInt - Get the position of the first trailing bit set
+        static_assert(endian::Order::kNative == endian::Order::kLittle);
+        int ret = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_cvtsi64_si128(val), _mm_setzero_si128()));
+        return countTrailingZerosNonZero32(ret);
+#else
+        // If SSE2 is not available, we use bit magic.
+        const uint64_t magic = 0x7F7F7F7F7F7F7F7FULL;
+
+        // This is based on a trick from following link, which describes how to make an expression
+        // which results in '0' when ALL bytes are non-zero, and results in zero when ANY byte is
+        // zero. Instead of casting this result to bool, we count how many complete 0 bytes there
+        // are in 'ret'. This tells us the length of the string.
+        // https://graphics.stanford.edu/~seander/bithacks.html#ZeroInWord
+
+        // At the end of this, ret will store a value where  each byte which was all 0's is now
+        // 10000000 and any byte that was anything non zero is now 0.
+
+        // (1) compute (val & magic). This clears the highest bit in each byte.
+        uint64_t ret = val & magic;
+
+        // (2) add magic to the above expression. The result is that, from overflow,
+        // the high bit will be set if any bit was set in 'v' other than the high bit.
+        ret += magic;
+        // (3) OR this result with v. This ensures that if the high bit in 'v' was set
+        // then the high bit in our result will be set.
+        ret |= val;
+        // (4) OR with magic. This will set any low bits which were not already set. At this point
+        // each byte is either all ones or 01111111.
+        ret |= magic;
+
+        // When we invert this, each byte will either be
+        // all zeros (previously non zero) or 10000000 (previously 0).
+        ret = ~ret;
+
+        // So all we have to do is count how many complete 0 bytes there are from one end.
+        if constexpr (endian::Order::kNative == endian::Order::kLittle) {
+            return (countTrailingZerosNonZero64(ret) >> 3);
+        } else {
+            return (countLeadingZerosNonZero64(ret) >> 3);
+        }
+#endif
     } else if (tag == TypeTags::StringBig || tag == TypeTags::bsonString) {
         return ConstDataView(getRawPointerView(val)).read<LittleEndian<int32_t>>() - 1;
     }
@@ -944,12 +977,12 @@ inline SortSpec* getSortSpecView(Value val) noexcept {
 struct BsonRegex {
     explicit BsonRegex(const char* rawValue) {
         pattern = rawValue;
-        // We add sizeof(char) to account NULL byte after pattern.
+        // Add sizeof(char) to account for the NULL byte after 'pattern'.
         flags = pattern.rawData() + pattern.size() + sizeof(char);
     }
 
     size_t byteSize() const {
-        // We add 2 * sizeof(char) to account NULL bytes after each string.
+        // Add 2 * sizeof(char) to account for the NULL bytes after 'pattern' and 'flags'.
         return pattern.size() + sizeof(char) + flags.size() + sizeof(char);
     }
 
@@ -985,15 +1018,16 @@ struct BsonDBPointer {
     explicit BsonDBPointer(const char* rawValue) {
         uint32_t lenWithNull = ConstDataView(rawValue).read<LittleEndian<uint32_t>>();
         ns = {rawValue + sizeof(uint32_t), lenWithNull - sizeof(char)};
-        id = reinterpret_cast<const uint8_t*>(rawValue) + 4 + lenWithNull;
+        id = reinterpret_cast<const uint8_t*>(rawValue) + sizeof(uint32_t) + lenWithNull;
     }
 
     size_t byteSize() const {
+        // Add sizeof(char) to account for the NULL byte after 'ns'.
         return sizeof(uint32_t) + ns.size() + sizeof(char) + sizeof(value::ObjectIdType);
     }
 
     StringData ns;
-    const uint8_t* id = nullptr;
+    const uint8_t* id{nullptr};
 };
 
 inline BsonDBPointer getBsonDBPointerView(Value val) noexcept {
@@ -1004,6 +1038,43 @@ std::pair<TypeTags, Value> makeNewBsonDBPointer(StringData ns, const uint8_t* id
 
 inline std::pair<TypeTags, Value> makeCopyBsonDBPointer(const BsonDBPointer& dbptr) {
     return makeNewBsonDBPointer(dbptr.ns, dbptr.id);
+}
+
+/**
+ * The BsonCodeWScope class is used to represent the CodeWScope BSON type.
+ *
+ * In BSON, a CodeWScope is encoded as a little-endian 32-bit integer ('numBytes'), followed by a
+ * bsonString ('code'), followed by a bsonObject ('scope').
+ */
+struct BsonCodeWScope {
+    explicit BsonCodeWScope(const char* rawValue) {
+        auto dataView = ConstDataView(rawValue);
+
+        numBytes = dataView.read<LittleEndian<uint32_t>>();
+        uint32_t lenWithNull = dataView.read<LittleEndian<uint32_t>>(sizeof(uint32_t));
+
+        auto ptr = rawValue + 2 * sizeof(uint32_t);
+        code = {ptr, lenWithNull - sizeof(char)};
+        scope = ptr + lenWithNull;
+    }
+
+    size_t byteSize() const {
+        return numBytes;
+    }
+
+    uint32_t numBytes{0};
+    StringData code;
+    const char* scope{nullptr};
+};
+
+inline BsonCodeWScope getBsonCodeWScopeView(Value val) noexcept {
+    return BsonCodeWScope(getRawPointerView(val));
+}
+
+std::pair<TypeTags, Value> makeNewBsonCodeWScope(StringData code, const char* scope);
+
+inline std::pair<TypeTags, Value> makeCopyBsonCodeWScope(const BsonCodeWScope& cws) {
+    return makeNewBsonCodeWScope(cws.code, cws.scope);
 }
 
 std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey);
@@ -1083,6 +1154,8 @@ inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
             return makeCopyBsonJavascript(getBsonJavascriptView(val));
         case TypeTags::bsonDBPointer:
             return makeCopyBsonDBPointer(getBsonDBPointerView(val));
+        case TypeTags::bsonCodeWScope:
+            return makeCopyBsonCodeWScope(getBsonCodeWScopeView(val));
         case TypeTags::ftsMatcher:
             return makeCopyFtsMatcher(*getFtsMatcherView(val));
         case TypeTags::sortSpec:
@@ -1240,7 +1313,7 @@ public:
         reset(tag, val);
     }
 
-    void reset(TypeTags tag, Value val) {
+    void reset(TypeTags tag, Value val, size_t index = 0) {
         _tagArray = tag;
         _valArray = val;
         _array = nullptr;
@@ -1249,15 +1322,22 @@ public:
 
         if (tag == TypeTags::Array) {
             _array = getArrayView(val);
-        } else if (tag == TypeTags::ArraySet) {
-            _arraySet = getArraySetView(val);
-            _iter = _arraySet->values().begin();
-        } else if (tag == TypeTags::bsonArray) {
-            auto bson = getRawPointerView(val);
-            _arrayCurrent = bson + 4;
-            _arrayEnd = bson + ConstDataView(bson).read<LittleEndian<uint32_t>>();
+            _index = index;
         } else {
-            MONGO_UNREACHABLE;
+            if (tag == TypeTags::ArraySet) {
+                _arraySet = getArraySetView(val);
+                _iter = _arraySet->values().begin();
+            } else if (tag == TypeTags::bsonArray) {
+                auto bson = getRawPointerView(val);
+                _arrayCurrent = bson + 4;
+                _arrayEnd = bson + ConstDataView(bson).read<LittleEndian<uint32_t>>();
+            } else {
+                MONGO_UNREACHABLE;
+            }
+
+            for (size_t i = 0; !atEnd() && i < index; i++) {
+                advance();
+            }
         }
     }
 

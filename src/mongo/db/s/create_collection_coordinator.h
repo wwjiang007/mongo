@@ -44,7 +44,8 @@ public:
     using CoordDoc = CreateCollectionCoordinatorDocument;
     using Phase = CreateCollectionCoordinatorPhaseEnum;
 
-    CreateCollectionCoordinator(const BSONObj& initialState);
+    CreateCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                const BSONObj& initialState);
     ~CreateCollectionCoordinator() = default;
 
 
@@ -65,10 +66,12 @@ public:
     }
 
 private:
+    ShardingDDLCoordinatorMetadata const& metadata() const override {
+        return _doc.getShardingDDLCoordinatorMetadata();
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
-
-    void _interrupt(Status status) noexcept override;
 
     template <typename Func>
     auto _executePhase(const Phase& newPhase, Func&& func) {
@@ -87,8 +90,6 @@ private:
         };
     };
 
-    void _insertCoordinatorDocument(CoordDoc&& doc);
-    void _updateCoordinatorDocument(CoordDoc&& newStateDoc);
     void _enterPhase(Phase newState);
 
     /**
@@ -122,14 +123,17 @@ private:
     /**
      * Refresh all participant shards and log creation.
      */
-    void _finalize(OperationContext* opCtx) noexcept;
+    void _finalize(OperationContext* opCtx);
 
     /**
-     * Executes _commit with an exponential backoff and retries if the commit failed due to a
-     * stepdown error.
+     * Helper function to audit and log the shard collection event.
      */
-    ExecutorFuture<void> _commitWithRetries(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                            const CancellationToken& token);
+    void _logStartCreateCollection(OperationContext* opCtx);
+
+    /**
+     * Helper function to log the end of the shard collection event.
+     */
+    void _logEndCreateCollection(OperationContext* opCtx);
 
     CreateCollectionCoordinatorDocument _doc;
     const BSONObj _critSecReason;
@@ -141,6 +145,8 @@ private:
     std::unique_ptr<InitialSplitPolicy> _splitPolicy;
     InitialSplitPolicy::ShardCollectionConfig _initialChunks;
     boost::optional<CreateCollectionResponse> _result;
+    boost::optional<bool> _collectionEmpty;
+    boost::optional<size_t> _numChunks;
 };
 
 }  // namespace mongo

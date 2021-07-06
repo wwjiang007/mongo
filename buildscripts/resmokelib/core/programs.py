@@ -62,7 +62,7 @@ def mongod_program(logger, job_num, executable, process_kwargs, mongod_options):
 
     if "port" not in mongod_options:
         mongod_options["port"] = network.PortAllocator.next_fixture_port(job_num)
-    suite_set_parameters = mongod_options.get("set_parameters", make_historic({}))
+    suite_set_parameters = mongod_options.get("set_parameters", {})
     _apply_set_parameters(args, suite_set_parameters)
     mongod_options.pop("set_parameters")
 
@@ -106,10 +106,14 @@ def mongos_program(  # pylint: disable=too-many-arguments
 
 def mongo_shell_program(  # pylint: disable=too-many-arguments,too-many-branches,too-many-locals,too-many-statements
         logger, job_num, test_id=None, executable=None, connection_string=None, filename=None,
-        process_kwargs=None, **kwargs):
+        test_filename=None, process_kwargs=None, **kwargs):
     """Return a Process instance that starts a mongo shell.
 
     The shell is started with the given connection string and arguments constructed from 'kwargs'.
+
+    :param filename: the file run by the mongo shell
+    :param test_filename: The test file - it's usually  `filename`, but may be different for
+                          tests that use JS runner files, which in turn run real JS files.
     """
 
     executable = utils.default_if_none(
@@ -119,10 +123,16 @@ def mongo_shell_program(  # pylint: disable=too-many-arguments,too-many-branches
     eval_sb = []  # String builder.
     global_vars = kwargs.pop("global_vars", {}).copy()
 
-    if filename is not None:
-        test_name = os.path.splitext(os.path.basename(filename))[0]
+    def basename(filepath):
+        return os.path.splitext(os.path.basename(filepath))[0]
+
+    if test_filename is not None:
+        test_name = basename(test_filename)
+    elif filename is not None:
+        test_name = basename(filename)
     else:
         test_name = None
+
     shortcut_opts = {
         "backupOnRestartDir": (config.BACKUP_ON_RESTART_DIR, None),
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
@@ -135,6 +145,9 @@ def mongo_shell_program(  # pylint: disable=too-many-arguments,too-many-branches
         "wiredTigerCollectionConfigString": (config.WT_COLL_CONFIG, ""),
         "wiredTigerEngineConfigString": (config.WT_ENGINE_CONFIG, ""),
         "wiredTigerIndexConfigString": (config.WT_INDEX_CONFIG, ""),
+
+        # Evergreen variables.
+        "evergreenDebugSymbolsUrl": (config.DEBUG_SYMBOLS_URL, ""),
     }
 
     test_data = global_vars.get("TestData", {}).copy()
@@ -249,12 +262,6 @@ def mongo_shell_program(  # pylint: disable=too-many-arguments,too-many-branches
     eval_str = "; ".join(eval_sb)
     args.append("--eval")
     args.append(eval_str)
-
-    if config.SHELL_READ_MODE is not None:
-        kwargs["readMode"] = config.SHELL_READ_MODE
-
-    if config.SHELL_WRITE_MODE is not None:
-        kwargs["writeMode"] = config.SHELL_WRITE_MODE
 
     if connection_string is not None:
         # The --host and --port options are ignored by the mongo shell when an explicit connection

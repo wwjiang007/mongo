@@ -2,7 +2,6 @@ __quiet = false;
 __magicNoPrint = {
     __magicNoPrint: 1111
 };
-__callLastError = false;
 _verboseShell = false;
 
 chatty = function(s) {
@@ -368,6 +367,8 @@ jsTestOptions = function() {
 
             undoRecorderPath: TestData.undoRecorderPath,
             backupOnRestartDir: TestData.backupOnRestartDir || false,
+
+            evergreenDebugSymbolsUrl: TestData.evergreenDebugSymbolsUrl || null,
         });
     }
     return _jsTestOptions;
@@ -392,7 +393,11 @@ jsTest.basicUserRoles = ["dbOwner"];
 jsTest.adminUserRoles = ["root"];
 
 jsTest.authenticate = function(conn) {
-    if (!jsTest.options().auth && !jsTest.options().keyFile) {
+    const connOptions = conn.fullOptions || {};
+    const authMode =
+        connOptions.clusterAuthMode || conn.clusterAuthMode || jsTest.options().clusterAuthMode;
+
+    if (!jsTest.options().auth && !jsTest.options().keyFile && authMode !== "x509") {
         conn.authenticated = true;
         return true;
     }
@@ -402,12 +407,25 @@ jsTest.authenticate = function(conn) {
             // Set authenticated to stop an infinite recursion from getDB calling
             // back into authenticate.
             conn.authenticated = true;
-            print("Authenticating as user " + jsTestOptions().authUser + " with mechanism " +
-                  DB.prototype._getDefaultAuthenticationMechanism() + " on connection: " + conn);
-            conn.authenticated = conn.getDB(jsTestOptions().authenticationDatabase).auth({
-                user: jsTestOptions().authUser,
-                pwd: jsTestOptions().authPassword,
-            });
+            let mech = DB.prototype._getDefaultAuthenticationMechanism();
+            if (authMode === 'x509') {
+                mech = 'MONGODB-X509';
+            }
+
+            print("Authenticating as user " + jsTestOptions().authUser + " with mechanism " + mech +
+                  " on connection: " + conn);
+
+            if (authMode !== 'x509') {
+                conn.authenticated = conn.getDB(jsTestOptions().authenticationDatabase).auth({
+                    user: jsTestOptions().authUser,
+                    pwd: jsTestOptions().authPassword,
+                });
+            } else {
+                authutil.assertAuthenticate(conn, '$external', {
+                    mechanism: 'MONGODB-X509',
+                });
+            }
+
             return conn.authenticated;
             // Dont' run the hang analyzer because we expect that this might fail in the normal
             // course of events.
@@ -424,7 +442,7 @@ jsTest.authenticateNodes = function(nodes) {
         for (var i = 0; i < nodes.length; i++) {
             // Don't try to authenticate to arbiters
             try {
-                res = nodes[i].getDB("admin").runCommand({replSetGetStatus: 1});
+                res = nodes[i].getDB("admin")._runCommandWithoutApiStrict({replSetGetStatus: 1});
             } catch (e) {
                 // ReplicaSet tests which don't use auth are allowed to have nodes crash during
                 // startup. To allow tests which use to behavior to work with auth,
@@ -444,7 +462,7 @@ jsTest.authenticateNodes = function(nodes) {
 };
 
 jsTest.isMongos = function(conn) {
-    return conn.getDB('admin').isMaster().msg == 'isdbgrid';
+    return conn.getDB('admin')._helloOrLegacyHello().msg == 'isdbgrid';
 };
 
 defaultPrompt = function() {
@@ -453,7 +471,7 @@ defaultPrompt = function() {
 
     if (typeof prefix == 'undefined') {
         prefix = "";
-        var buildInfo = db.runCommand({buildInfo: 1});
+        var buildInfo = db._runCommandWithoutApiStrict({buildInfo: 1});
         try {
             if (buildInfo.modules.indexOf("enterprise") > -1) {
                 prefix += "MongoDB Enterprise ";
@@ -461,9 +479,9 @@ defaultPrompt = function() {
         } catch (e) {
             // Don't do anything here. Just throw the error away.
         }
-        var isMasterRes = db.runCommand({isMaster: 1, forShell: 1});
+        var hello = db._helloOrLegacyHello({forShell: 1});
         try {
-            if (isMasterRes.hasOwnProperty("automationServiceDescriptor")) {
+            if (hello.hasOwnProperty("automationServiceDescriptor")) {
                 prefix += "[automated] ";
             }
         } catch (e) {
@@ -478,12 +496,12 @@ defaultPrompt = function() {
             try {
                 var prompt = replSetMemberStatePrompt();
                 // set our status that it was good
-                db.getMongo().authStatus = {replSetGetStatus: true, isMaster: true};
+                db.getMongo().authStatus = {replSetGetStatus: true, hello: true};
                 return prefix + prompt;
             } catch (e) {
                 // don't have permission to run that, or requires auth
                 // print(e);
-                status = {authRequired: true, replSetGetStatus: false, isMaster: true};
+                status = {authRequired: true, replSetGetStatus: false, hello: true};
             }
         }
         // auth detected
@@ -504,22 +522,22 @@ defaultPrompt = function() {
             }
         }
 
-        // try to use isMaster?
-        if (status.isMaster) {
+        // try to use hello?
+        if (status.hello) {
             try {
-                var prompt = isMasterStatePrompt(isMasterRes);
-                status.isMaster = true;
+                var prompt = helloStatePrompt(hello);
+                status.hello = true;
                 db.getMongo().authStatus = status;
                 return prefix + prompt;
             } catch (e) {
                 status.authRequired = true;
-                status.isMaster = false;
+                status.hello = false;
             }
         }
     } catch (ex) {
         printjson(ex);
         // reset status and let it figure it out next time.
-        status = {isMaster: true};
+        status = {hello: true};
     }
 
     db.getMongo().authStatus = status;
@@ -528,7 +546,8 @@ defaultPrompt = function() {
 
 replSetMemberStatePrompt = function() {
     var state = '';
-    var stateInfo = db.getSiblingDB('admin').runCommand({replSetGetStatus: 1, forShell: 1});
+    var stateInfo =
+        db.getSiblingDB('admin')._runCommandWithoutApiStrict({replSetGetStatus: 1, forShell: 1});
     if (stateInfo.ok) {
         // Report the self member's stateStr if it's present.
         stateInfo.members.forEach(function(member) {
@@ -552,58 +571,34 @@ replSetMemberStatePrompt = function() {
     return state + '> ';
 };
 
-isMasterStatePrompt = function(isMasterResponse) {
+helloStatePrompt = function(helloReply) {
     var state = '';
-    var isMaster = isMasterResponse || db.runCommand({isMaster: 1, forShell: 1});
-    if (isMaster.ok) {
+    var hello = helloReply || db._helloOrLegacyHello({forShell: 1});
+    if (hello.ok) {
         var role = "";
 
-        if (isMaster.msg == "isdbgrid") {
+        if (hello.msg == "isdbgrid") {
             role = "mongos";
         }
 
-        if (isMaster.setName) {
-            if (isMaster.ismaster)
+        if (hello.setName) {
+            if (hello.isWritablePrimary || hello.ismaster)
                 role = "PRIMARY";
-            else if (isMaster.secondary)
+            else if (hello.secondary)
                 role = "SECONDARY";
-            else if (isMaster.arbiterOnly)
+            else if (hello.arbiterOnly)
                 role = "ARBITER";
             else {
                 role = "OTHER";
             }
-            state = isMaster.setName + ':';
+            state = hello.setName + ':';
         }
         state = state + role;
     } else {
-        throw _getErrorWithCode(isMaster, "Failed: " + tojson(isMaster));
+        throw _getErrorWithCode(hello, "Failed: " + tojson(hello));
     }
     return state + '> ';
 };
-
-if (typeof _useWriteCommandsDefault === "undefined") {
-    // We ensure the _useWriteCommandsDefault() function is always defined, in case the JavaScript
-    // engine is being used from someplace other than the mongo shell (e.g. map-reduce).
-    _useWriteCommandsDefault = function _useWriteCommandsDefault() {
-        return false;
-    };
-}
-
-if (typeof _writeMode === "undefined") {
-    // We ensure the _writeMode() function is always defined, in case the JavaScript engine is being
-    // used from someplace other than the mongo shell (e.g. map-reduce).
-    _writeMode = function _writeMode() {
-        return "commands";
-    };
-}
-
-if (typeof _readMode === "undefined") {
-    // We ensure the _readMode() function is always defined, in case the JavaScript engine is being
-    // used from someplace other than the mongo shell (e.g. map-reduce).
-    _readMode = function _readMode() {
-        return "legacy";
-    };
-}
 
 if (typeof _shouldRetryWrites === 'undefined') {
     // We ensure the _shouldRetryWrites() function is always defined, in case the JavaScript engine
@@ -625,17 +620,6 @@ if (typeof _shouldUseImplicitSessions === 'undefined') {
 
 shellPrintHelper = function(x) {
     if (typeof (x) == "undefined") {
-        // Make sure that we have a db var before we use it
-        // TODO: This implicit calling of GLE can cause subtle, hard to track issues - remove?
-        if (__callLastError && typeof (db) != "undefined" && db.getMongo &&
-            db.getMongo().writeMode() == "legacy") {
-            __callLastError = false;
-            // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad
-            var err = db.getLastError(1);
-            if (err != null) {
-                print(err);
-            }
-        }
         return;
     }
 
@@ -1074,7 +1058,7 @@ shellHelper.show = function(what) {
         }
 
         if (dbDeclared) {
-            var res = db.runCommand({isMaster: 1, forShell: 1});
+            var res = db._helloOrLegacyHello({forShell: 1});
             if (!res.ok) {
                 print("Note: Cannot determine if automation is active");
                 return "";
@@ -1148,7 +1132,7 @@ shellHelper.show = function(what) {
         // A MongoDB emulation service offered by a company
         // responsible for a certain disk operating system.
         try {
-            const buildInfo = db.runCommand({buildInfo: 1});
+            const buildInfo = db._runCommandWithoutApiStrict({buildInfo: 1});
             if (buildInfo.hasOwnProperty('_t')) {
                 matchesKnownImposterSignature = true;
             }
@@ -1204,7 +1188,7 @@ __promptWrapper__ = function(promptFunction) {
     try {
         db = originalDB.getMongo().getDB(originalDB.getName());
         // Setting db._session to be a _DummyDriverSession instance makes it so that
-        // a logical session id isn't included in the isMaster and replSetGetStatus
+        // a logical session id isn't included in the hello and replSetGetStatus
         // commands and therefore won't interfere with the session associated with the
         // global "db" object.
         db._session = new _DummyDriverSession(db.getMongo());
@@ -1445,35 +1429,42 @@ _awaitRSHostViaRSMonitor = function(hostAddr, desiredState, rsName, timeout) {
 
 rs.help = function() {
     print(
-        "\trs.status()                                { replSetGetStatus : 1 } checks repl set status");
+        "\trs.status()                                     { replSetGetStatus : 1 } checks repl set status");
     print(
-        "\trs.initiate()                              { replSetInitiate : null } initiates set with default settings");
+        "\trs.initiate()                                   { replSetInitiate : null } initiates set with default settings");
     print(
-        "\trs.initiate(cfg)                           { replSetInitiate : cfg } initiates set with configuration cfg");
+        "\trs.initiate(cfg)                                { replSetInitiate : cfg } initiates set with configuration cfg");
     print(
-        "\trs.conf()                                  get the current configuration object from local.system.replset");
+        "\trs.conf()                                       get the current configuration object from local.system.replset");
     print(
-        "\trs.reconfig(cfg)                           updates the configuration of a running replica set with cfg (disconnects)");
+        "\trs.reconfig(cfg, opts)                          updates the configuration of a running replica set with cfg, using the given opts (disconnects)");
     print(
-        "\trs.add(hostportstr)                        add a new member to the set with default attributes (disconnects)");
+        "\trs.reconfigForPSASet(memberIndex, cfg, opts)    updates the configuration of a Primary-Secondary-Arbiter (PSA) replica set while preserving majority writes");
     print(
-        "\trs.add(membercfgobj)                       add a new member to the set with extra attributes (disconnects)");
+        "\t                                                    memberIndex: index of the node being updated; cfg: the desired new config; opts: options passed in with the reconfig");
+    // TODO (SERVER-56801): Add placeholder link.
     print(
-        "\trs.addArb(hostportstr)                     add a new member which is arbiterOnly:true (disconnects)");
-    print("\trs.stepDown([stepdownSecs, catchUpSecs])   step down as primary (disconnects)");
+        "\t                                                    Not to be used with every configuration");
     print(
-        "\trs.syncFrom(hostportstr)                   make a secondary sync from the given member");
+        "\trs.add(hostportstr)                             add a new member to the set with default attributes (disconnects)");
     print(
-        "\trs.freeze(secs)                            make a node ineligible to become primary for the time specified");
+        "\trs.add(membercfgobj)                            add a new member to the set with extra attributes (disconnects)");
     print(
-        "\trs.remove(hostportstr)                     remove a host from the replica set (disconnects)");
-    print("\trs.secondaryOk()                               allow queries on secondary nodes");
+        "\trs.addArb(hostportstr)                          add a new member which is arbiterOnly:true (disconnects)");
+    print("\trs.stepDown([stepdownSecs, catchUpSecs])        step down as primary (disconnects)");
+    print(
+        "\trs.syncFrom(hostportstr)                        make a secondary sync from the given member");
+    print(
+        "\trs.freeze(secs)                                 make a node ineligible to become primary for the time specified");
+    print(
+        "\trs.remove(hostportstr)                          remove a host from the replica set (disconnects)");
+    print("\trs.secondaryOk()                                allow queries on secondary nodes");
     print();
-    print("\trs.printReplicationInfo()                  check oplog size and time range");
+    print("\trs.printReplicationInfo()                       check oplog size and time range");
     print(
-        "\trs.printSecondaryReplicationInfo()             check replica set members and replication lag");
-    print("\tdb.isMaster()                              check who is primary");
-    print("\tdb.hello()                              check who is primary");
+        "\trs.printSecondaryReplicationInfo()              check replica set members and replication lag");
+    print("\tdb.isMaster()                                   check who is primary");
+    print("\tdb.hello()                                      check who is primary");
     print();
     print("\treconfiguration helpers disconnect from the database so the shell will display");
     print("\tan error, even if the command succeeds.");
@@ -1518,13 +1509,10 @@ rs._runCmd = function(c) {
         res = db.adminCommand(c);
     } catch (e) {
         if (isNetworkError(e)) {
-            // closed connection.  reconnect.
-            db.getLastErrorObj();
-            var o = db.getLastErrorObj();
-            if (o.ok) {
+            if (reconnect(db)) {
                 print("reconnected to server after rs command (which is normal)");
             } else {
-                printjson(o);
+                print("failed to reconnect to server after:" + e);
             }
         } else {
             print("shell got exception during repl set operation: " + e);
@@ -1542,6 +1530,55 @@ rs.reconfig = function(cfg, options) {
         cmd[i] = options[i];
     }
     return this._runCmd(cmd);
+};
+
+_validateMemberIndex = function(memberIndex, newConfig) {
+    const newMemberConfig = newConfig.members[memberIndex];
+    assert(newMemberConfig, `Node at index ${memberIndex} does not exist in the new config`);
+    assert.eq(1,
+              newMemberConfig.votes,
+              `Node at index ${memberIndex} must have {votes: 1} in the new config`);
+
+    // Use memberId to compare nodes across configs.
+    const memberId = newMemberConfig._id;
+    const oldConfig = rs.conf();
+    const oldMemberConfig = oldConfig.members.find(member => member._id === memberId);
+
+    // If the node doesn't exist in the old config, we are adding it as a new node. Skip validating
+    // the node in the old config.
+    if (!oldMemberConfig) {
+        return;
+    }
+
+    assert(!oldMemberConfig.votes,
+           `Node at index ${memberIndex} must have {votes: 0} in the old config`);
+};
+
+rs.reconfigForPSASet = function(memberIndex, cfg, options) {
+    _validateMemberIndex(memberIndex, cfg);
+
+    const memberPriority = cfg.members[memberIndex].priority;
+    print(
+        `Running first reconfig to give member at index ${memberIndex} { votes: 1, priority: 0 }`);
+    cfg.members[memberIndex].votes = 1;
+    cfg.members[memberIndex].priority = 0;
+    let res = rs.reconfig(cfg, options);
+    if (!res.ok) {
+        return res;
+    }
+
+    print(`Running second reconfig to give member at index ${memberIndex} { priority: ${
+        memberPriority} }`);
+    cfg.members[memberIndex].priority = memberPriority;
+
+    // If the first reconfig added a new node, the second config will not succeed until the
+    // automatic reconfig to remove the 'newlyAdded' field is completed. Retry the second reconfig
+    // until it succeeds in that case.
+    assert.soon(() => {
+        res = rs.reconfig(cfg, options);
+        return res.ok;
+    });
+    return res;
 };
 rs.add = function(hostport, arb) {
     let res;
@@ -1739,8 +1776,6 @@ help = shellHelper.help = function(x) {
         print("    var mydb = x.getDB('mydb');");
         print("  or");
         print("    var mydb = connect('host[:port]/mydb');");
-        print(
-            "\nNote: the REPL prompt only auto-reports getLastError() for the shell command line connection.\n");
         return;
     } else if (x == "keys") {
         print("Tab completion and command history is available at the command prompt.\n");

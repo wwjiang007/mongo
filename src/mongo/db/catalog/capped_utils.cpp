@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
@@ -48,10 +49,8 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/util/scopeguard.h"
 
@@ -75,7 +74,7 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
     CollectionWriter collection(opCtx, collectionName);
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "emptycapped not supported on view: " << collectionName.ns(),
-            collection || !ViewCatalog::get(db)->lookup(opCtx, collectionName.ns()));
+            collection || !ViewCatalog::get(db)->lookup(opCtx, collectionName));
     uassert(ErrorCodes::NamespaceNotFound, "no such collection", collection);
 
     if (collectionName.isSystem() && !collectionName.isSystemDotProfile()) {
@@ -127,7 +126,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "cloneCollectionAsCapped not supported for views: " << fromNss,
-                !ViewCatalog::get(db)->lookup(opCtx, fromNss.ns()));
+                !ViewCatalog::get(db)->lookup(opCtx, fromNss));
 
         uasserted(ErrorCodes::NamespaceNotFound,
                   str::stream() << "source collection " << fromNss << " does not exist");
@@ -145,8 +144,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
 
     // create new collection
     {
-        auto options =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, fromCollection->getCatalogId());
+        auto options = fromCollection->getCollectionOptions();
         // The capped collection will get its own new unique id, as the conversion isn't reversible,
         // so it can't be rolled back.
         options.uuid.reset();
@@ -237,7 +235,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
             // Because of that, we acquire an optime for the insert now to ensure that the insert
             // oplog entry gets logged before any delete oplog entries.
             if (!isOplogDisabledForCappedCollection) {
-                auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+                auto oplogInfo = LocalOplogInfo::get(opCtx);
                 auto oplogSlots = oplogInfo->getNextOpTimes(opCtx, /*batchSize=*/1);
                 insertStmt.oplogSlot = oplogSlots.front();
             }

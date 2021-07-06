@@ -18,11 +18,9 @@ selector:
   - jstests/core/currentop.js  # uses fsync.
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
-  - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
@@ -78,7 +76,6 @@ selector:
   - jstests/core/and.js
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
-  - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
@@ -152,7 +149,6 @@ selector:
   # to test run without multi statement transactions).
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
-  - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
   - jstests/core/field_name_validation.js
@@ -274,8 +270,8 @@ selector:
   # it, since we won't know whether the cursor was advanced or not.
   - requires_getmore
   - does_not_support_transactions
-  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
-  # cannot be run with transactions.
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
   - uses_api_parameters
 
 executor:
@@ -305,7 +301,6 @@ executor:
             # coordinateCommit commmand returns as soon as the decision is made durable, and
             # prepare conflicts are explicity ignored for non-causal reads.
             causalConsistency: true
-      readMode: commands
   hooks:
   - class: CheckReplDBHashInBackground
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied

@@ -82,8 +82,8 @@ public:
         CatalogTestFixture::setUp();
 
         WriteUnitOfWork wuow(operationContext());
-        AutoGetOrCreateDb autoDb(operationContext(), "db", MODE_X);
-        _db = autoDb.getDb();
+        AutoGetDb autoDb(operationContext(), "db", MODE_X);
+        _db = autoDb.ensureDbExists();
         invariant(_db);
 
         auto durableViewCatalogUnique = std::make_unique<DurableViewCatalogImpl>(_db);
@@ -95,8 +95,8 @@ public:
             NamespaceString("db", NamespaceString::kSystemDotViewsCollectionName)));
 
         // Create any additional databases used throughout the test.
-        ASSERT(AutoGetOrCreateDb(operationContext(), "db1", MODE_X).getDb());
-        ASSERT(AutoGetOrCreateDb(operationContext(), "db2", MODE_X).getDb());
+        ASSERT(AutoGetDb(operationContext(), "db1", MODE_X).ensureDbExists());
+        ASSERT(AutoGetDb(operationContext(), "db2", MODE_X).ensureDbExists());
         wuow.commit();
     }
 
@@ -164,7 +164,8 @@ public:
         return _db;
     }
 
-    std::shared_ptr<const ViewDefinition> lookup(OperationContext* opCtx, StringData ns) {
+    std::shared_ptr<const ViewDefinition> lookup(OperationContext* opCtx,
+                                                 const NamespaceString& ns) {
         Lock::DBLock dbLock(operationContext(), NamespaceString(ns).db(), MODE_IS);
         return getViewCatalog()->lookup(operationContext(), ns);
     }
@@ -495,7 +496,7 @@ TEST_F(ReplViewCatalogFixture, ModifyViewWithPipelineFailsOnIneligibleStage) {
 }
 
 TEST_F(ViewCatalogFixture, LookupMissingView) {
-    ASSERT(!lookup(operationContext(), "db.view"_sd));
+    ASSERT(!lookup(operationContext(), NamespaceString("db.view")));
 }
 
 TEST_F(ViewCatalogFixture, LookupExistingView) {
@@ -504,7 +505,7 @@ TEST_F(ViewCatalogFixture, LookupExistingView) {
 
     ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
 
-    ASSERT(lookup(operationContext(), "db.view"_sd));
+    ASSERT(lookup(operationContext(), viewName));
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDExistingView) {
@@ -621,13 +622,13 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
 }
 
 TEST_F(ViewCatalogFixture, CreateViewThenDropAndLookup) {
-    const NamespaceString viewName("db.view");
+    NamespaceString viewName("db.view");
     const NamespaceString viewOn("db.coll");
 
     ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
     ASSERT_OK(dropView(operationContext(), viewName));
 
-    ASSERT(!lookup(operationContext(), "db.view"_sd));
+    ASSERT(!lookup(operationContext(), viewName));
 }
 
 TEST_F(ViewCatalogFixture, Iterate) {

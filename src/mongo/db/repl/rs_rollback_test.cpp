@@ -58,7 +58,6 @@
 #include "mongo/db/repl/rollback_test_fixture.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
@@ -213,7 +212,7 @@ int _createIndexOnEmptyCollection(OperationContext* opCtx,
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     auto indexCatalog = coll->getIndexCatalog();
     WriteUnitOfWork wunit(opCtx);
-    ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, indexSpec).getStatus());
+    ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, coll, indexSpec).getStatus());
     wunit.commit();
     return indexCatalog->numIndexesReady(opCtx);
 }
@@ -1358,9 +1357,7 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
         ASSERT_TRUE(oldCollName.getCollection());
 
         // Remote collection options should have been empty.
-        auto collAfterRollbackOptions =
-            DurableCatalog::get(_opCtx.get())
-                ->getCollectionOptions(_opCtx.get(), oldCollName.getCollection()->getCatalogId());
+        auto collAfterRollbackOptions = oldCollName->getCollectionOptions();
         ASSERT_BSONOBJ_EQ(BSON("uuid" << *options.uuid), collAfterRollbackOptions.toBSON());
     }
 }
@@ -1416,9 +1413,7 @@ TEST_F(RSRollbackTest,
     ASSERT_TRUE(rollbackSource.getCollectionInfoCalled);
 
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString(renameFromNss));
-    auto collAfterRollbackOptions =
-        DurableCatalog::get(_opCtx.get())
-            ->getCollectionOptions(_opCtx.get(), autoColl.getCollection()->getCatalogId());
+    auto collAfterRollbackOptions = autoColl->getCollectionOptions();
     ASSERT_TRUE(collAfterRollbackOptions.temp);
     ASSERT_BSONOBJ_EQ(BSON("uuid" << *options.uuid << "temp" << true),
                       collAfterRollbackOptions.toBSON());
@@ -1817,13 +1812,13 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
     CollectionOptions options;
     options.uuid = UUID::gen();
     {
-        AutoGetOrCreateDb autoDb(_opCtx.get(), "test", MODE_X);
+        AutoGetDb autoDb(_opCtx.get(), "test", MODE_X);
         mongo::WriteUnitOfWork wuow(_opCtx.get());
         coll = CollectionCatalog::get(_opCtx.get())
                    ->lookupCollectionByNamespace(_opCtx.get(), NamespaceString("test.t"));
         if (!coll) {
-            coll =
-                autoDb.getDb()->createCollection(_opCtx.get(), NamespaceString("test.t"), options);
+            auto db = autoDb.ensureDbExists();
+            coll = db->createCollection(_opCtx.get(), NamespaceString("test.t"), options);
         }
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
@@ -2020,9 +2015,7 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommand) {
 
     // Make sure the collection options are correct.
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString("test.t"));
-    auto collAfterRollbackOptions =
-        DurableCatalog::get(_opCtx.get())
-            ->getCollectionOptions(_opCtx.get(), autoColl.getCollection()->getCatalogId());
+    auto collAfterRollbackOptions = autoColl->getCollectionOptions();
     ASSERT_BSONOBJ_EQ(BSON("uuid" << *options.uuid), collAfterRollbackOptions.toBSON());
 }
 

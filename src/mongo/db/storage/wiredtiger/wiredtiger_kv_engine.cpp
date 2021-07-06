@@ -118,6 +118,7 @@ namespace mongo {
 
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(WTPauseStableTimestamp);
 MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
 MONGO_FAIL_POINT_DEFINE(WTSetOldestTSToStableTS);
 
@@ -326,6 +327,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
       _inRepairMode(repair),
       _readOnly(readOnly),
       _keepDataHistory(serverGlobalParams.enableMajorityReadConcern) {
+    _pinnedOplogTimestamp.store(Timestamp::max().asULL());
     boost::filesystem::path journalPath = path;
     journalPath /= "journal";
     if (_durable) {
@@ -343,7 +345,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
     }
 
-    _previousCheckedDropsQueued = _clockSource->now();
+    _previousCheckedDropsQueued.store(_clockSource->now().toMillisSinceEpoch());
 
     std::stringstream ss;
     ss << "create,";
@@ -363,6 +365,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     ss << "log=(enabled=true,archive=" << (_readOnly ? "false" : "true")
        << ",path=journal,compressor=";
     ss << wiredTigerGlobalOptions.journalCompressor << "),";
+    ss << "builtin_extension_config=(zstd=(compression_level="
+       << wiredTigerGlobalOptions.zstdCompressorLevel << ")),";
     ss << "file_manager=(close_idle_time=" << gWiredTigerFileHandleCloseIdleTime
        << ",close_scan_interval=" << gWiredTigerFileHandleCloseScanInterval
        << ",close_handle_minimum=" << gWiredTigerFileHandleCloseMinimum << "),";
@@ -375,8 +379,9 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     }
 
     if (kDebugBuild) {
-        // Enable debug write-ahead logging for all tables under debug build.
-        ss << "debug_mode=(table_logging=true,";
+        // Enable debug write-ahead logging for all tables under debug build. Do not abort the
+        // process when corruption is found in debug builds, which supports increased test coverage.
+        ss << "debug_mode=(table_logging=true,corruption_abort=false,";
         // For select debug builds, support enabling WiredTiger eviction debug mode. This uses
         // more aggressive eviction tactics, but may have a negative performance impact.
         if (gWiredTigerEvictionDebugMode) {
@@ -1478,6 +1483,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext
     params.sizeStorer = _sizeStorer.get();
     params.isReadOnly = _readOnly;
     params.tracksSizeAdjustments = true;
+    params.forceUpdateWithFullDocument = options.timeseries != boost::none;
 
     if (NamespaceString::oplog(ns)) {
         // The oplog collection must have a size provided.
@@ -1620,6 +1626,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     // Temporary collections do not need to reconcile collection size/counts.
     params.tracksSizeAdjustments = false;
     params.isReadOnly = false;
+    params.forceUpdateWithFullDocument = false;
 
     std::unique_ptr<WiredTigerRecordStore> rs;
     rs = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
@@ -1726,7 +1733,7 @@ std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDro
 
 bool WiredTigerKVEngine::haveDropsQueued() const {
     Date_t now = _clockSource->now();
-    Milliseconds delta = now - _previousCheckedDropsQueued;
+    Milliseconds delta = now - Date_t::fromMillisSinceEpoch(_previousCheckedDropsQueued.load());
 
     if (!_readOnly && _sizeStorerSyncTracker.intervalHasElapsed()) {
         _sizeStorerSyncTracker.resetLastTime();
@@ -1737,7 +1744,7 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     if (delta < Milliseconds(1000))
         return false;
 
-    _previousCheckedDropsQueued = now;
+    _previousCheckedDropsQueued.store(now.toMillisSinceEpoch());
 
     // Don't wait for the mutex: if we can't get it, report that no drops are queued.
     stdx::unique_lock<Latch> lk(_identToDropMutex, stdx::defer_lock);
@@ -1816,7 +1823,7 @@ void WiredTigerKVEngine::checkpoint() {
         // Three cases:
         //
         // First, initialDataTimestamp is Timestamp(0, 1) -> Take full checkpoint. This is when
-        // there is no consistent view of the data (i.e: during initial sync).
+        // there is no consistent view of the data (e.g: during initial sync).
         //
         // Second, stableTimestamp < initialDataTimestamp: Skip checkpoints. The data on disk is
         // prone to being rolled back. Hold off on checkpoints.  Hope that the stable timestamp
@@ -1828,6 +1835,10 @@ void WiredTigerKVEngine::checkpoint() {
             UniqueWiredTigerSession session = _sessionCache->getSession();
             WT_SESSION* s = session->getSession();
             invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
+            LOGV2_FOR_RECOVERY(5576602,
+                               2,
+                               "Completed unstable checkpoint.",
+                               "initialDataTimestamp"_attr = initialDataTimestamp.toString());
         } else if (stableTimestamp < initialDataTimestamp) {
             LOGV2_FOR_RECOVERY(
                 23985,
@@ -1854,7 +1865,6 @@ void WiredTigerKVEngine::checkpoint() {
             }
         }
     } catch (const WriteConflictException&) {
-        // TODO SERVER-50824: Check if this can be removed now that WT-3483 is done.
         LOGV2_WARNING(22346, "Checkpoint encountered a write conflict exception.");
     } catch (const AssertionException& exc) {
         invariant(ErrorCodes::isShutdownError(exc.code()), exc.what());
@@ -1957,7 +1967,31 @@ void WiredTigerKVEngine::setJournalListener(JournalListener* jl) {
     return _sessionCache->setJournalListener(jl);
 }
 
+namespace {
+uint64_t _fetchAllDurableValue(WT_CONNECTION* conn) {
+    // Fetch the latest all_durable value from the storage engine. This value will be a timestamp
+    // that has no holes (uncommitted transactions with lower timestamps) behind it.
+    char buf[(2 * 8 /*bytes in hex*/) + 1 /*nul terminator*/];
+    auto wtStatus = conn->query_timestamp(conn, buf, "get=all_durable");
+    if (wtStatus == WT_NOTFOUND) {
+        // Treat this as lowest possible timestamp; we need to see all preexisting data but no new
+        // (timestamped) data.
+        return StorageEngine::kMinimumTimestamp;
+    } else {
+        invariantWTOK(wtStatus);
+    }
+
+    uint64_t tmp;
+    fassert(38002, NumberParser().base(16)(buf, &tmp));
+    return tmp;
+}
+}  // namespace
+
 void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp, bool force) {
+    if (MONGO_unlikely(WTPauseStableTimestamp.shouldFail())) {
+        return;
+    }
+
     if (stableTimestamp.isNull()) {
         return;
     }
@@ -1968,7 +2002,7 @@ void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp, bool forc
         return;
     }
 
-    Timestamp allDurableTimestamp = getAllDurableTimestamp();
+    Timestamp allDurableTimestamp = Timestamp(_fetchAllDurableValue(_conn));
 
     // When 'force' is set, the all durable timestamp will be advanced to the stable timestamp.
     // TODO SERVER-52623: to remove this enable majority read concern check.
@@ -2207,26 +2241,6 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
     return {stableTimestamp};
 }
 
-namespace {
-uint64_t _fetchAllDurableValue(WT_CONNECTION* conn) {
-    // Fetch the latest all_durable value from the storage engine. This value will be a timestamp
-    // that has no holes (uncommitted transactions with lower timestamps) behind it.
-    char buf[(2 * 8 /*bytes in hex*/) + 1 /*nul terminator*/];
-    auto wtstatus = conn->query_timestamp(conn, buf, "get=all_durable");
-    if (wtstatus == WT_NOTFOUND) {
-        // Treat this as lowest possible timestamp; we need to see all preexisting data but no new
-        // (timestamped) data.
-        return StorageEngine::kMinimumTimestamp;
-    } else {
-        invariantWTOK(wtstatus);
-    }
-
-    uint64_t tmp;
-    fassert(38002, NumberParser().base(16)(buf, &tmp));
-    return tmp;
-}
-}  // namespace
-
 Timestamp WiredTigerKVEngine::getAllDurableTimestamp() const {
     auto ret = _fetchAllDurableValue(_conn);
 
@@ -2315,28 +2329,30 @@ boost::optional<Timestamp> WiredTigerKVEngine::getOplogNeededForCrashRecovery() 
 }
 
 Timestamp WiredTigerKVEngine::getPinnedOplog() const {
+    // The storage engine may have been told to keep oplog back to a certain timestamp.
+    Timestamp pinned = Timestamp(_pinnedOplogTimestamp.load());
+
     {
         stdx::lock_guard<Latch> lock(_oplogPinnedByBackupMutex);
         if (!storageGlobalParams.allowOplogTruncation) {
             // If oplog truncation is not allowed, then return the min timestamp so that no history
-            // is
-            // ever allowed to be deleted.
+            // is ever allowed to be deleted.
             return Timestamp::min();
         }
         if (_oplogPinnedByBackup) {
             // All the oplog since `_oplogPinnedByBackup` should remain intact during the backup.
-            return _oplogPinnedByBackup.get();
+            return std::min(_oplogPinnedByBackup.get(), pinned);
         }
     }
 
     auto oplogNeededForCrashRecovery = getOplogNeededForCrashRecovery();
     if (!_keepDataHistory) {
         // We use rollbackViaRefetch, so we only need to pin oplog for crash recovery.
-        return oplogNeededForCrashRecovery.value_or(Timestamp::max());
+        return std::min((oplogNeededForCrashRecovery.value_or(Timestamp::max())), pinned);
     }
 
     if (oplogNeededForCrashRecovery) {
-        return oplogNeededForCrashRecovery.value();
+        return std::min(oplogNeededForCrashRecovery.value(), pinned);
     }
 
     auto status = getOplogNeededForRollback();
@@ -2434,6 +2450,10 @@ void WiredTigerKVEngine::unpinOldestTimestamp(const std::string& requestingServi
 std::map<std::string, Timestamp> WiredTigerKVEngine::getPinnedTimestampRequests() {
     stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
     return _oldestTimestampPinRequests;
+}
+
+void WiredTigerKVEngine::setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) {
+    _pinnedOplogTimestamp.store(pinnedTimestamp.asULL());
 }
 
 bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {

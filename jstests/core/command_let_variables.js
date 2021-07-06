@@ -2,8 +2,6 @@
 // variables for use in expressions within the command.
 // @tags: [
 //   requires_fcv_48,
-//   # Does not work with legacy shellWriteMode.
-//   requires_find_command,
 // ]
 //
 (function() {
@@ -536,4 +534,11 @@ assert.between(0, result, 1);
     const deduped = [...new Set(values)];
     assert.eq(1, deduped.length, `Expected all identical values: ${deduped}`);
 }
+
+// Test that expressions wrapped with $literal are serialized correctly when run in sharded cluster
+// environments.
+result = coll.aggregate([{$match: {$expr: {$eq: ["$_id", 2]}}}, {$project: {a: "$$b"}}],
+                        {let : {b: {$literal: "$notAFieldPath"}}})
+             .toArray();
+assert.eq(result, [{_id: 2, a: "$notAFieldPath"}]);
 }());

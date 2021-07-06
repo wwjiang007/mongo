@@ -424,7 +424,7 @@ public:
         // of concurrent reconfigs.
         if (!parsedArgs.force) {
             // Skip the waiting if the current config is from a force reconfig.
-            auto oplogWait = replCoord->getConfig().getConfigTerm() != OpTime::kUninitializedTerm;
+            auto oplogWait = replCoord->getConfigTerm() != OpTime::kUninitializedTerm;
             auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
             status.addContext("New config is rejected");
             if (status == ErrorCodes::MaxTimeMSExpired) {
@@ -665,8 +665,6 @@ public:
         status = args.initialize(cmdObj);
         if (status.isOK()) {
             status = replCoord->processReplSetUpdatePosition(args);
-
-            // TODO convert to uassertStatusOK once SERVER-34806 is done.
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         } else {
             // Parsing error from UpdatePositionArgs.

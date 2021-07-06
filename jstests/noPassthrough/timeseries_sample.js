@@ -2,7 +2,6 @@
  * Tests inserting sample data into the time-series buckets collection. This test is for the
  * exercising the optimized $sample implementation for $_internalUnpackBucket.
  * @tags: [
- *     sbe_incompatible,
  *     requires_wiredtiger,
  * ]
  */
@@ -111,7 +110,7 @@ let runSampleTests = (measurementsPerBucket, backupPlanSelected) => {
     const viewDocs = coll.find({}, {x: 1}).toArray();
     assert.eq(numDocs, viewDocs.length, viewDocs);
 
-    let sampleSize = 5;
+    let sampleSize = 20;
     let result = coll.aggregate([{$sample: {size: sampleSize}}]).toArray();
     assert.eq(sampleSize, result.length, result);
     assertUniqueDocuments(result);

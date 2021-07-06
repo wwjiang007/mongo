@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/resharding/donor_document_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/resharding/common_types_gen.h"
@@ -49,17 +50,25 @@ namespace mongo {
  */
 class ReshardingMetrics final {
 public:
-    ReshardingMetrics(const ReshardingMetrics&) = delete;
-    ReshardingMetrics(ReshardingMetrics&&) = delete;
-
-    explicit ReshardingMetrics(ServiceContext* svcCtx)
-        : _svcCtx(svcCtx), _cumulativeOp(svcCtx->getFastClockSource()) {}
+    enum Role { kCoordinator, kDonor, kRecipient };
 
     static ReshardingMetrics* get(ServiceContext*) noexcept;
 
-    // Marks the beginning of a resharding operation. Not that only one resharding operation may run
-    // at any time.
-    void onStart() noexcept;
+    explicit ReshardingMetrics(ServiceContext* svcCtx);
+    ~ReshardingMetrics();
+
+    ReshardingMetrics(const ReshardingMetrics&) = delete;
+    ReshardingMetrics& operator=(const ReshardingMetrics&) = delete;
+
+    // Marks the beginning of a resharding operation for a particular role. Note that:
+    // * Only one resharding operation may run at any time.
+    // * The only valid co-existing roles on a process are kDonor and kRecipient.
+    void onStart(Role role, Date_t runningOperationStartTime) noexcept;
+
+    // Marks the resumption of a resharding operation for a particular role.
+    void onStepUp(Role role) noexcept;
+
+    void onStepUp(DonorStateEnum state, ReshardingDonorMetrics donorMetrics);
 
     // So long as a resharding operation is in progress, the following may be used to update the
     // state of a donor, a recipient, and a coordinator, respectively.
@@ -67,25 +76,54 @@ public:
     void setRecipientState(RecipientStateEnum) noexcept;
     void setCoordinatorState(CoordinatorStateEnum) noexcept;
 
-    // Set by donors.
     void setDocumentsToCopy(int64_t documents, int64_t bytes) noexcept;
+    void setDocumentsToCopyForCurrentOp(int64_t documents, int64_t bytes) noexcept;
     // Allows updating metrics on "documents to copy" so long as the recipient is in cloning state.
     void onDocumentsCopied(int64_t documents, int64_t bytes) noexcept;
+    // Allows updating metrics on "documents to copy".
+    void onDocumentsCopiedForCurrentOp(int64_t documents, int64_t bytes) noexcept;
+
+    // Starts/ends the timers recording the times spend in the named sections.
+    void startCopyingDocuments(Date_t start);
+    void endCopyingDocuments(Date_t end);
+
+    void startApplyingOplogEntries(Date_t start);
+    void endApplyingOplogEntries(Date_t end);
+
+    void enterCriticalSection(Date_t start);
+    void leaveCriticalSection(Date_t end);
 
     // Allows updating "oplog entries to apply" metrics when the recipient is in applying state.
     void onOplogEntriesFetched(int64_t entries) noexcept;
+    // Allows restoring "oplog entries to apply" metrics.
+    void onOplogEntriesFetchedForCurrentOp(int64_t entries) noexcept;
     void onOplogEntriesApplied(int64_t entries) noexcept;
+    void onOplogEntriesAppliedForCurrentOp(int64_t entries) noexcept;
 
     // Allows tracking writes during a critical section when the donor's state is either of
-    // "preparing-to-block-writes" or "blocking-writes".
+    // "donating-oplog-entries" or "blocking-writes".
     void onWriteDuringCriticalSection(int64_t writes) noexcept;
+    // Allows restoring writes during a critical section.
+    void onWriteDuringCriticalSectionForCurrentOp(int64_t writes) noexcept;
 
-    // Marks the completion of the current (active) resharding operation. Aborts the process if no
-    // resharding operation is in progress.
-    void onCompletion(ReshardingOperationStatusEnum) noexcept;
+    // Indicates that a role on this node is stepping down. If the role being stepped down is the
+    // last active role on this process, the function tears down the currentOp variable. The
+    // replica set primary that is stepping up continues the resharding operation from disk.
+    void onStepDown(Role role) noexcept;
+
+    // Marks the completion of the current (active) resharding operation for a particular role. If
+    // the role being completed is the last active role on this process, the function tears down
+    // the currentOp variable, indicating completion for the resharding operation on this process.
+    //
+    // Aborts the process if no resharding operation is in progress.
+    void onCompletion(Role role,
+                      ReshardingOperationStatusEnum status,
+                      Date_t runningOperationEndTime) noexcept;
+
+    // Records the chunk imbalance count for the most recent resharding operation.
+    void setLastReshardChunkImbalanceCount(int64_t newCount) noexcept;
 
     struct ReporterOptions {
-        enum class Role { kDonor, kRecipient, kCoordinator };
         ReporterOptions(Role role, UUID id, NamespaceString nss, BSONObj shardKey, bool unique)
             : role(role),
               id(std::move(id)),
@@ -102,7 +140,7 @@ public:
     BSONObj reportForCurrentOp(const ReporterOptions& options) const noexcept;
 
     // Append metrics to the builder in CurrentOp format for the given `role`.
-    void serializeCurrentOpMetrics(BSONObjBuilder*, ReporterOptions::Role role) const;
+    void serializeCurrentOpMetrics(BSONObjBuilder*, Role role) const;
 
     // Append metrics to the builder in CumulativeOp (ServerStatus) format.
     void serializeCumulativeOpMetrics(BSONObjBuilder*) const;
@@ -114,9 +152,16 @@ public:
     boost::optional<Milliseconds> getOperationRemainingTime() const;
 
 private:
+    class OperationMetrics;
+
     ServiceContext* const _svcCtx;
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ReshardingMetrics::_mutex");
+
+    void _emplaceCurrentOpForRole(Role role,
+                                  boost::optional<Date_t> runningOperationStartTime) noexcept;
+
+    Date_t _now() const;
 
     // The following maintain the number of resharding operations that have started, succeeded,
     // failed with an unrecoverable error, and canceled by the user, respectively.
@@ -125,61 +170,8 @@ private:
     int64_t _failed = 0;
     int64_t _canceled = 0;
 
-    // Metrics for resharding operation. Accesses must be serialized using `_mutex`.
-    struct OperationMetrics {
-        // Allows tracking elapsed time for the resharding operation and its sub operations (e.g.,
-        // applying oplog entries).
-        class TimeInterval {
-        public:
-            explicit TimeInterval(ClockSource* clockSource) : _clockSource(clockSource) {}
-
-            void start() noexcept;
-
-            void end() noexcept;
-
-            Milliseconds duration() const noexcept;
-
-        private:
-            ClockSource* const _clockSource;
-            boost::optional<Date_t> _start;
-            boost::optional<Date_t> _end;
-        };
-
-        explicit OperationMetrics(ClockSource* clockSource)
-            : runningOperation(clockSource),
-              copyingDocuments(clockSource),
-              applyingOplogEntries(clockSource),
-              inCriticalSection(clockSource) {}
-
-        using Role = ReporterOptions::Role;
-        void appendCurrentOpMetrics(BSONObjBuilder*, Role) const;
-
-        void appendCumulativeOpMetrics(BSONObjBuilder*) const;
-
-        boost::optional<Milliseconds> remainingOperationTime() const;
-
-        TimeInterval runningOperation;
-        ReshardingOperationStatusEnum opStatus = ReshardingOperationStatusEnum::kInactive;
-
-        TimeInterval copyingDocuments;
-        int64_t documentsToCopy = 0;
-        int64_t documentsCopied = 0;
-        int64_t bytesToCopy = 0;
-        int64_t bytesCopied = 0;
-
-        TimeInterval applyingOplogEntries;
-        int64_t oplogEntriesFetched = 0;
-        int64_t oplogEntriesApplied = 0;
-
-        TimeInterval inCriticalSection;
-        int64_t writesDuringCriticalSection = 0;
-
-        DonorStateEnum donorState = DonorStateEnum::kUnused;
-        RecipientStateEnum recipientState = RecipientStateEnum::kUnused;
-        CoordinatorStateEnum coordinatorState = CoordinatorStateEnum::kUnused;
-    };
-    boost::optional<OperationMetrics> _currentOp;
-    OperationMetrics _cumulativeOp;
+    std::unique_ptr<OperationMetrics> _currentOp;
+    std::unique_ptr<OperationMetrics> _cumulativeOp;
 };
 
 }  // namespace mongo

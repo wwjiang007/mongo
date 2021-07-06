@@ -19,13 +19,10 @@ selector:
   - jstests/core/currentop.js  # uses fsync.
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
-  - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/invalidated_legacy_cursors.js # capped collections.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
   - jstests/core/startup_log.js  # "local" database.
@@ -90,7 +87,6 @@ executor:
       - ValidateCollections
   config:
     shell_options:
-      readMode: commands
       eval: load("jstests/libs/override_methods/implicitly_shard_accessed_collections.js")
   hooks:
   - class: CheckReplDBHash

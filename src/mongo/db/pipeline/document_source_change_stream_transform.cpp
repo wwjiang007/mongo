@@ -36,17 +36,17 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/pipeline/change_stream_document_diff_parser.h"
 #include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/db/pipeline/document_source_check_resume_token.h"
+#include "mongo/db/pipeline/document_source_change_stream_check_resumability.h"
+#include "mongo/db/pipeline/document_source_change_stream_lookup_post_image.h"
 #include "mongo/db/pipeline/document_source_limit.h"
-#include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
-#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/update/update_oplog_entry_version.h"
@@ -63,55 +63,62 @@ namespace {
 constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
 }  // namespace
 
-boost::intrusive_ptr<DocumentSourceChangeStreamTransform>
-DocumentSourceChangeStreamTransform::create(
+REGISTER_INTERNAL_DOCUMENT_SOURCE(
+    _internalChangeStreamTransform,
+    LiteParsedDocumentSourceChangeStreamInternal::parse,
+    DocumentSourceChangeStreamTransform::createFromBson,
+    feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV());
+
+intrusive_ptr<DocumentSourceChangeStreamTransform> DocumentSourceChangeStreamTransform::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const ServerGlobalParams::FeatureCompatibility::Version& fcv,
-    BSONObj changeStreamSpec) {
-    return new DocumentSourceChangeStreamTransform(expCtx, fcv, changeStreamSpec);
+    const DocumentSourceChangeStreamSpec& spec) {
+    return new DocumentSourceChangeStreamTransform(expCtx, spec);
+}
+
+intrusive_ptr<DocumentSourceChangeStreamTransform>
+DocumentSourceChangeStreamTransform::createFromBson(
+    BSONElement rawSpec, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(5467601,
+            "the '$_internalChangeStreamTransform' object spec must be an object",
+            rawSpec.type() == BSONType::Object);
+    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
+                                                      rawSpec.Obj());
+    return new DocumentSourceChangeStreamTransform(expCtx, std::move(spec));
 }
 
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const ServerGlobalParams::FeatureCompatibility::Version& fcv,
-    BSONObj changeStreamSpec)
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, DocumentSourceChangeStreamSpec spec)
     : DocumentSource(DocumentSourceChangeStreamTransform::kStageName, expCtx),
-      _changeStreamSpec(changeStreamSpec.getOwned()),
-      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()),
-      _fcv(fcv) {
-
-    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
-                                                      _changeStreamSpec);
+      _changeStreamSpec(std::move(spec)),
+      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()) {
 
     // If the change stream spec requested a pre-image, make sure that we supply one.
     _includePreImageOptime =
-        (spec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff);
+        (_changeStreamSpec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff);
+
+    // Extract the resume token or high-water-mark from the spec.
+    auto tokenData = DocumentSourceChangeStream::resolveResumeTokenFromSpec(_changeStreamSpec);
+
+    // Set the initialPostBatchResumeToken on the expression context.
+    expCtx->initialPostBatchResumeToken = ResumeToken(tokenData).toBSON();
 
     // If the change stream spec includes a resumeToken with a shard key, populate the document key
     // cache with the field paths.
-    auto resumeAfter = spec.getResumeAfter();
-    auto startAfter = spec.getStartAfter();
-    if (resumeAfter || startAfter) {
-        ResumeToken token = resumeAfter ? resumeAfter.get() : startAfter.get();
-        ResumeTokenData tokenData = token.getData();
+    if (!tokenData.documentKey.missing() && tokenData.uuid) {
+        std::vector<FieldPath> docKeyFields;
+        auto docKey = tokenData.documentKey.getDocument();
 
-        if (!tokenData.documentKey.missing() && tokenData.uuid) {
-            std::vector<FieldPath> docKeyFields;
-            auto docKey = tokenData.documentKey.getDocument();
-
-            auto iter = docKey.fieldIterator();
-            while (iter.more()) {
-                auto fieldPair = iter.next();
-                docKeyFields.push_back(fieldPair.first);
-            }
-
-            // If the document key from the resume token has more than one field, that means it
-            // includes the shard key and thus should never change.
-            const bool isFinal = docKeyFields.size() > 1;
-
-            _documentKeyCache[tokenData.uuid.get()] =
-                DocumentKeyCacheEntry({docKeyFields, isFinal});
+        auto iter = docKey.fieldIterator();
+        while (iter.more()) {
+            auto fieldPair = iter.next();
+            docKeyFields.push_back(fieldPair.first);
         }
+
+        // If the document key from the resume token has more than one field, that means it
+        // includes the shard key and thus should never change.
+        const bool isFinal = docKeyFields.size() > 1;
+
+        _documentKeyCache[tokenData.uuid.get()] = DocumentKeyCacheEntry({docKeyFields, isFinal});
     }
 }
 
@@ -361,44 +368,35 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     }
 
     // Add the post-image, pre-image, namespace, documentKey and other fields as appropriate.
-    doc.addField(DocumentSourceChangeStream::kFullDocumentField, fullDocument);
+    doc.addField(DocumentSourceChangeStream::kFullDocumentField, std::move(fullDocument));
     if (_includePreImageOptime) {
         // Set 'kFullDocumentBeforeChangeField' to the pre-image optime. The DSCSLookupPreImage
         // stage will replace this optime with the actual pre-image taken from the oplog.
-        doc.addField(DocumentSourceChangeStream::kFullDocumentBeforeChangeField, preImageOpTime);
+        doc.addField(DocumentSourceChangeStream::kFullDocumentBeforeChangeField,
+                     std::move(preImageOpTime));
     }
     doc.addField(DocumentSourceChangeStream::kNamespaceField,
                  operationType == DocumentSourceChangeStream::kDropDatabaseOpType
                      ? Value(Document{{"db", nss.db()}})
                      : Value(Document{{"db", nss.db()}, {"coll", nss.coll()}}));
-    doc.addField(DocumentSourceChangeStream::kDocumentKeyField, documentKey);
+    doc.addField(DocumentSourceChangeStream::kDocumentKeyField, std::move(documentKey));
 
     // Note that 'updateDescription' might be the 'missing' value, in which case it will not be
     // serialized.
-    doc.addField("updateDescription", updateDescription);
+    doc.addField("updateDescription", std::move(updateDescription));
     return doc.freeze();
 }
 
-Value DocumentSourceChangeStreamTransform::serialize(
+Value DocumentSourceChangeStreamTransform::serializeLatest(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    Document changeStreamOptions(_changeStreamSpec);
-    // If we're on a mongos and no other start time is specified, we want to start at the current
-    // cluster time on the mongos.  This ensures all shards use the same start time.
-    if (pExpCtx->inMongos &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kResumeAfterFieldName].missing() &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName]
-            .missing() &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAfterFieldName].missing()) {
-        MutableDocument newChangeStreamOptions(changeStreamOptions);
-
-        // Configure the serialized $changeStream to start from the initial high-watermark
-        // postBatchResumeToken which we generated while parsing the $changeStream pipeline.
-        invariant(!pExpCtx->initialPostBatchResumeToken.isEmpty());
-        newChangeStreamOptions[DocumentSourceChangeStreamSpec::kResumeAfterFieldName] =
-            Value(pExpCtx->initialPostBatchResumeToken);
-        changeStreamOptions = newChangeStreamOptions.freeze();
+    if (explain) {
+        return Value(Document{{DocumentSourceChangeStream::kStageName,
+                               Document{{"stage"_sd, "internalTransform"_sd},
+                                        {"options"_sd, _changeStreamSpec.toBSON()}}}});
     }
-    return Value(Document{{getSourceName(), changeStreamOptions}});
+
+    return Value(
+        Document{{DocumentSourceChangeStreamTransform::kStageName, _changeStreamSpec.toBSON()}});
 }
 
 DepsTracker::State DocumentSourceChangeStreamTransform::getDependencies(DepsTracker* deps) const {

@@ -2,12 +2,11 @@
  * Tests index creation, index drops, list indexes, hide/unhide index on a time-series collection.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -25,6 +24,11 @@ TimeseriesTest.run((insert) => {
     const controlMaxTimeFieldName = "control.max." + timeFieldName;
 
     const doc = {_id: 0, [timeFieldName]: ISODate(), [metaFieldName]: {tag1: 'a', tag2: 'b'}};
+
+    const roundDown = (date) => {
+        // Round down to nearest minute.
+        return new Date(date - (date % 60000));
+    };
 
     /**
      * Tests time-series
@@ -66,7 +70,7 @@ TimeseriesTest.run((insert) => {
 
         const bucketDoc = bucketDocs[0];
         assert.eq(doc._id, bucketDoc.control.min._id, bucketDoc);
-        assert.eq(doc[timeFieldName], bucketDoc.control.min[timeFieldName], bucketDoc);
+        assert.eq(roundDown(doc[timeFieldName]), bucketDoc.control.min[timeFieldName], bucketDoc);
         assert.docEq(doc[metaFieldName], bucketDoc.meta, bucketDoc);
 
         // Check that listIndexes against the time-series collection returns the index just created.
@@ -221,12 +225,7 @@ TimeseriesTest.run((insert) => {
     const testCreateIndex = function(spec, options = {}) {
         const indexName = 'testCreateIndex';
         const res = coll.createIndex(spec, Object.extend({name: indexName}, options));
-        if (TimeseriesTest.supportsClusteredIndexes(db.getMongo())) {
-            assert.commandFailedWithCode(res, ErrorCodes.InvalidOptions);
-        } else {
-            assert.commandWorked(res);
-            assert.commandWorked(coll.dropIndex(indexName));
-        }
+        assert.commandFailedWithCode(res, ErrorCodes.InvalidOptions);
     };
 
     // Partial indexes are not supported on clustered time-series bucket collections.
@@ -247,9 +246,7 @@ TimeseriesTest.run((insert) => {
     const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     assert.commandWorked(bucketsColl.createIndex({not_metadata: 1}),
                          'failed to create index: ' + tojson({not_metadata: 1}));
-    assert.eq(TimeseriesTest.supportsClusteredIndexes(db.getMongo()) ? 1 : 2,
-              bucketsColl.getIndexes().length,
-              tojson(bucketsColl.getIndexes()));
+    assert.eq(1, bucketsColl.getIndexes().length, tojson(bucketsColl.getIndexes()));
     assert.eq(0, coll.getIndexes().length, tojson(coll.getIndexes()));
 });
 })();

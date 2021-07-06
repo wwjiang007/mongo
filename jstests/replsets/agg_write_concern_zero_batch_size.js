@@ -12,6 +12,10 @@ const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 rst.startSet();
 rst.initiate();
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(rst.getPrimary().adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 const testDB = rst.getPrimary().getDB("test");
 const source = testDB.agg_write_concern_zero_batch_size;
 const target = testDB.agg_write_concern_zero_batch_size_target;
@@ -60,17 +64,6 @@ try {
             () => source.aggregate([stageSpec], {writeConcern: {w: 2, wtimeout: 100}}));
         assert(error instanceof Error);
         assert(tojson(error).indexOf("writeConcernError") != -1, tojson(error));
-
-        // Now switch to legacy OP_GET_MORE read mode. We should get a different error indicating
-        // that using writeConcern in this way is unsupported.
-        source.getDB().getMongo().forceReadMode("legacy");
-        error = assert.throws(
-            () => source
-                      .aggregate([stageSpec],
-                                 {cursor: {batchSize: 0}, writeConcern: {w: 2, wtimeout: 100}})
-                      .itcount());
-        assert.eq(error.code, 31124);
-        source.getDB().getMongo().forceReadMode("commands");
 
         restartServerReplication(rst.getSecondary());
     });

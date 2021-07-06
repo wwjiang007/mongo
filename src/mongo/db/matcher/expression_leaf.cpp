@@ -210,8 +210,7 @@ const std::set<char> RegexMatchExpression::kValidRegexFlags = {'i', 'm', 's', 'x
 
 std::unique_ptr<pcrecpp::RE> RegexMatchExpression::makeRegex(const std::string& regex,
                                                              const std::string& flags) {
-    return std::make_unique<pcrecpp::RE>(regex.c_str(),
-                                         regex_util::flagsToPcreOptions(flags, true));
+    return std::make_unique<pcrecpp::RE>(regex.c_str(), regex_util::flagsToPcreOptions(flags));
 }
 
 RegexMatchExpression::RegexMatchExpression(StringData path,
@@ -221,15 +220,11 @@ RegexMatchExpression::RegexMatchExpression(StringData path,
     : LeafMatchExpression(REGEX, path, std::move(annotation)),
       _regex(regex.toString()),
       _flags(options.toString()),
-      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flagsToPcreOptions(_flags, true))) {
+      _re(new pcrecpp::RE(_regex.c_str(), regex_util::flagsToPcreOptions(_flags))) {
 
     uassert(ErrorCodes::BadValue,
             "Regular expression cannot contain an embedded null byte",
             _regex.find('\0') == std::string::npos);
-
-    uassert(ErrorCodes::BadValue,
-            "Regular expression options string cannot contain an embedded null byte",
-            _flags.find('\0') == std::string::npos);
 
     uassert(51091,
             str::stream() << "Regular expression is invalid: " << _re->error(),
@@ -389,6 +384,7 @@ std::unique_ptr<MatchExpression> InMatchExpression::shallowClone() const {
     next->_hasEmptyArray = _hasEmptyArray;
     next->_equalitySet = _equalitySet;
     next->_originalEqualityVector = _originalEqualityVector;
+    next->_equalityStorage = _equalityStorage;
     for (auto&& regex : _regexes) {
         std::unique_ptr<RegexMatchExpression> clonedRegex(
             static_cast<RegexMatchExpression*>(regex->shallowClone().release()));
@@ -402,7 +398,9 @@ bool InMatchExpression::contains(const BSONElement& e) const {
 }
 
 bool InMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
-    if (_hasNull && e.eoo()) {
+    // When an $in has a null, it adopts the same semantics as {$eq:null}. Namely, in addition to
+    // matching literal null values, the $in should match missing and undefined.
+    if (_hasNull && (e.eoo() || e.type() == BSONType::Undefined)) {
         return true;
     }
     if (contains(e)) {
@@ -544,6 +542,10 @@ Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
                      _eltCmp.makeEqualTo());
 
     return Status::OK();
+}
+
+void InMatchExpression::setBackingBSON(BSONObj equalityStorage) {
+    _equalityStorage = std::move(equalityStorage);
 }
 
 Status InMatchExpression::addRegex(std::unique_ptr<RegexMatchExpression> expr) {

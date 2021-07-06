@@ -62,6 +62,7 @@
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
@@ -126,14 +127,54 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingTxnCloner::_targetAggregati
 
     request.setReadConcern(BSON(repl::ReadConcernArgs::kLevelFieldName
                                 << repl::readConcernLevels::kSnapshotName
-                                << repl::ReadConcernArgs::kAtClusterTimeFieldName
-                                << _fetchTimestamp));
+                                << repl::ReadConcernArgs::kAtClusterTimeFieldName << _fetchTimestamp
+                                << repl::ReadConcernArgs::kAllowTransactionTableSnapshot << true));
     request.setWriteConcern(WriteConcernOptions());
     request.setHint(BSON(SessionTxnRecord::kSessionIdFieldName << 1));
     request.setUnwrappedReadPref(ReadPreferenceSetting{ReadPreference::Nearest}.toContainingBSON());
 
     return sharded_agg_helpers::runPipelineDirectlyOnSingleShard(
         pipeline.getContext(), std::move(request), _sourceId.getShardId());
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter> ReshardingTxnCloner::_restartPipeline(
+    OperationContext* opCtx, std::shared_ptr<MongoProcessInterface> mongoProcessInterface) {
+    auto progressLsid = _fetchProgressLsid(opCtx);
+    auto pipeline = _targetAggregationRequest(
+        opCtx, *makePipeline(opCtx, std::move(mongoProcessInterface), progressLsid));
+
+    pipeline->detachFromOperationContext();
+    pipeline.get_deleter().dismissDisposal();
+    return pipeline;
+}
+
+boost::optional<SessionTxnRecord> ReshardingTxnCloner::_getNextRecord(OperationContext* opCtx,
+                                                                      Pipeline& pipeline) {
+    pipeline.reattachToOperationContext(opCtx);
+    ON_BLOCK_EXIT([&pipeline] { pipeline.detachFromOperationContext(); });
+
+    // The BlockingResultsMerger underlying by the $mergeCursors stage records how long the
+    // recipient spent waiting for documents from the donor shard. It doing so requires the CurOp to
+    // be marked as having started.
+    auto* curOp = CurOp::get(opCtx);
+    curOp->ensureStarted();
+    ON_BLOCK_EXIT([curOp] { curOp->done(); });
+
+    auto doc = pipeline.getNext();
+    return doc ? SessionTxnRecord::parse({"resharding config.transactions cloning"}, doc->toBson())
+               : boost::optional<SessionTxnRecord>{};
+}
+
+boost::optional<SharedSemiFuture<void>> ReshardingTxnCloner::doOneRecord(
+    OperationContext* opCtx, const SessionTxnRecord& donorRecord) {
+    return resharding::data_copy::withSessionCheckedOut(
+        opCtx, donorRecord.getSessionId(), donorRecord.getTxnNum(), boost::none /* stmtId */, [&] {
+            resharding::data_copy::updateSessionRecord(opCtx,
+                                                       TransactionParticipant::kDeadEndSentinel,
+                                                       {kIncompleteHistoryStmtId},
+                                                       boost::none /* preImageOpTime */,
+                                                       boost::none /* postImageOpTime */);
+        });
 }
 
 void ReshardingTxnCloner::_updateProgressDocument(OperationContext* opCtx,
@@ -156,96 +197,61 @@ SemiFuture<void> ReshardingTxnCloner::run(
     std::shared_ptr<MongoProcessInterface> mongoProcessInterface_forTest) {
     struct ChainContext {
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
-        boost::optional<SessionTxnRecord> donorRecord = boost::none;
+        boost::optional<SessionTxnRecord> donorRecord;
         bool moreToCome = true;
         int progressCounter = 0;
     };
 
     auto chainCtx = std::make_shared<ChainContext>();
 
-    return resharding::WithAutomaticRetry([this, chainCtx, factory, mongoProcessInterface_forTest] {
-               if (!chainCtx->pipeline) {
-                   auto opCtx = factory.makeOperationContext(&cc());
-                   chainCtx->pipeline = [&]() {
-                       auto progressLsid = _fetchProgressLsid(opCtx.get());
+    return resharding::WithAutomaticRetry(
+               [this, chainCtx, cancelToken, factory, mongoProcessInterface_forTest] {
+                   if (!chainCtx->pipeline) {
+                       auto opCtx = factory.makeOperationContext(&cc());
+                       chainCtx->pipeline =
+                           _restartPipeline(opCtx.get(),
+                                            MONGO_unlikely(mongoProcessInterface_forTest)
+                                                ? mongoProcessInterface_forTest
+                                                : MongoProcessInterface::create(opCtx.get()));
+                       chainCtx->donorRecord = boost::none;
+                   }
 
-                       auto mongoProcessInterface = MONGO_unlikely(mongoProcessInterface_forTest)
-                           ? mongoProcessInterface_forTest
-                           : MongoProcessInterface::create(opCtx.get());
+                   // A donor record will have been stashed on the ChainContext if we are resuming
+                   // due to a prepared transaction having been in progress.
+                   if (!chainCtx->donorRecord) {
+                       auto opCtx = factory.makeOperationContext(&cc());
+                       auto guard = makeGuard([&] {
+                           chainCtx->pipeline->dispose(opCtx.get());
+                           chainCtx->pipeline.reset();
+                       });
+                       chainCtx->donorRecord = _getNextRecord(opCtx.get(), *chainCtx->pipeline);
+                       guard.dismiss();
+                   }
 
-                       auto pipeline = _targetAggregationRequest(
-                           opCtx.get(),
-                           *makePipeline(
-                               opCtx.get(), std::move(mongoProcessInterface), progressLsid));
+                   if (!chainCtx->donorRecord) {
+                       chainCtx->moreToCome = false;
+                       return makeReadyFutureWith([] {}).semi();
+                   }
 
-                       pipeline->detachFromOperationContext();
-                       pipeline.get_deleter().dismissDisposal();
-                       return pipeline;
-                   }();
+                   {
+                       auto opCtx = factory.makeOperationContext(&cc());
+                       if (auto hitPreparedTxn = doOneRecord(opCtx.get(), *chainCtx->donorRecord)) {
+                           return future_util::withCancellation(std::move(*hitPreparedTxn),
+                                                                cancelToken);
+                       }
+                   }
+
+                   chainCtx->progressCounter = (chainCtx->progressCounter + 1) %
+                       resharding::gReshardingTxnClonerProgressBatchSize.load();
+
+                   if (chainCtx->progressCounter == 0) {
+                       auto opCtx = factory.makeOperationContext(&cc());
+                       _updateProgressDocument(opCtx.get(), chainCtx->donorRecord->getSessionId());
+                   }
 
                    chainCtx->donorRecord = boost::none;
-               }
-
-               // A donor record will have been stashed on the ChainContext if we are resuming due
-               // to a prepared transaction having been in progress.
-               if (!chainCtx->donorRecord) {
-                   auto opCtx = factory.makeOperationContext(&cc());
-                   chainCtx->donorRecord = [&]() {
-                       chainCtx->pipeline->reattachToOperationContext(opCtx.get());
-
-                       // The BlockingResultsMerger underlying by the $mergeCursors stage records
-                       // how long the recipient spent waiting for documents from the donor shards.
-                       // It doing so requires the CurOp to be marked as having started.
-                       auto* curOp = CurOp::get(opCtx.get());
-                       curOp->ensureStarted();
-                       ON_BLOCK_EXIT([curOp] { curOp->done(); });
-
-                       auto doc = chainCtx->pipeline->getNext();
-                       chainCtx->pipeline->detachFromOperationContext();
-
-                       return doc ? SessionTxnRecord::parse(
-                                        {"resharding config.transactions cloning"}, doc->toBson())
-                                  : boost::optional<SessionTxnRecord>{};
-                   }();
-               }
-
-               if (!chainCtx->donorRecord) {
-                   chainCtx->moreToCome = false;
-                   return makeReadyFutureWith([] {}).share();
-               }
-
-               {
-                   auto opCtx = factory.makeOperationContext(&cc());
-                   auto hitPreparedTxn = resharding::data_copy::withSessionCheckedOut(
-                       opCtx.get(),
-                       chainCtx->donorRecord->getSessionId(),
-                       chainCtx->donorRecord->getTxnNum(),
-                       boost::none /* stmtId */,
-                       [&] {
-                           resharding::data_copy::updateSessionRecord(
-                               opCtx.get(),
-                               TransactionParticipant::kDeadEndSentinel,
-                               {kIncompleteHistoryStmtId},
-                               boost::none /* preImageOpTime */,
-                               boost::none /* postImageOpTime */);
-                       });
-
-                   if (hitPreparedTxn) {
-                       return *hitPreparedTxn;
-                   }
-               }
-
-               chainCtx->progressCounter = (chainCtx->progressCounter + 1) %
-                   resharding::gReshardingTxnClonerProgressBatchSize;
-
-               if (chainCtx->progressCounter == 0) {
-                   auto opCtx = factory.makeOperationContext(&cc());
-                   _updateProgressDocument(opCtx.get(), chainCtx->donorRecord->getSessionId());
-               }
-
-               chainCtx->donorRecord = boost::none;
-               return makeReadyFutureWith([] {}).share();
-           })
+                   return makeReadyFutureWith([] {}).semi();
+               })
         .onTransientError([this](const Status& status) {
             LOGV2(5461600,
                   "Transient error while cloning config.transactions collection",
@@ -270,7 +276,7 @@ SemiFuture<void> ReshardingTxnCloner::run(
 
             return status.isOK() && !chainCtx->moreToCome;
         })
-        .on(std::move(executor), std::move(cancelToken))
+        .on(std::move(executor), cancelToken)
         .thenRunOn(std::move(cleanupExecutor))
         // It is unsafe to capture `this` once the task is running on the cleanupExecutor because
         // RecipientStateMachine, along with its ReshardingTxnCloner member, may have already been

@@ -2,7 +2,7 @@
  * Checks that the server properly parses "API Version" parameters
  *
  * @tags: [
- *  requires_fcv_47,
+ *  requires_fcv_50,
  *  uses_api_parameters,
  * ]
  */
@@ -53,10 +53,10 @@ assert.commandWorked(db.runCommand({ping: 1, apiVersion: "1"}));
 assert.commandWorked(db.runCommand({listCommands: 1, apiVersion: "1"}));
 // If the client passed apiStrict: true, but the command is not in V1, reply with
 // APIStrictError.
-assert.commandFailedWithCode(
-    db.runCommand({listCommands: 1, apiVersion: "1", apiStrict: true}),
-    ErrorCodes.APIStrictError,
-    "Provided apiStrict: true, but the invoked command's apiVersions() does not include \"1\"");
+assert.commandFailedWithCode(db.runCommand({listCommands: 1, apiVersion: "1", apiStrict: true}),
+                             ErrorCodes.APIStrictError);
+assert.commandFailedWithCode(db.runCommand({isMaster: 1, apiVersion: "1", apiStrict: true}),
+                             ErrorCodes.APIStrictError);
 assert.commandWorked(db.runCommand({listCommands: 1, apiVersion: "1", apiDeprecationErrors: true}));
 
 // Test parsing logic of command deprecated in API V1.
@@ -68,6 +68,12 @@ assert.commandFailedWithCode(
     db.runCommand({testDeprecation: 1, apiVersion: "1", apiDeprecationErrors: true}),
     ErrorCodes.APIDeprecationError,
     "Provided apiDeprecationErrors: true, but the invoked command's deprecatedApiVersions() does not include \"1\"");
+
+// Assert APIStrictError message for unsupported commands contains link to docs site
+var err = assert.commandFailedWithCode(
+    db.runCommand({buildInfo: 1, apiStrict: true, apiVersion: "1"}), ErrorCodes.APIStrictError);
+assert.includes(err.errmsg, 'buildInfo');
+assert.includes(err.errmsg, 'dochub.mongodb.org');
 
 // Test writing to system.js fails.
 assert.commandFailedWithCode(

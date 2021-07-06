@@ -44,13 +44,15 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/resharded_chunk_gen.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 constexpr auto kReshardFinalOpLogType = "reshardFinalOp"_sd;
+static const auto kReshardErrorMaxBytes = 2000;
 
 /**
  * Emplaces the 'fetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
@@ -118,11 +120,21 @@ void emplaceMinFetchTimestampIfExists(ClassWithMinFetchTimestamp& c,
 }
 
 /**
+ * Returns a serialized version of the originalError status. If the originalError status exceeds
+ * maxErrorBytes, truncates the status and returns it in the errmsg field of a new status with code
+ * ErrorCodes::ReshardingCollectionTruncatedError.
+ */
+BSONObj serializeAndTruncateReshardingErrorIfNeeded(Status originalError);
+
+/**
  * Emplaces the 'abortReason' onto the ClassWithAbortReason if the reason has been emplaced inside
- * the boost::optional.
+ * the boost::optional. If the 'abortReason' is too large, emplaces a status with
+ * ErrorCodes::ReshardCollectionTruncatedError and a truncated version of the 'abortReason' for the
+ * errmsg.
  */
 template <class ClassWithAbortReason>
-void emplaceAbortReasonIfExists(ClassWithAbortReason& c, boost::optional<Status> abortReason) {
+void emplaceTruncatedAbortReasonIfExists(ClassWithAbortReason& c,
+                                         boost::optional<Status> abortReason) {
     if (!abortReason) {
         return;
     }
@@ -134,10 +146,9 @@ void emplaceAbortReasonIfExists(ClassWithAbortReason& c, boost::optional<Status>
         return;
     }
 
-    BSONObjBuilder bob;
-    abortReason.get().serializeErrorToBSON(&bob);
+    auto truncatedAbortReasonObj = serializeAndTruncateReshardingErrorIfNeeded(abortReason.get());
     AbortReason abortReasonStruct;
-    abortReasonStruct.setAbortReason(bob.obj());
+    abortReasonStruct.setAbortReason(truncatedAbortReasonObj);
     c.setAbortReasonStruct(std::move(abortReasonStruct));
 }
 
@@ -236,7 +247,7 @@ void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
  * ReshardedChunk and asserts that each chunk's shardId is associated with an existing entry in
  * the shardRegistry. Then, asserts that there is not a hole or overlap in the chunks.
  */
-void validateReshardedChunks(const std::vector<mongo::BSONObj>& chunks,
+void validateReshardedChunks(const std::vector<ReshardedChunk>& chunks,
                              OperationContext* opCtx,
                              const KeyPattern& keyPattern);
 
@@ -250,23 +261,13 @@ Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorS
 /**
  * Asserts that there is not an overlap in the zone ranges.
  */
-void checkForOverlappingZones(std::vector<TagsType>& zones);
+void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones);
 
 /**
- * Validates zones provided with a reshardCollection cmd. Parses each BSONObj to a valid
- * TagsType and asserts that each zones's name is associated with an existing entry in
- * config.tags. Then, asserts that there is not an overlap in the zone ranges.
+ * Builds documents to insert into config.tags from zones provided to reshardCollection cmd.
  */
-void validateZones(const std::vector<mongo::BSONObj>& zones,
-                   const std::vector<TagsType>& authoritativeTags);
-
-/**
- * Creates a view on the oplog that facilitates the specialized oplog tailing a resharding
- * recipient performs on a donor.
- */
-void createSlimOplogView(OperationContext* opCtx, Database* db);
-
-BSONObj getSlimOplogPipeline();
+std::vector<BSONObj> buildTagsDocsFromZones(const NamespaceString& tempNss,
+                                            const std::vector<ReshardingZoneType>& zones);
 
 /**
  * Creates a pipeline that can be serialized into a query for fetching oplog entries. `startAfter`

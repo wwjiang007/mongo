@@ -48,7 +48,12 @@ CandidatePlans CachedSolutionPlanner::plan(
     invariant(solutions.size() == roots.size());
 
     auto candidate = [&]() {
-        auto candidates = collectExecutionStats(std::move(solutions), std::move(roots));
+        // In cached solution planning we collect execution stats with an upper bound on reads
+        // allowed per trial run computed based on previous decision reads.
+        auto candidates = collectExecutionStats(
+            std::move(solutions),
+            std::move(roots),
+            static_cast<size_t>(internalQueryCacheEvictionRatio * _decisionReads));
         invariant(candidates.size() == 1);
         return std::move(candidates[0]);
     }();
@@ -111,6 +116,11 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
     // The plan drawn from the cache is being discarded, and should no longer be registered with the
     // yield policy.
     _yieldPolicy->clearRegisteredPlans();
+
+    // We're planning from scratch, using the original set of indexes provided in '_queryParams'.
+    // Therefore, if any of the collection's indexes have been dropped, the query should fail with
+    // a 'QueryPlanKilled' error.
+    _indexExistenceChecker.check();
 
     if (shouldCache) {
         // Deactivate the current cache entry.

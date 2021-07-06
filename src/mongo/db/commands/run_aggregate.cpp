@@ -49,6 +49,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
@@ -186,6 +187,19 @@ bool handleCursorCommand(OperationContext* opCtx,
         } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
             // This exception is thrown when a $changeStream stage encounters an event that
             // invalidates the cursor. We should close the cursor and return without error.
+            cursor = nullptr;
+            exec = nullptr;
+            break;
+        } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+            // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+            // to the resume token of the invalidating event, and mark the cursor response as
+            // invalidated. We expect ExtraInfo to always be present for this exception.
+            const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+            tassert(5493701, "Missing ChangeStreamInvalidationInfo on exception", extraInfo);
+
+            responseBuilder.setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+            responseBuilder.setInvalidated();
+
             cursor = nullptr;
             exec = nullptr;
             break;
@@ -348,7 +362,7 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
                 // that the inverse scenario (mistaking a view for a collection) is not an issue
                 // because $merge/$out cannot target a view.
                 auto nssToCheck = NamespaceString(request.getNamespace().db(), involvedNs.coll());
-                if (viewCatalog && viewCatalog->lookup(opCtx, nssToCheck.ns())) {
+                if (viewCatalog && viewCatalog->lookup(opCtx, nssToCheck)) {
                     auto status = resolveViewDefinition(nssToCheck, viewCatalog);
                     if (!status.isOK()) {
                         return status;
@@ -365,7 +379,7 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             // pipeline because 'involvedNs' doesn't refer to a view namespace in our consistent
             // snapshot of the view catalog.
             resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
-        } else if (viewCatalog->lookup(opCtx, involvedNs.ns())) {
+        } else if (viewCatalog->lookup(opCtx, involvedNs)) {
             auto status = resolveViewDefinition(involvedNs, viewCatalog);
             if (!status.isOK()) {
                 return status;
@@ -398,7 +412,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
             continue;
         }
 
-        auto view = viewCatalog->lookup(opCtx, potentialViewNs.ns());
+        auto view = viewCatalog->lookup(opCtx, potentialViewNs);
         if (!view) {
             continue;
         }
@@ -431,7 +445,8 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
     const AggregateCommandRequest& request,
     std::unique_ptr<CollatorInterface> collator,
-    boost::optional<UUID> uuid) {
+    boost::optional<UUID> uuid,
+    ExpressionContext::CollationMatchesDefault collationMatchesDefault) {
     setIgnoredShardVersionForMergeCursors(opCtx, request);
     boost::intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(opCtx,
@@ -443,6 +458,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                               CurOp::get(opCtx)->dbProfileLevel() > 0);
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     expCtx->inMultiDocumentTransaction = opCtx->inMultiDocumentTransaction();
+    expCtx->collationMatchesDefault = collationMatchesDefault;
 
     return expCtx;
 }
@@ -456,8 +472,8 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
  */
 void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
     repl::ReadConcernArgs& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    // There is already a read concern level set. Do nothing.
-    if (readConcernArgs.hasLevel()) {
+    // There is already a non-default read concern level set. Do nothing.
+    if (readConcernArgs.hasLevel() && !readConcernArgs.getProvenance().isImplicitDefault()) {
         return;
     }
     // We upconvert an empty read concern to 'majority'.
@@ -476,7 +492,7 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
     }
 
     // Wait for read concern again since we changed the original read concern.
-    uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
+    uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, StringData(), true));
     setPrepareConflictBehaviorForReadConcern(
         opCtx, readConcernArgs, PrepareConflictBehavior::kIgnoreConflicts);
 }
@@ -507,7 +523,8 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
                                            request,
                                            expCtx->getCollator() ? expCtx->getCollator()->clone()
                                                                  : nullptr,
-                                           uuid);
+                                           uuid,
+                                           expCtx->collationMatchesDefault);
 
             // Create a new pipeline for the consumer consisting of a single
             // DocumentSourceExchange.
@@ -564,6 +581,7 @@ Status runAggregate(OperationContext* opCtx,
     // The collation to use for this aggregation. boost::optional to distinguish between the case
     // where the collation has not yet been resolved, and where it has been resolved to nullptr.
     boost::optional<std::unique_ptr<CollatorInterface>> collatorToUse;
+    ExpressionContext::CollationMatchesDefault collatorToUseMatchesDefault;
 
     // The UUID of the collection for the execution namespace of this aggregation.
     boost::optional<UUID> uuid;
@@ -607,7 +625,7 @@ Status runAggregate(OperationContext* opCtx,
             if (!origNss.isCollectionlessAggregateNS()) {
                 auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, origNss.db());
                 if (viewCatalog) {
-                    auto view = viewCatalog->lookup(opCtx, origNss.ns());
+                    auto view = viewCatalog->lookup(opCtx, origNss);
                     uassert(ErrorCodes::CommandNotSupportedOnView,
                             str::stream()
                                 << "Namespace " << origNss.ns() << " is a timeseries collection",
@@ -622,8 +640,10 @@ Status runAggregate(OperationContext* opCtx,
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
             // collation. We do not inherit the collection's default collation or UUID, since
             // the stream may be resuming from a point before the current UUID existed.
-            collatorToUse.emplace(PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr));
+            auto [collator, match] = PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr);
+            collatorToUse.emplace(std::move(collator));
+            collatorToUseMatchesDefault = match;
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
@@ -639,13 +659,17 @@ Status runAggregate(OperationContext* opCtx,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
-            collatorToUse.emplace(PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr));
+            auto [collator, match] = PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr);
+            collatorToUse.emplace(std::move(collator));
+            collatorToUseMatchesDefault = match;
         } else {
             // This is a regular aggregation. Lock the collection or view.
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsPermitted);
-            collatorToUse.emplace(PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), ctx->getCollection()));
+            auto [collator, match] = PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), ctx->getCollection());
+            collatorToUse.emplace(std::move(collator));
+            collatorToUseMatchesDefault = match;
             if (ctx->getCollection()) {
                 uuid = ctx->getCollection()->uuid();
             }
@@ -737,7 +761,8 @@ Status runAggregate(OperationContext* opCtx,
         }
 
         invariant(collatorToUse);
-        expCtx = makeExpressionContext(opCtx, request, std::move(*collatorToUse), uuid);
+        expCtx = makeExpressionContext(
+            opCtx, request, std::move(*collatorToUse), uuid, collatorToUseMatchesDefault);
 
         auto pipeline = Pipeline::parse(request.getPipeline(), expCtx);
 

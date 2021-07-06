@@ -14,10 +14,10 @@ load("jstests/libs/transactions_util.js");
 let originalRunCommand = Mongo.prototype.runCommand;
 let originalRunCommandWithMetadata = Mongo.prototype.runCommandWithMetadata;
 
-const blacklistedDbNames = ["config", "admin", "local"];
+const denylistedDbNames = ["config", "admin", "local"];
 
-function isBlacklistedDb(dbName) {
-    return blacklistedDbNames.includes(dbName);
+function isDenylistedDb(dbName) {
+    return denylistedDbNames.includes(dbName);
 }
 
 /**
@@ -31,7 +31,7 @@ function prependTenantIdToDbNameIfApplicable(dbName) {
         return dbName;
     }
     const prefix = TestData.tenantId + "_";
-    return isBlacklistedDb(dbName) || dbName.startsWith(prefix) ? dbName : prefix + dbName;
+    return isDenylistedDb(dbName) || dbName.startsWith(prefix) ? dbName : prefix + dbName;
 }
 
 /**
@@ -348,24 +348,43 @@ Mongo.prototype.recordRerouteDueToTenantMigration = function() {
     assert.neq(null, this.reroutingMongo);
 
     while (true) {
-        const res = originalRunCommand.apply(this, [
-            "testTenantMigration",
-            {
-                insert: "rerouted",
-                documents: [{_id: this.migrationStateDoc._id}],
-                writeConcern: {w: "majority"}
-            },
-            0
-        ]);
-        if (res.ok) {
-            return;
+        try {
+            const res = originalRunCommand.apply(this, [
+                "testTenantMigration",
+                {
+                    insert: "rerouted",
+                    documents: [{_id: this.migrationStateDoc._id}],
+                    writeConcern: {w: "majority"}
+                },
+                0
+            ]);
+
+            if (res.ok) {
+                break;
+            } else if (ErrorCodes.isNetworkError(res.code) ||
+                       ErrorCodes.isNotPrimaryError(res.code)) {
+                jsTest.log(
+                    "Failed to write to testTenantMigration.rerouted due to a retryable error " +
+                    tojson(res));
+                continue;
+            } else {
+                // Throw non-retryable errors.
+                assert.commandWorked(res);
+            }
+        } catch (e) {
+            // Since the shell can throw custom errors that don't propagate the error code, check
+            // these exceptions for specific network error messages.
+            // TODO SERVER-54026: Remove check for network error messages once the shell reliably
+            // returns error codes.
+            if (ErrorCodes.isNetworkError(e.code) || ErrorCodes.isNotPrimaryError(e.code) ||
+                isNetworkError(e)) {
+                jsTest.log(
+                    "Failed to write to testTenantMigration.rerouted due to a retryable error exception " +
+                    tojson(e));
+                continue;
+            }
+            throw e;
         }
-        if (ErrorCodes.isNetworkError(res.code) || ErrorCodes.isNotPrimaryError(res.code)) {
-            jsTest.log("Failed to write to testTenantMigration.rerouted due to a retryable error " +
-                       tojson(res));
-            continue;
-        }
-        assert.commandWorked(res);
     }
 };
 
@@ -516,19 +535,21 @@ Mongo.prototype.runCommandRetryOnTenantMigrationErrors = function(
                 // After getting a TenantMigrationCommitted error, wait for the python test fixture
                 // to do a dbhash check on the donor and recipient primaries before we retry the
                 // command on the recipient.
-                assert.soon(() => {
-                    let findRes = assert.commandWorked(originalRunCommand.apply(this, [
-                        "testTenantMigration",
-                        {
-                            find: "dbhashCheck",
-                            filter: {_id: this.migrationStateDoc._id},
-                        },
-                        0
-                    ]));
+                if (!TestData.skipTenantMigrationDBHash) {
+                    assert.soon(() => {
+                        let findRes = assert.commandWorked(originalRunCommand.apply(this, [
+                            "testTenantMigration",
+                            {
+                                find: "dbhashCheck",
+                                filter: {_id: this.migrationStateDoc._id},
+                            },
+                            0
+                        ]));
 
-                    const docs = findRes.cursor.firstBatch;
-                    return docs[0] != null;
-                });
+                        const docs = findRes.cursor.firstBatch;
+                        return docs[0] != null;
+                    });
+                }
             } else if (migrationAbortedErr) {
                 jsTestLog(`Got TenantMigrationAborted for command against database ${
                     dbNameWithTenantId} after trying ${numAttempts} times: ${tojson(resObj)}`);

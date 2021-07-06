@@ -37,6 +37,7 @@
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_handle_topology_change.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_match.h"
@@ -56,7 +57,6 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/query/cluster_query_knobs_gen.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
-#include "mongo/s/query/document_source_update_on_add_shard.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
@@ -834,8 +834,15 @@ BSONObj createPassthroughCommandForShard(
         targetedCmd[AggregateCommandRequest::kPipelineFieldName] = Value(pipeline->serialize());
     }
 
-    return genericTransformForShards(
-        std::move(targetedCmd), expCtx, explainVerbosity, collationObj);
+    auto shardCommand =
+        genericTransformForShards(std::move(targetedCmd), expCtx, explainVerbosity, collationObj);
+
+    // Apply filter and RW concern to the final shard command.
+    return CommandHelpers::filterCommandRequestForPassthrough(
+        applyReadWriteConcern(expCtx->opCtx,
+                              true,              /* appendRC */
+                              !explainVerbosity, /* appendWC */
+                              shardCommand));
 }
 
 BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -873,8 +880,14 @@ BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionCont
     targetedCmd[AggregateCommandRequest::kExchangeFieldName] =
         exchangeSpec ? Value(exchangeSpec->exchangeSpec.toBSON()) : Value();
 
-    return genericTransformForShards(
+    auto shardCommand = genericTransformForShards(
         std::move(targetedCmd), expCtx, expCtx->explain, expCtx->getCollatorBSON());
+
+    // Apply RW concern to the final shard command.
+    return applyReadWriteConcern(expCtx->opCtx,
+                                 true,             /* appendRC */
+                                 !expCtx->explain, /* appendWC */
+                                 shardCommand);
 }
 
 /**
@@ -948,15 +961,12 @@ DispatchShardPipelineResults dispatchShardPipeline(
     }
 
     // Generate the command object for the targeted shards.
-    BSONObj targetedCommand = applyReadWriteConcern(
-        opCtx,
-        true,             /* appendRC */
-        !expCtx->explain, /* appendWC */
-        splitPipelines
-            ? createCommandForTargetedShards(
-                  expCtx, serializedCommand, *splitPipelines, exchangeSpec, true)
-            : createPassthroughCommandForShard(
-                  expCtx, serializedCommand, expCtx->explain, pipeline.get(), collationObj));
+    BSONObj targetedCommand =
+        (splitPipelines
+             ? createCommandForTargetedShards(
+                   expCtx, serializedCommand, *splitPipelines, exchangeSpec, true /* needsMerge */)
+             : createPassthroughCommandForShard(
+                   expCtx, serializedCommand, expCtx->explain, pipeline.get(), collationObj));
 
     // A $changeStream pipeline must run on all shards, and will also open an extra cursor on the
     // config server in order to monitor for new shards. To guarantee that we do not miss any
@@ -1094,15 +1104,8 @@ void addMergeCursorsSource(Pipeline* mergePipeline,
 
     armParams.setRemotes(std::move(remoteCursors));
 
-    // For change streams, we need to set up a custom stage to establish cursors on new shards when
-    // they are added, to ensure we don't miss results from the new shards.
     auto mergeCursorsStage =
         DocumentSourceMergeCursors::create(mergePipeline->getContext(), std::move(armParams));
-
-    if (hasChangeStream) {
-        mergePipeline->addInitialSource(DocumentSourceUpdateOnAddShard::create(
-            mergePipeline->getContext(), mergeCursorsStage, targetedShards, cmdSentToShards));
-    }
 
     mergePipeline->addInitialSource(std::move(mergeCursorsStage));
 }
@@ -1237,7 +1240,7 @@ StatusWith<ChunkManager> getExecutionNsRoutingInfo(OperationContext* opCtx,
 Shard::RetryPolicy getDesiredRetryPolicy(OperationContext* opCtx) {
     // The idempotent retry policy will retry even for writeConcern failures, so only set it if the
     // pipeline does not support writeConcern.
-    if (!opCtx->getWriteConcern().usedDefault) {
+    if (!opCtx->getWriteConcern().usedDefaultConstructedWC) {
         return Shard::RetryPolicy::kNotIdempotent;
     }
     return Shard::RetryPolicy::kIdempotent;
@@ -1258,16 +1261,26 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(Pipeline* owne
     invariant(pipeline->getSources().empty() ||
               !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
 
+    if (expCtx->ns.isConfigDotCacheDotChunks()) {
+        // We take special care to attach the local cursor stage to 'ownedPipeline' here rather than
+        // attaching it to a serialized and re-parsed copy of the pipeline to avoid optimizations
+        // such as the $sequentialCache stage from being lost. This is safe because each shard has
+        // its own complete copy of any "config.cache.chunks.*" namespace.
+        return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
+            pipeline.release());
+    }
+
     auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
     return shardVersionRetry(
         expCtx->opCtx, catalogCache, expCtx->ns, "targeting pipeline to attach cursors"_sd, [&]() {
             auto pipelineToTarget = pipeline->clone();
-            if (allowTargetingShards && !expCtx->ns.isConfigDotCacheDotChunks() &&
-                expCtx->ns.db() != "local") {
-                return targetShardsAndAddMergeCursors(expCtx, std::move(pipelineToTarget));
+            if (!allowTargetingShards || expCtx->ns.db() == "local") {
+                // If the db is local, this may be a change stream examining the oplog. We know the
+                // oplog (and any other local collections) will not be sharded.
+                return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
+                    pipelineToTarget.release());
             }
-            return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
-                pipelineToTarget.release());
+            return targetShardsAndAddMergeCursors(expCtx, std::move(pipelineToTarget));
         });
 }
 

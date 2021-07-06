@@ -3,12 +3,11 @@
  * they are within the time range, regardless of the order in which they are inserted.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -22,7 +21,7 @@ TimeseriesTest.run((insert) => {
     const timeFieldName = 'time';
     const times = [
         ISODate('2021-01-01T01:00:00Z'),
-        ISODate('2021-01-01T01:30:00Z'),
+        ISODate('2021-01-01T01:00:30Z'),
         ISODate('2021-01-01T02:00:00Z')
     ];
     let docs = [{_id: 0, [timeFieldName]: times[1]}, {_id: 1, [timeFieldName]: times[0]}];

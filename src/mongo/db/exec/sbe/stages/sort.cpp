@@ -125,6 +125,7 @@ void SortStage::makeSorter() {
     opts.extSortAllowed = _allowDiskUse;
     opts.limit =
         _specificStats.limit != std::numeric_limits<size_t>::max() ? _specificStats.limit : 0;
+    opts.moveSortedDataIntoIterator = true;
 
     auto comp = [&](const SorterData& lhs, const SorterData& rhs) {
         auto size = lhs.first.size();
@@ -171,14 +172,16 @@ void SortStage::open(bool reOpen) {
 
         size_t idx = 0;
         for (auto accessor : _inKeyAccessors) {
-            auto [tag, val] = accessor->copyOrMoveValue();
-            keys.reset(idx++, true, tag, val);
+            auto [tag, val] = accessor->getViewOfValue();
+            auto [cTag, cVal] = copyValue(tag, val);
+            keys.reset(idx++, true, cTag, cVal);
         }
 
         idx = 0;
         for (auto accessor : _inValueAccessors) {
-            auto [tag, val] = accessor->copyOrMoveValue();
-            vals.reset(idx++, true, tag, val);
+            auto [tag, val] = accessor->getViewOfValue();
+            auto [cTag, cVal] = copyValue(tag, val);
+            vals.reset(idx++, true, cTag, cVal);
         }
 
         _sorter->emplace(std::move(keys), std::move(vals));
@@ -194,7 +197,7 @@ void SortStage::open(bool reOpen) {
             // higher level stages.
             _tracker = nullptr;
             _children[0]->close();
-            uasserted(ErrorCodes::QueryTrialRunCompleted, "Trial run early exit");
+            uasserted(ErrorCodes::QueryTrialRunCompleted, "Trial run early exit in sort");
         }
     }
 
@@ -225,7 +228,7 @@ PlanState SortStage::getNext() {
 void SortStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _mergeIt.reset();
     _sorter.reset();
 }
@@ -240,6 +243,7 @@ std::unique_ptr<PlanStageStats> SortStage::getStats(bool includeDebugInfo) const
         bob.appendNumber("totalDataSizeSorted",
                          static_cast<long long>(_specificStats.totalDataSizeBytes));
         bob.appendBool("usedDisk", _specificStats.spills > 0);
+        bob.appendNumber("spills", static_cast<long long>(_specificStats.spills));
 
         BSONObjBuilder childrenBob(bob.subobjStart("orderBySlots"));
         for (size_t idx = 0; idx < _obs.size(); ++idx) {

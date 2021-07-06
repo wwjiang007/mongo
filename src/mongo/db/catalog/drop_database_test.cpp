@@ -67,6 +67,8 @@ using namespace mongo;
 class OpObserverMock : public OpObserverNoop {
 public:
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override;
+
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -180,8 +182,8 @@ void DropDatabaseTest::tearDown() {
  */
 void _createCollection(OperationContext* opCtx, const NamespaceString& nss) {
     writeConflictRetry(opCtx, "testDropCollection", nss.ns(), [=] {
-        AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         WriteUnitOfWork wuow(opCtx);

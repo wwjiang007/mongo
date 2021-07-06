@@ -1,7 +1,6 @@
 // Verifies basic sharded transaction behavior with the supported read concern levels.
 //
 // @tags: [
-//   requires_find_command,
 //   requires_sharding,
 //   uses_multi_shard_transaction,
 //   uses_transactions,
@@ -13,7 +12,7 @@ const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-const st = new ShardingTest({shards: 2, config: 1});
+const st = new ShardingTest({shards: 2});
 
 // Set up a sharded collection with 2 chunks, one on each shard.
 

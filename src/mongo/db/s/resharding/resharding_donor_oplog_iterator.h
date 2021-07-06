@@ -73,6 +73,14 @@ public:
         std::shared_ptr<executor::TaskExecutor> executor,
         CancellationToken cancelToken,
         CancelableOperationContextFactory factory) = 0;
+
+    /**
+     * Releases any resources held by this oplog iterator such as Pipelines, PlanExecutors, or
+     * in-memory structures.
+     *
+     * This function must be called before destroying the oplog iterator.
+     */
+    virtual void dispose(OperationContext* opCtx) {}
 };
 
 /**
@@ -101,14 +109,13 @@ public:
         CancellationToken cancelToken,
         CancelableOperationContextFactory factory) override;
 
+    void dispose(OperationContext* opCtx) override;
+
     static constexpr auto kActualOpFieldName = "actualOp"_sd;
     static constexpr auto kPreImageOpFieldName = "preImageOp"_sd;
     static constexpr auto kPostImageOpFieldName = "postImageOp"_sd;
 
 private:
-    template <typename Callable>
-    auto _withTemporaryOperationContext(Callable&& callable);
-
     std::vector<repl::OplogEntry> _fillBatch(Pipeline& pipeline);
 
     const NamespaceString _oplogBufferNss;

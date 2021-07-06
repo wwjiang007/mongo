@@ -122,14 +122,15 @@ public:
      * Look up the 'nss' in the view catalog, returning a shared pointer to a View definition, or
      * nullptr if it doesn't exist.
      */
-    std::shared_ptr<const ViewDefinition> lookup(OperationContext* opCtx, StringData nss) const;
+    std::shared_ptr<const ViewDefinition> lookup(OperationContext* opCtx,
+                                                 const NamespaceString& nss) const;
 
     /**
      * Same functionality as above, except this function skips validating durable views in the view
      * catalog.
      */
     std::shared_ptr<const ViewDefinition> lookupWithoutValidatingDurableViews(
-        OperationContext* opCtx, StringData nss) const;
+        OperationContext* opCtx, const NamespaceString& nss) const;
 
     /**
      * Resolve the views on 'nss', transforming the pipeline appropriately. This function returns a
@@ -137,6 +138,21 @@ public:
      * the collation to use for the operation.
      */
     StatusWith<ResolvedView> resolveView(OperationContext* opCtx, const NamespaceString& nss) const;
+
+    /**
+     * Usage statistics about this view catalog.
+     * Total views = internal + userViews + userTimeseries.
+     */
+    struct Stats {
+        int userViews = 0;
+        int userTimeseries = 0;
+        int internal = 0;
+    };
+
+    /**
+     * Returns statistics for this view catalog.
+     */
+    Stats getStats() const;
 
     /**
      * Returns Status::OK with the set of involved namespaces if the given pipeline is eligible to
@@ -191,13 +207,15 @@ private:
                               const std::vector<NamespaceString>& refs) const;
 
     std::shared_ptr<const ViewDefinition> _lookup(OperationContext* opCtx,
-                                                  StringData ns,
+                                                  const NamespaceString& ns,
                                                   ViewCatalogLookupBehavior lookupBehavior) const;
     std::shared_ptr<ViewDefinition> _lookup(OperationContext* opCtx,
-                                            StringData ns,
+                                            const NamespaceString& ns,
                                             ViewCatalogLookupBehavior lookupBehavior);
 
-    Status _reload(OperationContext* opCtx, ViewCatalogLookupBehavior lookupBehavior);
+    Status _reload(OperationContext* opCtx,
+                   ViewCatalogLookupBehavior lookupBehavior,
+                   bool reloadForCollectionCatalog);
 
     /**
      * uasserts with the InvalidViewDefinition error if the current in-memory state of the view
@@ -207,10 +225,10 @@ private:
     void _requireValidCatalog() const;
 
     ViewMap _viewMap;
-    ViewMap _viewMapBackup;
     std::shared_ptr<DurableViewCatalog> _durable;
     bool _valid;
     ViewGraph _viewGraph;
     bool _viewGraphNeedsRefresh;
+    Stats _stats;
 };
 }  // namespace mongo

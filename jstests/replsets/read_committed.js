@@ -77,6 +77,10 @@ var secondary = replTest.getSecondary();
 var coll = primary.getDB(name)[name];
 var secondaryColl = secondary.getDB(name)[name];
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+replTest.awaitReplication();
 function log(arg) {
     jsTest.log(tojson(arg));
 }
@@ -155,7 +159,8 @@ for (var testName in testCases) {
 
     // Restart oplog application on the secondary and ensure the committed view is updated.
     restartServerReplication(secondary);
-    coll.getDB().getLastError("majority", 60 * 1000);
+    replTest.awaitLastOpCommitted();
+
     assert.eq(doCommittedRead(coll), test.expectedAfter);
     assert.neq(readLatestOplogEntry('majority').ts, initialOplogTs);
 

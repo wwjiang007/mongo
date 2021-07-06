@@ -45,7 +45,7 @@ using std::vector;
 REGISTER_DOCUMENT_SOURCE(bucketAuto,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceBucketAuto::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 namespace {
 
@@ -99,6 +99,11 @@ DocumentSource::GetNextResult DocumentSourceBucketAuto::doGetNext() {
 
         initalizeBucketIteration();
         _populated = true;
+    }
+
+    if (!_sortedInput) {
+        // We have been disposed. Return EOF.
+        return GetNextResult::makeEOF();
     }
 
     if (_currentBucketDetails.currentBucketNum++ < _nBuckets) {
@@ -406,7 +411,8 @@ intrusive_ptr<DocumentSourceBucketAuto> DocumentSourceBucketAuto::create(
             "count",
             AccumulationExpression(ExpressionConstant::create(pExpCtx.get(), Value(BSONNULL)),
                                    ExpressionConstant::create(pExpCtx.get(), Value(1)),
-                                   [pExpCtx] { return AccumulatorSum::create(pExpCtx.get()); }));
+                                   [pExpCtx] { return AccumulatorSum::create(pExpCtx.get()); },
+                                   AccumulatorSum::kName));
     }
     return new DocumentSourceBucketAuto(pExpCtx,
                                         groupByExpression,

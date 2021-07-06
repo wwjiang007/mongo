@@ -119,6 +119,7 @@ private:
 
 class ReplicationRecoveryTestObObserver : public OpObserverNoop {
 public:
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -267,7 +268,8 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                                 boost::none,    // pre-image optime
                                 boost::none,    // post-image optime
                                 boost::none,    // ShardId of resharding recipient
-                                boost::none)};  // _id
+                                boost::none,    // _id
+                                boost::none)};  // needsRetryImage
 }
 
 /**
@@ -783,11 +785,12 @@ TEST_F(ReplicationRecoveryTest,
 
 DEATH_TEST_REGEX_F(ReplicationRecoveryTest,
                    AppliedThroughBehindOplogFasserts,
-                   "Fatal assertion.*40292") {
+                   "Fatal assertion.*5466601") {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
     getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(1, 1), 1));
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(1, 1));
     _setUpOplog(opCtx, getStorageInterface(), {3, 4, 5});
 
     recovery.recoverFromOplog(opCtx, boost::none);
@@ -805,13 +808,12 @@ DEATH_TEST_REGEX_F(ReplicationRecoveryTest,
     recovery.recoverFromOplog(opCtx, boost::none);
 }
 
-DEATH_TEST_REGEX_F(ReplicationRecoveryTest,
-                   AppliedThroughNotInOplogCausesFassert,
-                   "Fatal assertion.*40292") {
+TEST_F(ReplicationRecoveryTest, AppliedThroughNotInOplog) {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
     getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(3, 3), 1));
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(3, 3));
     _setUpOplog(opCtx, getStorageInterface(), {1, 2, 4, 5});
 
     recovery.recoverFromOplog(opCtx, boost::none);
@@ -1593,6 +1595,37 @@ DEATH_TEST_REGEX_F(
     getConsistencyMarkers()->setMinValid(opCtx, OpTime(Timestamp(20, 20), 1));
 
     recovery.recoverFromOplogAsStandalone(opCtx);
+}
+
+TEST_F(ReplicationRecoveryTest, RecoverStartFromClosestLTEEntryIfRecoveryTsNotInOplog) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    auto recoveryTs = Timestamp(4, 4);
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(recoveryTs);
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 5, 6, 7});
+    recovery.recoverFromOplog(opCtx, recoveryTs);
+}
+
+TEST_F(ReplicationRecoveryTest, RecoverySetsValidateFeaturesAsPrimaryToFalseWhileApplyingOplog) {
+    FailPointEnableBlock failpoint(
+        "skipResettingValidateFeaturesAsPrimaryAfterRecoveryOplogApplication");
+
+    // The reset will be skipped due to the failpoint so we make the test do it instead.
+    auto validateValue = serverGlobalParams.validateFeaturesAsPrimary.load();
+    ON_BLOCK_EXIT(
+        [validateValue] { serverGlobalParams.validateFeaturesAsPrimary.store(validateValue); });
+
+    serverGlobalParams.validateFeaturesAsPrimary.store(true);
+    ASSERT(serverGlobalParams.validateFeaturesAsPrimary.load());
+
+    auto opCtx = getOperationContext();
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    getConsistencyMarkers()->setAppliedThrough(opCtx, OpTime(Timestamp(3, 3), 1));
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4, 5});
+    recovery.recoverFromOplog(opCtx, boost::none /* recoveryTs */);
+
+    ASSERT_FALSE(serverGlobalParams.validateFeaturesAsPrimary.load());
 }
 
 }  // namespace

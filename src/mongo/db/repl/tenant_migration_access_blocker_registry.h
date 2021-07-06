@@ -70,10 +70,15 @@ public:
 
         void clearAccessBlocker(TenantMigrationAccessBlocker::BlockerType type) {
             if (type == TenantMigrationAccessBlocker::BlockerType::kDonor) {
-                invariant(_donor);
+                if (!_donor) {
+                    return;
+                }
+                checked_pointer_cast<TenantMigrationDonorAccessBlocker>(_donor)->interrupt();
                 _donor.reset();
             } else {
-                invariant(_recipient);
+                if (!_recipient) {
+                    return;
+                }
                 _recipient.reset();
             }
         }
@@ -95,6 +100,12 @@ public:
      * Invariants that an entry for tenantId exists, and then removes the entry for (tenantId, mtab)
      */
     void remove(StringData tenantId, TenantMigrationAccessBlocker::BlockerType type);
+    void _remove(WithLock, StringData tenantId, TenantMigrationAccessBlocker::BlockerType type);
+
+    /**
+     * Removes all mtabs of the given type.
+     */
+    void removeAll(TenantMigrationAccessBlocker::BlockerType type);
 
     /**
      * Iterates through each of the TenantMigrationAccessBlockers and

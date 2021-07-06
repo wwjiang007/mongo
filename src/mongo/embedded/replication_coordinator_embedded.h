@@ -46,7 +46,7 @@ public:
     // Members that are implemented and safe to call of public ReplicationCoordinator API
 
     void startup(OperationContext* opCtx,
-                 LastStorageEngineShutdownState lastStorageEngineShutdownState) override;
+                 StorageEngine::LastShutdownState lastShutdownState) override;
 
     void enterTerminalShutdown() override;
 
@@ -109,7 +109,7 @@ public:
 
     Seconds getSecondaryDelaySecs() const override;
 
-    void clearSyncSourceBlacklist() override;
+    void clearSyncSourceDenylist() override;
 
     repl::ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext*, const repl::OpTime&, const WriteConcernOptions&) override;
@@ -182,6 +182,30 @@ public:
 
     repl::ReplSetConfig getConfig() const override;
 
+    ConnectionString getConfigConnectionString() const override;
+
+    Milliseconds getConfigElectionTimeoutPeriod() const override;
+
+    std::vector<repl::MemberConfig> getConfigVotingMembers() const override;
+
+    std::int64_t getConfigTerm() const override;
+
+    std::int64_t getConfigVersion() const override;
+
+    repl::ConfigVersionAndTerm getConfigVersionAndTerm() const override;
+
+    int getConfigNumMembers() const override;
+
+    Milliseconds getConfigHeartbeatTimeoutPeriodMillis() const override;
+
+    BSONObj getConfigBSON() const override;
+
+    const repl::MemberConfig* findConfigMemberByHostAndPort(const HostAndPort& hap) const override;
+
+    bool isConfigLocalHostAllowed() const override;
+
+    Milliseconds getConfigHeartbeatInterval() const override;
+
     void processReplSetGetConfig(BSONObjBuilder*,
                                  bool commitmentStatus = false,
                                  bool includeNewlyAdded = false) override;
@@ -221,7 +245,7 @@ public:
 
     HostAndPort chooseNewSyncSource(const repl::OpTime&) override;
 
-    void blacklistSyncSource(const HostAndPort&, Date_t) override;
+    void denylistSyncSource(const HostAndPort&, Date_t) override;
 
     void resetLastOpTimesFromOplog(OperationContext*) override;
 

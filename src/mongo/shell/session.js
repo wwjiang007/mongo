@@ -148,7 +148,7 @@ var {
                 wireVersion <= client.getMaxWireVersion();
         }
 
-        // TODO: Update this whitelist, or convert it to a blacklist depending on the outcome of
+        // TODO: Update this allowlist, or convert it to a denylist depending on the outcome of
         // SERVER-31743.
         const kCommandsThatSupportReadConcern = new Set([
             "aggregate",
@@ -257,11 +257,8 @@ var {
             if (serverSupports(kWireVersionSupportingLogicalSession) &&
                 // Always attach sessionId from explicit sessions.
                 (driverSession._isExplicit ||
-                 // Check that implicit sessions are not disabled. The client must be using read
-                 // commands because aggregations always use runCommand() to establish cursors but
-                 // may use OP_GET_MORE (and therefore not have a session id attached) to retrieve
-                 // subsequent batches.
-                 (!jsTest.options().disableImplicitSessions && client.useReadCommands()))) {
+                 // Check that implicit sessions are not disabled.
+                 !jsTest.options().disableImplicitSessions)) {
                 cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
             }
 
@@ -374,9 +371,9 @@ var {
                         throw e;
                     }
 
-                    // We run an "isMaster" command explicitly to force the underlying
+                    // We run a "hello" command explicitly to force the underlying
                     // DBClient to reconnect to the server.
-                    const res = client.adminCommand({isMaster: 1});
+                    const res = client.getDB('admin')._helloOrLegacyHello();
                     if (res.ok !== 1) {
                         throw e;
                     }

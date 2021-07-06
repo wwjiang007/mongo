@@ -84,6 +84,7 @@ let testCases = {
     _configsvrCleanupReshardCollection: {skip: "internal command"},
     _configsvrClearJumboFlag: {skip: "internal command"},
     _configsvrCommitChunkMerge: {skip: "internal command"},
+    _configsvrCommitChunksMerge: {skip: "internal command"},
     _configsvrCommitChunkMigration: {skip: "internal command"},
     _configsvrCommitChunkSplit: {skip: "internal command"},
     _configsvrCommitMovePrimary: {skip: "internal command"},
@@ -98,7 +99,9 @@ let testCases = {
     _configsvrRefineCollectionShardKey: {skip: "internal command"},
     _configsvrRemoveShard: {skip: "internal command"},
     _configsvrRemoveShardFromZone: {skip: "internal command"},
+    _configsvrRemoveTags: {skip: "internal command"},
     _configsvrRenameCollection: {skip: "internal command"},
+    _configsvrRenameCollectionMetadata: {skip: "internal command"},
     _configsvrReshardCollection: {skip: "internal command"},
     _configsvrSetAllowMigrations: {skip: "internal command"},
     _configsvrShardCollection: {skip: "internal command"},
@@ -108,6 +111,7 @@ let testCases = {
     _flushReshardingStateChange: {skip: "internal command"},
     _flushRoutingTableCacheUpdates: {skip: "internal command"},
     _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "internal command"},
+    _getAuditConfigGeneration: {skip: "does not accept read or write concern"},
     _getNextSessionMods: {skip: "internal command"},
     _getUserCacheGeneration: {skip: "internal command"},
     _hashBSONElement: {skip: "internal command"},
@@ -119,6 +123,7 @@ let testCases = {
     _recvChunkCommit: {skip: "internal command"},
     _recvChunkStart: {skip: "internal command"},
     _recvChunkStatus: {skip: "internal command"},
+    _shardsvrAbortReshardCollection: {skip: "internal command"},
     _shardsvrCleanupReshardCollection: {skip: "internal command"},
     _shardsvrCloneCatalogData: {skip: "internal command"},
     _shardsvrCreateCollection: {skip: "internal command"},
@@ -131,7 +136,7 @@ let testCases = {
     _shardsvrRefineCollectionShardKey: {skip: "internal command"},
     _shardsvrRenameCollection: {skip: "internal command"},
     _shardsvrRenameCollectionParticipant: {skip: "internal command"},
-    _shardsvrRenameCollectionUnblockParticipant: {skip: "internal command"},
+    _shardsvrRenameCollectionParticipantUnblock: {skip: "internal command"},
     _shardsvrReshardCollection: {skip: "internal command"},
     _shardsvrReshardingOperationTime: {skip: "internal command"},
     _shardsvrShardCollection: {skip: "internal command"},
@@ -140,7 +145,8 @@ let testCases = {
     abortReshardCollection: {skip: "does not accept read or write concern"},
     abortTransaction: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
+            assert.commandWorked(
+                conn.getDB(db).runCommand({create: coll, writeConcern: {w: 'majority'}}));
             // Ensure that the dbVersion is known.
             assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
             assert.eq(1,
@@ -213,9 +219,11 @@ let testCases = {
         checkWriteConcern: true,
     },
     collStats: {skip: "does not accept read or write concern"},
+    commitReshardCollection: {skip: "does not accept read or write concern"},
     commitTransaction: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
+            assert.commandWorked(
+                conn.getDB(db).runCommand({create: coll, writeConcern: {w: 'majority'}}));
             // Ensure that the dbVersion is known.
             assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
             assert.eq(1,
@@ -411,6 +419,7 @@ let testCases = {
     forceerror: {skip: "test command"},
     fsync: {skip: "does not accept read or write concern"},
     fsyncUnlock: {skip: "does not accept read or write concern"},
+    getAuditConfig: {skip: "does not accept read or write concern"},
     getCmdLineOpts: {skip: "does not accept read or write concern"},
     getDatabaseVersion: {skip: "does not accept read or write concern"},
     getDefaultRWConcern: {skip: "does not accept read or write concern"},
@@ -846,7 +855,7 @@ function runScenario(
 
         // Do any test-specific setup.
         if (typeof (test.setUp) === "function") {
-            conn._runWithForcedReadMode("commands", test.setUp);
+            test.setUp(conn);
         }
 
         // Get the command from the test case.
@@ -966,14 +975,13 @@ function runTests(conn, regularCheckConn, configSvrCheckConn) {
                 configSvrCheckConn,
                 {explicitRWC: true, explicitProvenance: true});
 
-    assert.commandWorked(conn.adminCommand(
-        {setDefaultRWConcern: 1, defaultReadConcern: {}, defaultWriteConcern: {}}));
-    runScenario("Scenario: RWC defaults unset, explicit RWC present, absent provenance",
+    assert.commandWorked(conn.adminCommand({setDefaultRWConcern: 1, defaultReadConcern: {}}));
+    runScenario("Scenario: Read concern defaults unset, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
                 {explicitRWC: true, explicitProvenance: false});
-    runScenario("Scenario: RWC defaults unset, explicit RWC present, explicit provenance",
+    runScenario("Scenario: Read concern defaults unset, explicit RWC present, explicit provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,

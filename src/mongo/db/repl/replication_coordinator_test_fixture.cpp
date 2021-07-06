@@ -36,7 +36,9 @@
 #include <functional>
 #include <memory>
 
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/hello_response.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
@@ -140,6 +142,10 @@ void ReplCoordTest::init() {
     // PRNG seed for tests.
     const int64_t seed = 0;
 
+    // The ReadWriteConcernDefaults decoration on the service context won't always be created,
+    // so we should manually instantiate it to ensure it exists in our tests.
+    ReadWriteConcernDefaults::create(service, lookupMock.getFetchDefaultsFn());
+
     TopologyCoordinator::Options settings;
     auto topo = std::make_unique<TopologyCoordinator>(settings);
     _topo = topo.get();
@@ -190,7 +196,7 @@ void ReplCoordTest::start() {
     }
 
     const auto opCtx = makeOperationContext();
-    _repl->startup(opCtx.get(), LastStorageEngineShutdownState::kClean);
+    _repl->startup(opCtx.get(), StorageEngine::LastShutdownState::kClean);
     _repl->waitForStartUpComplete_forTest();
     // _rsConfig should be written down at this point, so populate _memberData accordingly.
     _topo->populateAllMembersConfigVersionAndTerm_forTest();
@@ -492,7 +498,7 @@ void ReplCoordTest::disableSnapshots() {
 void ReplCoordTest::simulateCatchUpAbort() {
     NetworkInterfaceMock* net = getNet();
     auto heartbeatTimeoutWhen =
-        net->now() + getReplCoord()->getConfig().getHeartbeatTimeoutPeriodMillis();
+        net->now() + getReplCoord()->getConfigHeartbeatTimeoutPeriodMillis();
     bool hasRequest = false;
     net->enterNetwork();
     if (net->now() < heartbeatTimeoutWhen) {

@@ -31,7 +31,6 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
-#include "mongo/db/s/resharding/resharding_critical_section.h"
 #include "mongo/db/s/resharding/resharding_data_replication.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
@@ -59,10 +58,7 @@ public:
         return NamespaceString::kRecipientReshardingOperationsNamespace;
     }
 
-    ThreadPool::Limits getThreadPoolLimits() const override {
-        // TODO Limit the size of ReshardingRecipientService thread pool.
-        return ThreadPool::Limits();
-    }
+    ThreadPool::Limits getThreadPoolLimits() const override;
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
 };
@@ -99,7 +95,32 @@ public:
         std::unique_ptr<RecipientStateMachineExternalState> externalState,
         ReshardingDataReplicationFactory dataReplicationFactory);
 
-    ~RecipientStateMachine();
+    ~RecipientStateMachine() = default;
+
+    /**
+     *  Runs up until the recipient is in state kStrictConsistency or encountered an error.
+     */
+    ExecutorFuture<void> _runUntilStrictConsistencyOrErrored(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken) noexcept;
+
+    /**
+     * Notifies the coordinator if the recipient is in kStrictConsistency or kError and waits for
+     * _coordinatorHasDecisionPersisted to be fulfilled (success) or for the abortToken to be
+     * canceled (failure or stepdown).
+     */
+    ExecutorFuture<void> _notifyCoordinatorAndAwaitDecision(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken) noexcept;
+
+    /**
+     * Finishes the work left remaining on the recipient after the coordinator persists its decision
+     * to abort or complete resharding.
+     */
+    ExecutorFuture<void> _finishReshardingOperation(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& stepdownToken,
+        bool aborted) noexcept;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                          const CancellationToken& token) noexcept override;
@@ -107,8 +128,17 @@ public:
     void interrupt(Status status) override;
 
     /**
-     * Returns a Future that will be resolved when all work associated with this Instance has
-     * completed running.
+     * Returns a Future fulfilled once the recipient locally persists its final state before the
+     * coordinator makes its decision to commit or abort (RecipientStateEnum::kError or
+     * RecipientStateEnum::kStrictConsistency).
+     */
+    SharedSemiFuture<void> awaitInStrictConsistencyOrError() const {
+        return _inStrictConsistencyOrError.getFuture();
+    }
+
+    /**
+     * Returns a Future that will be resolved when all work associated with this Instance is done
+     * making forward progress.
      */
     SharedSemiFuture<void> getCompletionFuture() const {
         return _completionPromise.getFuture();
@@ -124,10 +154,29 @@ public:
     static void insertStateDocument(OperationContext* opCtx,
                                     const ReshardingRecipientDocument& recipientDoc);
 
+    /**
+     * Indicates that the coordinator has persisted a decision. Unblocks the
+     * _coordinatorHasDecisionPersisted promise.
+     */
+    void commit();
+
+    /**
+     * Initiates the cancellation of the resharding operation.
+     */
+    void abort(bool isUserCancelled);
+
 private:
+    /**
+     * The work inside this function must be run regardless of any work on _scopedExecutor ever
+     * running.
+     */
+    ExecutorFuture<void> _runMandatoryCleanup(Status status,
+                                              const CancellationToken& stepdownToken);
+
     // The following functions correspond to the actions to take at a particular recipient state.
     ExecutorFuture<void> _awaitAllDonorsPreparedToDonateThenTransitionToCreatingCollection(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken);
 
     void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
@@ -135,29 +184,31 @@ private:
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken);
 
-    ExecutorFuture<void> _applyThenTransitionToSteadyState(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-        const CancellationToken& abortToken);
-
     ExecutorFuture<void> _awaitAllDonorsBlockingWritesThenTransitionToStrictConsistency(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken);
 
-    ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
-
     void _renameTemporaryReshardingCollection();
+
+    void _cleanupReshardingCollections(bool aborted);
 
     // Transitions the on-disk and in-memory state to 'newState'.
     void _transitionState(RecipientStateEnum newState);
 
     void _transitionState(RecipientShardContext&& newRecipientCtx,
-                          boost::optional<CloneDetails>&& cloneDetails);
+                          boost::optional<CloneDetails>&& cloneDetails,
+                          boost::optional<mongo::Date_t> configStartTime);
 
-    // Transitions the on-disk and in-memory state to RecipientStateEnum::kCreatingCollection.
-    void _transitionToCreatingCollection(CloneDetails cloneDetails);
+    // The following functions transition the on-disk and in-memory state to the named state.
+    void _transitionToCreatingCollection(CloneDetails cloneDetails,
+                                         boost::optional<mongo::Date_t> startConfigTxnCloneTime);
 
-    // Transitions the on-disk and in-memory state to RecipientStateEnum::kError.
+    void _transitionToCloning();
+
+    void _transitionToApplying();
+
+    void _transitionToStrictConsistency();
+
     void _transitionToError(Status abortReason);
 
     BSONObj _makeQueryForCoordinatorUpdate(const ShardId& shardId, RecipientStateEnum newState);
@@ -168,10 +219,11 @@ private:
     // Updates the mutable portion of the on-disk and in-memory recipient document with
     // 'newRecipientCtx', 'fetchTimestamp and 'donorShards'.
     void _updateRecipientDocument(RecipientShardContext&& newRecipientCtx,
-                                  boost::optional<CloneDetails>&& cloneDetails);
+                                  boost::optional<CloneDetails>&& cloneDetails,
+                                  boost::optional<mongo::Date_t> configStartTime);
 
     // Removes the local recipient document from disk.
-    void _removeRecipientDocument();
+    void _removeRecipientDocument(bool aborted);
 
     std::unique_ptr<ReshardingDataReplicationInterface> _makeDataReplication(
         OperationContext* opCtx, bool cloningDone);
@@ -183,15 +235,17 @@ private:
 
     ReshardingMetrics* _metrics() const;
 
-    // Does work necessary for both recoverable errors (failover/stepdown) and unrecoverable errors
-    // (abort resharding).
-    void _onAbortOrStepdown(WithLock, Status status);
+    void _startMetrics();
+
+    // Restore metrics using the persisted metrics after stepping up.
+    void _restoreMetrics();
 
     // Initializes the _abortSource and generates a token from it to return back the caller.
     //
     // Should only be called once per lifetime.
     CancellationToken _initAbortSource(const CancellationToken& stepdownToken);
 
+    // The primary-only service instance corresponding to the recipient instance. Not owned.
     const ReshardingRecipientService* const _recipientService;
 
     // The in-memory representation of the immutable portion of the document in
@@ -206,6 +260,10 @@ private:
     boost::optional<Timestamp> _cloneTimestamp;
 
     const std::unique_ptr<RecipientStateMachineExternalState> _externalState;
+
+    // Time at which the minimum operation duration threshold has been met, and
+    // config.transactions cloning can begin.
+    boost::optional<Date_t> _startConfigTxnCloneAt;
 
     // ThreadPool used by CancelableOperationContext.
     // CancelableOperationContext must have a thread that is always available to it to mark its
@@ -224,14 +282,20 @@ private:
     // Canceled when there is an unrecoverable error or stepdown.
     boost::optional<CancellationSource> _abortSource;
 
-    // Contains the status with which the operation was aborted.
-    boost::optional<Status> _abortStatus;
+    // The identifier associated to the recoverable critical section.
+    const BSONObj _critSecReason;
 
-    boost::optional<ReshardingCriticalSection> _critSec;
+    // It states whether the current node has also the donor role.
+    const bool _isAlsoDonor;
+
+    // It states whether or not the user has aborted the resharding operation.
+    boost::optional<bool> _userCanceled;
 
     // Each promise below corresponds to a state on the recipient state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.
     SharedPromise<CloneDetails> _allDonorsPreparedToDonate;
+
+    SharedPromise<void> _inStrictConsistencyOrError;
 
     SharedPromise<void> _coordinatorHasDecisionPersisted;
 

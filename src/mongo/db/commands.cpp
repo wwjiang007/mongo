@@ -61,6 +61,7 @@
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/rpc/protocol.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
@@ -114,7 +115,7 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
 }
 
 // The command names that are allowed in a multi-document transaction.
-const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
+const StringMap<int> txnCmdAllowlist = {{"abortTransaction", 1},
                                         {"aggregate", 1},
                                         {"commitTransaction", 1},
                                         {"coordinateCommitTransaction", 1},
@@ -467,7 +468,7 @@ BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj,
                                         WriteConcernOptions::SyncMode::UNSET,
                                         wc["wtimeout"].Number());
         }
-    } else if (!defaultWC.usedDefault) {
+    } else if (!defaultWC.usedDefaultConstructedWC) {
         auto minimumAcceptableWTimeout = newWC.wTimeout;
         newWC = defaultWC;
         newWC.wMode = "majority";
@@ -555,11 +556,11 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
             "http://dochub.mongodb.org/core/transaction-count for a recommended alternative.",
             cmdName != "count"_sd);
 
-    auto inTxnWhitelist = txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend();
+    auto inTxnAllowlist = txnCmdAllowlist.find(cmdName) != txnCmdAllowlist.cend();
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction.",
-            inTxnWhitelist);
+            inTxnAllowlist);
 
     const auto dbName = nss.db();
 
@@ -681,6 +682,8 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
     const Command* cmd = invocation->definition();
     failCommand.executeIf(
         [&](const BSONObj& data) {
+            rpc::RewriteStateChangeErrors::onActiveFailCommand(opCtx, data);
+
             if (data.hasField(kErrorLabelsFieldName) &&
                 data[kErrorLabelsFieldName].type() == Array) {
                 // Propagate error labels specified in the failCommand failpoint to the
@@ -880,8 +883,9 @@ private:
         return _command->supportsWriteConcern(cmdObj());
     }
 
-    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
-        return _command->supportsReadConcern(cmdObj(), level);
+    ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                 bool isImplicitDefault) const override {
+        return _command->supportsReadConcern(cmdObj(), level, isImplicitDefault);
     }
 
     bool supportsReadMirroring() const override {

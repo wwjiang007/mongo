@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/s/rename_collection_coordinator_document_gen.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
@@ -40,7 +40,8 @@ public:
     using StateDoc = RenameCollectionCoordinatorDocument;
     using Phase = RenameCollectionCoordinatorPhaseEnum;
 
-    RenameCollectionCoordinator(const BSONObj& initialState);
+    RenameCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                const BSONObj& initialState);
 
     void checkIfOptionsConflict(const BSONObj& doc) const override;
 
@@ -58,11 +59,14 @@ public:
     }
 
 private:
+    ShardingDDLCoordinatorMetadata const& metadata() const override {
+        return _doc.getShardingDDLCoordinatorMetadata();
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    std::vector<DistLockManager::ScopedDistLock> _acquireAdditionalLocks(
-        OperationContext* opCtx) override;
+    std::vector<StringData> _acquireAdditionalLocks(OperationContext* opCtx) override;
 
     template <typename Func>
     auto _executePhase(const Phase& newPhase, Func&& func) {
@@ -81,9 +85,10 @@ private:
         };
     }
 
-    void _insertStateDocument(StateDoc&& doc);
-    void _updateStateDocument(StateDoc&& newStateDoc);
     void _enterPhase(Phase newPhase);
+
+    void _performNoopRetryableWriteOnParticipants(
+        OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor);
 
     RenameCollectionCoordinatorDocument _doc;
 

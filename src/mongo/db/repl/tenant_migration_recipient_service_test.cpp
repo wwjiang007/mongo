@@ -36,9 +36,11 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
+#include "mongo/client/streamable_replica_set_monitor_for_testing.h"
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version_document_gen.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
@@ -101,7 +103,8 @@ OplogEntry makeOplogEntry(OpTime opTime,
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
                               boost::none,    // ShardId of resharding recipient
-                              boost::none)};  // _id
+                              boost::none,    // _id
+                              boost::none)};  // needsRetryImage
 }
 
 MutableOplogEntry makeNoOpOplogEntry(OpTime opTime,
@@ -170,8 +173,10 @@ public:
         ServiceContextMongoDTest::setUp();
         auto serviceContext = getServiceContext();
 
-        // Only the ReplicaSetMonitor scanning protocol supports mock connections.
-        ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol::kScanning);
+        // Fake replSet just for creating consistent URI for monitor
+        MockReplicaSet replSet("donorSet", 1, true /* hasPrimary */, true /* dollarPrefixHosts */);
+        _rsmMonitor.setup(replSet.getURI());
+
         ConnectionString::setConnectionHook(mongo::MockConnRegistry::get()->getConnStrHook());
 
         // Set up clocks.
@@ -192,6 +197,11 @@ public:
             ReplicationCoordinator::set(serviceContext, std::move(replCoord));
 
             repl::createOplog(opCtx.get());
+            {
+                Lock::GlobalWrite lk(opCtx.get());
+                OldClientContext ctx(opCtx.get(), NamespaceString::kRsOplogNamespace.ns());
+                tenant_migration_util::createOplogViewForTenantMigrations(opCtx.get(), ctx.db());
+            }
 
             // Need real (non-mock) storage for the oplog buffer.
             StorageInterface::set(serviceContext, std::make_unique<StorageInterfaceImpl>());
@@ -396,6 +406,10 @@ protected:
         return instance->_stateDoc;
     }
 
+    sdam::MockTopologyManager* getTopologyManager() {
+        return _rsmMonitor.getTopologyManager();
+    }
+
     /**
      * Advance the time by millis on both clock source mocks.
      */
@@ -439,6 +453,10 @@ protected:
         client->insert(NamespaceString::kServerConfigurationNamespace.ns(), fcvDoc.toBSON());
     }
 
+    ClockSource* clock() {
+        return _clkSource.get();
+    }
+
 private:
     std::shared_ptr<ClockSourceMock> _clkSource = std::make_shared<ClockSourceMock>();
 
@@ -446,6 +464,8 @@ private:
         logv2::LogComponent::kReplication, logv2::LogSeverity::Debug(1)};
     unittest::MinimumLoggedSeverityGuard _tenantMigrationSeverityGuard{
         logv2::LogComponent::kTenantMigration, logv2::LogSeverity::Debug(1)};
+
+    StreamableReplicaSetMonitorForTesting _rsmMonitor;
 };
 
 #ifdef MONGO_CONFIG_SSL
@@ -511,7 +531,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_P
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -562,7 +582,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_S
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -614,7 +634,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -645,25 +665,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
     instance->excludeDonorHost_forTest(hosts.at(0), now + Milliseconds(500));
 
-    AtomicWord<bool> runReplMonitor{true};
-    // Keep scanning the replica set while waiting to reach the failpoint. This would normally
-    // be automatic but that doesn't work with mock replica sets.
-    stdx::thread replMonitorThread([&] {
-        Client::initThread("replMonitorThread");
-        while (runReplMonitor.load()) {
-            auto monitor = ReplicaSetMonitor::get(replSet.getSetName());
-            // Monitor may not have been created yet.
-            if (monitor) {
-                monitor->runScanForMockReplicaSet();
-            }
-            mongo::sleepmillis(100);
-        }
-    });
-
     hangFp->setMode(FailPoint::off);
     taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
-    runReplMonitor.store(false);
-    replMonitorThread.join();
 
     auto* client = getClient(instance.get());
     auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
@@ -689,7 +692,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -761,7 +764,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -795,25 +798,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
         instance->excludeDonorHost_forTest(host, now + Milliseconds(500));
     }
 
-    AtomicWord<bool> runReplMonitor{true};
-    // Keep scanning the replica set while waiting to reach the failpoint. This would normally
-    // be automatic but that doesn't work with mock replica sets.
-    stdx::thread replMonitorThread([&] {
-        Client::initThread("replMonitorThread");
-        while (runReplMonitor.load()) {
-            auto monitor = ReplicaSetMonitor::get(replSet.getSetName());
-            // Monitor may not have been created yet.
-            if (monitor) {
-                monitor->runScanForMockReplicaSet();
-            }
-            mongo::sleepmillis(100);
-        }
-    });
-
     hangFp->setMode(FailPoint::off);
     taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
-    runReplMonitor.store(false);
-    replMonitorThread.join();
 
     auto* client = getClient(instance.get());
     auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
@@ -839,7 +825,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -908,7 +894,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -980,7 +966,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 3);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1012,26 +998,10 @@ TEST_F(TenantMigrationRecipientServiceTest,
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
     auto excludeTime = Milliseconds(500);
     instance->excludeDonorHost_forTest(hosts.at(2), now + excludeTime);
-
-    AtomicWord<bool> runReplMonitor{true};
-    // Keep scanning the replica set while waiting to reach the failpoint. This would normally
-    // be automatic but that doesn't work with mock replica sets.
-    stdx::thread replMonitorThread([&] {
-        Client::initThread("replMonitorThread");
-        while (runReplMonitor.load()) {
-            auto monitor = ReplicaSetMonitor::get(replSet.getSetName());
-            // Monitor may not have been created yet.
-            if (monitor) {
-                monitor->runScanForMockReplicaSet();
-            }
-            mongo::sleepmillis(100);
-        }
-    });
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
 
     hangFp->setMode(FailPoint::off);
     taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
-    runReplMonitor.store(false);
-    replMonitorThread.join();
 
     auto* client = getClient(instance.get());
     auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
@@ -1057,7 +1027,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1090,6 +1060,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
     auto excludeTime = Milliseconds(500);
     instance->excludeDonorHost_forTest(hosts.at(2), now + excludeTime);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
 
     hangFp->setMode(FailPoint::off);
     taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
@@ -1130,6 +1101,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
 
     // Insert the remote majority optime into the oplogs of the first two hosts.
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
+
     const auto hosts = replSet.getHosts();
     const std::vector<HostAndPort> advancedOpTimeHosts = {hosts.begin(), hosts.begin() + 2};
 
@@ -1186,6 +1159,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
 
     // Insert the remote majority optime into the oplogs of the first two hosts.
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
+
     const auto hosts = replSet.getHosts();
     const std::vector<HostAndPort> advancedOpTimeHosts = {hosts[0], hosts[1]};
 
@@ -1246,11 +1221,12 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_P
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     // Primary is unavailable.
     replSet.kill(replSet.getHosts()[0].toString());
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
 
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
@@ -1341,6 +1317,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientGetStartOpTi
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1379,6 +1356,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const OpTime newTopOfOplogOpTime(Timestamp(6, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1417,7 +1395,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientGetStartOpTi
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
+
     SessionTxnRecord lastTxn(makeLogicalSessionIdForTest(), 100, txnLastWriteOpTime, Date_t());
     lastTxn.setStartOpTime(txnStartOpTime);
     lastTxn.setState(DurableTxnStateEnum::kInProgress);
@@ -1462,7 +1442,9 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const OpTime newTopOfOplogOpTime(Timestamp(6, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
+
     SessionTxnRecord lastTxn(makeLogicalSessionIdForTest(), 100, txnLastWriteOpTime, Date_t());
     lastTxn.setStartOpTime(txnStartOpTime);
     lastTxn.setState(DurableTxnStateEnum::kInProgress);
@@ -1503,6 +1485,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
 
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
@@ -1536,6 +1519,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientStartOplogFe
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1584,6 +1568,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientStartsCloner
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
@@ -1644,6 +1629,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherFailsDuringOplogApplicat
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1699,6 +1685,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherResumesFromTopOfOplogBuf
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, initialOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1734,6 +1721,9 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherResumesFromTopOfOplogBuf
     }
 
     hangBeforeFetcherFp->waitForTimesEntered(initialTimesEntered + 1);
+
+    const OpTime updatedOpTime(Timestamp(3, 1), 1);
+    insertTopOfOplog(&replSet, updatedOpTime);
 
     const auto oplogBuffer = getDonorOplogBuffer(instance.get());
     OplogBuffer::Batch batch1;
@@ -1802,6 +1792,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherNoDocInBufferToResumeFro
     const OpTime dataConsistentOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, startFetchingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1848,11 +1839,11 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherNoDocInBufferToResumeFro
     // Continue and hang before starting the oplog applier.
     const auto hangAfterStartingOplogApplier =
         globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
-    hangBeforeFetcherFp->setMode(FailPoint::off);
     initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
                                                                  0,
                                                                  BSON("action"
                                                                       << "hang"));
+    hangBeforeFetcherFp->setMode(FailPoint::off);
     hangAfterStartingOplogApplier->waitForTimesEntered(initialTimesEntered + 1);
 
     // The oplog fetcher should exist and be running.
@@ -1910,6 +1901,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromLastNoOpOplog
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, clonerFinishedOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -1930,6 +1922,14 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromLastNoOpOplog
 
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
+
+    // Hang before starting the oplog applier.
+    const auto hangAfterStartingOplogApplier =
+        globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
+    auto initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
+                                                                      0,
+                                                                      BSON("action"
+                                                                           << "hang"));
 
     {
         FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
@@ -1983,13 +1983,6 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromLastNoOpOplog
                                 {resumeNoOpEntry.toBSON(), resumeRecipientOpTime.getTimestamp()},
                                 resumeRecipientOpTime.getTerm()));
 
-    // Hang before starting the oplog applier.
-    const auto hangAfterStartingOplogApplier =
-        globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
-    auto initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
-                                                                      0,
-                                                                      BSON("action"
-                                                                           << "hang"));
     hangAfterStartingOplogApplier->waitForTimesEntered(initialTimesEntered + 1);
 
     auto oplogFetcher = getDonorOplogFetcher(instance.get());
@@ -2033,6 +2026,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, startApplyingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2056,6 +2050,21 @@ TEST_F(TenantMigrationRecipientServiceTest,
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
 
+    // Hang before creating the oplog applier.
+    const auto hangBeforeCreatingOplogApplier =
+        globalFailPointRegistry().find("fpAfterStartingOplogFetcherMigrationRecipientInstance");
+    hangBeforeCreatingOplogApplier->setMode(FailPoint::alwaysOn,
+                                            0,
+                                            BSON("action"
+                                                 << "hang"));
+    // Hang after starting the oplog applier.
+    const auto hangAfterStartingOplogApplier =
+        globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
+    auto initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
+                                                                      0,
+                                                                      BSON("action"
+                                                                           << "hang"));
+
     {
         FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
         // Create and start the instance.
@@ -2072,9 +2081,9 @@ TEST_F(TenantMigrationRecipientServiceTest,
     //       is less than the 'startApplyingDonorOpTime'. We will resume batching from this
     //       timestamp.
     // - (4) A no-op oplog entry with an inner oplog entry as the 'o2' field but no
-    //       'fromTenantMigrate' field. This oplog entry do not satisfy the conditions for the
-    //       oplog applier to resume applying from so we default to apply
-    //       from 'startDonorApplyingOpTime'.
+    //       'fromTenantMigrate' field. This oplog entry does not satisfy the conditions
+    //       for the oplog applier to resume applying from so we default to apply from
+    //       'startDonorApplyingOpTime'.
     const auto insertNss = NamespaceString("tenantA_foo.bar");
     const auto beforeStartApplyingOpTime = OpTime(Timestamp(1, 1), 1);
     const auto entryBeforeStartApplyingOpTime = makeOplogEntry(
@@ -2143,14 +2152,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
         ASSERT_OK(storage->insertDocument(
             opCtx.get(), oplogNss, {entry.toBSON(), opTime.getTimestamp()}, opTime.getTerm()));
     }
-
-    // Hang before starting the oplog applier.
-    const auto hangAfterStartingOplogApplier =
-        globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
-    auto initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
-                                                                      0,
-                                                                      BSON("action"
-                                                                           << "hang"));
+    // Move on to the next failpoint to hang after starting the oplog applier.
+    hangBeforeCreatingOplogApplier->setMode(FailPoint::off);
     hangAfterStartingOplogApplier->waitForTimesEntered(initialTimesEntered + 1);
 
     auto dataConsistentOplogEntry = makeOplogEntry(dataConsistentOpTime,
@@ -2196,6 +2199,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, startApplyingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2219,6 +2223,14 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
 
+    // Hang before starting the oplog applier.
+    const auto hangAfterStartingOplogApplier =
+        globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
+    auto initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
+                                                                      0,
+                                                                      BSON("action"
+                                                                           << "hang"));
+
     {
         FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
         // Create and start the instance.
@@ -2232,9 +2244,9 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
     // - (1) An oplog entry with opTime earlier than 'cloneFinishedRecipientOpTime'.
     // - (2) An oplog entry with opTime greater than 'cloneFinishedRecipientOpTime'.
     // - (3) A no-op oplog entry with an inner oplog entry as the 'o2' field but no
-    //       'fromTenantMigrate' field. This oplog entry do not satisfy the conditions for the
-    //       oplog applier to resume applying from so we default to applying and batching
-    //       from the start of the buffer collection.
+    //       'fromTenantMigrate' field. This oplog entry does not satisfy the conditions
+    //       for the oplog applier to resume applying from so we default to applying and
+    //       batching from the start of the buffer collection.
     const auto insertNss = NamespaceString("tenantA_foo.bar");
     const auto afterStartApplyingOpTime = OpTime(Timestamp(3, 1), 1);
     const auto entryAfterStartApplyingOpTime = makeOplogEntry(
@@ -2288,13 +2300,6 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
                                       {noOpEntry.toBSON(), laterOpTime.getTimestamp()},
                                       laterOpTime.getTerm()));
 
-    // Hang before starting the oplog applier.
-    const auto hangAfterStartingOplogApplier =
-        globalFailPointRegistry().find("fpAfterStartingOplogApplierMigrationRecipientInstance");
-    auto initialTimesEntered = hangAfterStartingOplogApplier->setMode(FailPoint::alwaysOn,
-                                                                      0,
-                                                                      BSON("action"
-                                                                           << "hang"));
     hangAfterStartingOplogApplier->waitForTimesEntered(initialTimesEntered + 1);
 
     auto dataConsistentOplogEntry = makeOplogEntry(dataConsistentOpTime,
@@ -2339,6 +2344,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, startFetchingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2444,6 +2450,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierFails) {
     const OpTime injectedEntryOpTime(Timestamp(6, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2509,6 +2516,7 @@ TEST_F(TenantMigrationRecipientServiceTest, StoppingApplierAllowsCompletion) {
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2563,6 +2571,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientAddResumeTok
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /*dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2666,6 +2675,8 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientAddResumeTok
 TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_BeforeRun) {
     const UUID migrationUUID = UUID::gen();
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
@@ -2702,6 +2713,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_FailToIniti
 
     const UUID migrationUUID = UUID::gen();
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
@@ -2733,6 +2746,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_WaitUntilSt
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2816,6 +2830,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_AfterStartO
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2878,6 +2893,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_AfterConsis
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -2965,6 +2981,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_AfterFail) 
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3047,6 +3064,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_FailToMarkG
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
@@ -3096,7 +3115,7 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientServiceRecor
 
     const UUID migrationUUID = UUID::gen();
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3131,7 +3150,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
 
     const UUID migrationUUID = UUID::gen();
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3170,7 +3189,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
 
     const UUID migrationUUID = UUID::gen();
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3218,7 +3237,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
 
     const UUID migrationUUID = UUID::gen();
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3253,6 +3272,7 @@ TEST_F(TenantMigrationRecipientServiceTest, WaitUntilMigrationReachesReturnAfter
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3312,6 +3332,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableFetcherErr
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3375,6 +3396,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableFetcher
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3433,6 +3455,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientWillNotRetryOnExternalInter
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3490,6 +3513,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableClonerErro
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3555,6 +3579,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableClonerE
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3602,6 +3627,7 @@ TEST_F(TenantMigrationRecipientServiceTest, IncrementNumRestartsDueToRecipientFa
     const OpTime topOfOplogOpTime(Timestamp(1, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3652,6 +3678,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     const OpTime topOfOplogOpTime(Timestamp(1, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    getTopologyManager()->setTopologyDescription(replSet.getTopologyDescription(clock()));
     insertTopOfOplog(&replSet, topOfOplogOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
@@ -3666,6 +3693,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     initialStateDocument.setState(TenantMigrationRecipientStateEnum::kStarted);
     // Set the 'expireAt' field to indicate the migration is garbage collectable.
     auto opCtx = makeOperationContext();
+    initialStateDocument.setStartAt(opCtx->getServiceContext()->getFastClockSource()->now());
     initialStateDocument.setExpireAt(opCtx->getServiceContext()->getFastClockSource()->now());
     ASSERT_EQ(0, initialStateDocument.getNumRestartsDueToRecipientFailure());
 

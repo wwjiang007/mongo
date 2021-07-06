@@ -74,20 +74,25 @@ static constexpr auto kSyntax = R"(
 
                 FORWARD_FLAG <- <'true'> / <'false'>
 
+                NEED_SLOT_FOR_OPLOG_TS <- <'true'> / <'false'>
+
                 SCAN <- 'scan' IDENT? # optional variable name of the root object (record) delivered by the scan
                                IDENT? # optional variable name of the record id delivered by the scan
                                IDENT? # optional variable name of the snapshot id read by the scan
                                IDENT? # optional variable name of the index name read by the scan
                                IDENT? # optional variable name of the index key read by the scan
+                               IDENT? # optional variable name of the index key pattern read by the scan
                                IDENT_LIST_WITH_RENAMES  # list of projected fields (may be empty)
                                IDENT # collection name to scan
                                FORWARD_FLAG # forward scan or not
+                               NEED_SLOT_FOR_OPLOG_TS # Whether a slot needs to be created for oplog timestamp
 
                 PSCAN <- 'pscan' IDENT? # optional variable name of the root object (record) delivered by the scan
                                  IDENT? # optional variable name of the record id delivered by the scan
                                  IDENT? # optional variable name of the snapshot id read by the scan
                                  IDENT? # optional variable name of the index name read by the scan
                                  IDENT? # optional variable name of the index key read by the scan
+                                 IDENT? # optional variable name of the index key pattern read by the scan
                                  IDENT_LIST_WITH_RENAMES  # list of projected fields (may be empty)
                                  IDENT # collection name to scan
 
@@ -97,9 +102,11 @@ static constexpr auto kSyntax = R"(
                                IDENT? # optional variable name of the snapshot id delivered by the scan
                                IDENT? # optional variable name of the index name read by the scan
                                IDENT? # optional variable name of the index key read by the scan
+                               IDENT? # optional variable name of the index key pattern read by the scan
                                IDENT_LIST_WITH_RENAMES  # list of projected fields (may be empty)
                                IDENT # collection name to scan
                                FORWARD_FLAG # forward scan or not
+                               NEED_SLOT_FOR_OPLOG_TS # Whether a slot needs to be created for oplog timestamp
 
                 IXSCAN <- 'ixscan' IDENT? # optional variable name of the root object (record) delivered by the scan
                                    IDENT? # optional variable name of the record id delivered by the scan
@@ -488,6 +495,8 @@ void Parser::walkRelopExpr(AstQuery& ast) {
             op = EPrimBinary::greaterEq;
         } else if (ast.nodes[1]->token == ">") {
             op = EPrimBinary::greater;
+        } else {
+            MONGO_UNREACHABLE;
         }
 
         if (ast.nodes.size() == 4) {
@@ -622,39 +631,42 @@ void Parser::walkScan(AstQuery& ast) {
     std::string snapshotIdName;
     std::string indexIdName;
     std::string indexKeyName;
-    std::string collName;
+    std::string indexKeyPatternName;
     int projectsPos;
-    int forwardPos;
 
-    if (ast.nodes.size() == 8) {
+    if (ast.nodes.size() == 10) {
         recordName = std::move(ast.nodes[0]->identifier);
         recordIdName = std::move(ast.nodes[1]->identifier);
         snapshotIdName = std::move(ast.nodes[2]->identifier);
         indexIdName = std::move(ast.nodes[3]->identifier);
         indexKeyName = std::move(ast.nodes[4]->identifier);
-        projectsPos = 5;
-        collName = std::move(ast.nodes[6]->identifier);
-        forwardPos = 7;
-    } else if (ast.nodes.size() == 5) {
+        indexKeyPatternName = std::move(ast.nodes[5]->identifier);
+        projectsPos = 6;
+    } else if (ast.nodes.size() == 6) {
         recordName = std::move(ast.nodes[0]->identifier);
         recordIdName = std::move(ast.nodes[1]->identifier);
         projectsPos = 2;
-        collName = std::move(ast.nodes[3]->identifier);
-        forwardPos = 4;
-    } else if (ast.nodes.size() == 4) {
+    } else if (ast.nodes.size() == 5) {
         recordName = std::move(ast.nodes[0]->identifier);
         projectsPos = 1;
-        collName = std::move(ast.nodes[2]->identifier);
-        forwardPos = 3;
-    } else if (ast.nodes.size() == 3) {
+    } else if (ast.nodes.size() == 4) {
         projectsPos = 0;
-        collName = std::move(ast.nodes[1]->identifier);
-        forwardPos = 2;
     } else {
         uasserted(5290715, "Wrong number of arguments for SCAN");
     }
+    auto lastPos = ast.nodes.size() - 1;
 
-    const auto forward = (ast.nodes[forwardPos]->token == "true") ? true : false;
+    // The 'collName' should be third from last.
+    auto collName = std::move(ast.nodes[lastPos - 2]->identifier);
+
+    // The 'FORWARD' should be second last.
+    const auto forward = (ast.nodes[lastPos - 1]->token == "true") ? true : false;
+
+    // The 'NEED_SLOT_FOR_OPLOG_TS' always comes at the end.
+    const auto oplogTs = (ast.nodes[lastPos]->token == "true")
+        ? boost::optional<value::SlotId>(_env->registerSlot(
+              "oplogTs"_sd, value::TypeTags::Nothing, 0, false, &_slotIdGenerator))
+        : boost::none;
 
     ast.stage = makeS<ScanStage>(getCollectionUuid(collName),
                                  lookupSlot(recordName),
@@ -662,13 +674,15 @@ void Parser::walkScan(AstQuery& ast) {
                                  lookupSlot(snapshotIdName),
                                  lookupSlot(indexIdName),
                                  lookupSlot(indexKeyName),
+                                 lookupSlot(indexKeyPatternName),
+                                 oplogTs,
                                  ast.nodes[projectsPos]->identifiers,
                                  lookupSlots(ast.nodes[projectsPos]->renames),
                                  boost::none,
                                  forward,
                                  nullptr,
                                  getCurrentPlanNodeId(),
-                                 ScanCallbacks({}));
+                                 ScanCallbacks{});
 }
 
 void Parser::walkParallelScan(AstQuery& ast) {
@@ -679,17 +693,19 @@ void Parser::walkParallelScan(AstQuery& ast) {
     std::string snapshotIdName;
     std::string indexIdName;
     std::string indexKeyName;
+    std::string indexKeyPatternName;
     std::string collName;
     int projectsPos;
 
-    if (ast.nodes.size() == 7) {
+    if (ast.nodes.size() == 8) {
         recordName = std::move(ast.nodes[0]->identifier);
         recordIdName = std::move(ast.nodes[1]->identifier);
         snapshotIdName = std::move(ast.nodes[2]->identifier);
         indexIdName = std::move(ast.nodes[3]->identifier);
         indexKeyName = std::move(ast.nodes[4]->identifier);
-        projectsPos = 5;
-        collName = std::move(ast.nodes[6]->identifier);
+        indexKeyPatternName = std::move(ast.nodes[5]->identifier);
+        projectsPos = 6;
+        collName = std::move(ast.nodes[7]->identifier);
     } else if (ast.nodes.size() == 4) {
         recordName = std::move(ast.nodes[0]->identifier);
         recordIdName = std::move(ast.nodes[1]->identifier);
@@ -712,11 +728,12 @@ void Parser::walkParallelScan(AstQuery& ast) {
                                          lookupSlot(snapshotIdName),
                                          lookupSlot(indexIdName),
                                          lookupSlot(indexKeyName),
+                                         lookupSlot(indexKeyPatternName),
                                          ast.nodes[projectsPos]->identifiers,
                                          lookupSlots(ast.nodes[projectsPos]->renames),
                                          nullptr,
                                          getCurrentPlanNodeId(),
-                                         ScanCallbacks({}));
+                                         ScanCallbacks{});
 }
 
 void Parser::walkSeek(AstQuery& ast) {
@@ -727,39 +744,43 @@ void Parser::walkSeek(AstQuery& ast) {
     std::string snapshotIdName;
     std::string indexIdName;
     std::string indexKeyName;
-    std::string collName;
-    int projectsPos;
-    int forwardPos;
+    std::string indexKeyPatternName;
 
-    if (ast.nodes.size() == 9) {
+    int projectsPos;
+
+    if (ast.nodes.size() == 11) {
         recordName = std::move(ast.nodes[1]->identifier);
         recordIdName = std::move(ast.nodes[2]->identifier);
         snapshotIdName = std::move(ast.nodes[3]->identifier);
         indexIdName = std::move(ast.nodes[4]->identifier);
         indexKeyName = std::move(ast.nodes[5]->identifier);
-        projectsPos = 6;
-        collName = std::move(ast.nodes[7]->identifier);
-        forwardPos = 8;
-    } else if (ast.nodes.size() == 6) {
+        indexKeyPatternName = std::move(ast.nodes[6]->identifier);
+        projectsPos = 7;
+    } else if (ast.nodes.size() == 7) {
         recordName = std::move(ast.nodes[1]->identifier);
         recordIdName = std::move(ast.nodes[2]->identifier);
         projectsPos = 3;
-        collName = std::move(ast.nodes[4]->identifier);
-        forwardPos = 5;
-    } else if (ast.nodes.size() == 5) {
+    } else if (ast.nodes.size() == 6) {
         recordName = std::move(ast.nodes[1]->identifier);
         projectsPos = 2;
-        collName = std::move(ast.nodes[3]->identifier);
-        forwardPos = 4;
-    } else if (ast.nodes.size() == 4) {
+    } else if (ast.nodes.size() == 5) {
         projectsPos = 1;
-        collName = std::move(ast.nodes[2]->identifier);
-        forwardPos = 3;
     } else {
-        uasserted(5290717, "Wrong number of arguments for SEEk");
+        uasserted(5290717, "Wrong number of arguments for SEEK");
     }
+    auto lastPos = ast.nodes.size() - 1;
 
-    const auto forward = (ast.nodes[forwardPos]->token == "true") ? true : false;
+    // The 'collName' should be third from last.
+    auto collName = std::move(ast.nodes[lastPos - 2]->identifier);
+
+    // The 'FORWARD' should be second last.
+    const auto forward = (ast.nodes[lastPos - 1]->token == "true") ? true : false;
+
+    // The 'NEED_SLOT_FOR_OPLOG_TS' always comes at the end.
+    const auto oplogTs = (ast.nodes[lastPos]->token == "true")
+        ? boost::optional<value::SlotId>(_env->registerSlot(
+              "oplogTs"_sd, value::TypeTags::Nothing, 0, false, &_slotIdGenerator))
+        : boost::none;
 
     ast.stage = makeS<ScanStage>(getCollectionUuid(collName),
                                  lookupSlot(recordName),
@@ -767,13 +788,15 @@ void Parser::walkSeek(AstQuery& ast) {
                                  lookupSlot(snapshotIdName),
                                  lookupSlot(indexIdName),
                                  lookupSlot(indexKeyName),
+                                 lookupSlot(indexKeyPatternName),
+                                 oplogTs,
                                  ast.nodes[projectsPos]->identifiers,
                                  lookupSlots(ast.nodes[projectsPos]->renames),
                                  lookupSlot(ast.nodes[0]->identifier),
                                  forward,
                                  nullptr,
                                  getCurrentPlanNodeId(),
-                                 ScanCallbacks({}));
+                                 ScanCallbacks{});
 }
 
 void Parser::walkIndexScan(AstQuery& ast) {
@@ -833,8 +856,7 @@ void Parser::walkIndexScan(AstQuery& ast) {
                                       boost::none,
                                       boost::none,
                                       nullptr,
-                                      getCurrentPlanNodeId(),
-                                      LockAcquisitionCallback{});
+                                      getCurrentPlanNodeId());
 }
 
 void Parser::walkIndexSeek(AstQuery& ast) {
@@ -894,8 +916,7 @@ void Parser::walkIndexSeek(AstQuery& ast) {
                                       lookupSlot(ast.nodes[0]->identifier),
                                       lookupSlot(ast.nodes[1]->identifier),
                                       nullptr,
-                                      getCurrentPlanNodeId(),
-                                      LockAcquisitionCallback{});
+                                      getCurrentPlanNodeId());
 }
 
 void Parser::walkProject(AstQuery& ast) {
@@ -1188,7 +1209,7 @@ void Parser::walkSkip(AstQuery& ast) {
 void Parser::walkCoScan(AstQuery& ast) {
     walkChildren(ast);
 
-    ast.stage = makeS<CoScanStage>(getCurrentPlanNodeId());
+    ast.stage = makeS<CoScanStage>(getCurrentPlanNodeId(), nullptr);
 }
 
 void Parser::walkTraverse(AstQuery& ast) {
@@ -1808,7 +1829,9 @@ void Parser::walk(AstQuery& ast) {
     }
 }
 
-Parser::Parser() {
+Parser::Parser(RuntimeEnvironment* env) : _env(env) {
+    invariant(_env);
+
     _parser.log = [&](size_t ln, size_t col, const std::string& msg) {
         LOGV2(4885902, "{msg}", "msg"_attr = format_error_message(ln, col, msg));
     };

@@ -10,7 +10,7 @@ selector:
   - jstests/concurrency/fsm_workloads/**/*.js
   exclude_files:
   ##
-  # Blacklists from concurrency_sharded_replication
+  # Denylists from concurrency_sharded_replication
   ##
 
   # SERVER-13116 distinct isn't sharding aware
@@ -90,17 +90,6 @@ selector:
   # our .remove(query, {justOne: true}) calls lack shard keys
   - jstests/concurrency/fsm_workloads/remove_single_document.js
 
-  # The rename_* workloads are disabled since renameCollection doesn't work with sharded
-  # collections
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_chain.js
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_dbname_chain.js
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_dbname_droptarget.js
-  - jstests/concurrency/fsm_workloads/rename_capped_collection_droptarget.js
-  - jstests/concurrency/fsm_workloads/rename_collection_chain.js
-  - jstests/concurrency/fsm_workloads/rename_collection_dbname_chain.js
-  - jstests/concurrency/fsm_workloads/rename_collection_dbname_droptarget.js
-  - jstests/concurrency/fsm_workloads/rename_collection_droptarget.js
-
   # cannot use upsert command with $where with sharded collections
   - jstests/concurrency/fsm_workloads/upsert_where.js
 
@@ -108,7 +97,7 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
 
-  # TODO Unblacklist (SERVER-38852).
+  # TODO Undenylist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
 
   # serverStatus does not include transaction metrics on mongos.
@@ -119,7 +108,7 @@ selector:
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
 
   ##
-  # Blacklists from concurrency_replication_multi_stmt_txn
+  # Denylists from concurrency_replication_multi_stmt_txn
   ##
 
   # Relies on having one thread observe writes from the other threads, which won't become visible
@@ -136,7 +125,7 @@ selector:
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
   ##
-  # Blacklists from concurrency_sharded_multi_stmt_txn
+  # Denylists from concurrency_sharded_multi_stmt_txn
   ##
 
   # Use updates that do not contain the shard key, so they are rejected before any commands are
@@ -149,7 +138,7 @@ selector:
   - jstests/concurrency/fsm_workloads/schema_validator_with_expr_variables.js
 
   ##
-  # Blacklists from concurrency_sharded_with_stepdowns
+  # Denylists from concurrency_sharded_with_stepdowns
   ##
 
   # ChunkHelper directly talks to the config servers and doesn't support retries for network errors
@@ -175,7 +164,7 @@ selector:
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
   ##
-  # Blacklists specific to this suite
+  # Denylists specific to this suite
   ##
 
   # Uses getMore. If a terminate happens between the time of creation of cursor (usually by calling
@@ -226,8 +215,9 @@ selector:
   - requires_full_ddl_support
   - does_not_support_transactions
   - does_not_support_stepdowns
+  - assumes_unsharded_collection
 
-  # Note that "requires_non_retryable_writes" does not need to be blacklisted because some writes
+  # Note that "requires_non_retryable_writes" does not need to be denylisted because some writes
   # that are not individually retryable can be retried if they are part of a transaction.
 
 executor:
@@ -238,7 +228,6 @@ executor:
     tests: true
   config:
     shell_options:
-      readMode: commands
       global_vars:
         TestData:
           runInsideTransaction: true

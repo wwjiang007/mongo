@@ -39,7 +39,7 @@ public:
     using StateDoc = DropDatabaseCoordinatorDocument;
     using Phase = DropDatabaseCoordinatorPhaseEnum;
 
-    DropDatabaseCoordinator(const BSONObj& initialState);
+    DropDatabaseCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState);
     ~DropDatabaseCoordinator() = default;
 
     void checkIfOptionsConflict(const BSONObj& doc) const override {}
@@ -49,6 +49,10 @@ public:
         MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
 private:
+    ShardingDDLCoordinatorMetadata const& metadata() const override {
+        return _doc.getShardingDDLCoordinatorMetadata();
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
@@ -69,9 +73,14 @@ private:
         };
     }
 
-    void _insertStateDocument(OperationContext* opCtx, StateDoc&& doc);
-    void _updateStateDocument(OperationContext* opCtx, StateDoc&& newStateDoc);
     void _enterPhase(Phase newPhase);
+
+    void _dropShardedCollection(OperationContext* opCtx,
+                                const CollectionType& coll,
+                                std::shared_ptr<executor::ScopedTaskExecutor> executor);
+
+    void _performNoopRetryableWriteOnParticipants(
+        OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor);
 
     DropDatabaseCoordinatorDocument _doc;
     StringData _dbName;

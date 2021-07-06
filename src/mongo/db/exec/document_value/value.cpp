@@ -131,6 +131,10 @@ void ValueStorage::putDocument(const Document& d) {
     putRefCountable(d._storage);
 }
 
+void ValueStorage::putDocument(Document&& d) {
+    putRefCountable(std::move(d._storage));
+}
+
 void ValueStorage::putVector(boost::intrusive_ptr<RCVector>&& vec) {
     fassert(16485, bool(vec));
     putRefCountable(std::move(vec));
@@ -159,7 +163,14 @@ Document ValueStorage::getDocument() const {
 
 // not in header because document is fwd declared
 Value::Value(const BSONObj& obj) : _storage(Object, Document(obj.getOwned())) {}
+
+// An option of providing 'Value(Document)' was rejected in favor of 'Value(const Document&)' and
+// 'Value(Document&&)' overloads, and lvalue/rvalue reference overloads of callees, since
+// 'Value(Document)' option with a lvalue parameter would result in one extra move operation in
+// 'ValueStorage::putDocument()'.
 Value::Value(const Document& doc) : _storage(Object, doc.isOwned() ? doc : doc.getOwned()) {}
+Value::Value(Document&& doc)
+    : _storage(Object, doc.isOwned() ? std::move(doc) : std::move(doc).getOwned()) {}
 
 Value::Value(const BSONElement& elem) : _storage(elem.type()) {
     switch (elem.type()) {
@@ -1240,6 +1251,16 @@ ostream& operator<<(ostream& out, const Value& val) {
 
     // Not in default case to trigger better warning if a case is missing
     verify(false);
+}
+
+void Value::fillCache() const {
+    if (isObject()) {
+        getDocument().fillCache();
+    } else if (isArray()) {
+        for (auto&& val : getArray()) {
+            val.fillCache();
+        }
+    }
 }
 
 void Value::serializeForSorter(BufBuilder& buf) const {

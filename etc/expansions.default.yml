@@ -11,7 +11,6 @@ resmoke_jobs_factor: "1"
 resmoke_jobs_max: "0"
 timeout_secs: "0"
 exec_timeout_secs: "0"
-python: /opt/mongodbtoolchain/v3/bin/python3
 multiversion_edition: base
 multiversion_platform: linux_x86_64
 multiversion_architecture: x86_64
@@ -31,9 +30,9 @@ scons_cache_mode: nolinked
 is_commit_queue: "false"
 use_scons_cache: "false"
 npm_command: jstestfuzz
-connection_attempts: "25"
 tar: tar
 cmake_path: /opt/cmake/bin/cmake
 content_type: application/x-gzip
 jstestfuzz_concurrent_num_files: "10"
 curator_release: "latest"
+ext: tgz

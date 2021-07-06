@@ -35,6 +35,7 @@
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/trial_period_utils.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
+#include "mongo/db/query/sbe_stage_builder_helpers.h"
 #include "mongo/db/query/shard_filterer_factory_interface.h"
 #include "mongo/db/query/stage_builder.h"
 
@@ -59,10 +60,10 @@ public:
     static constexpr StringData kResult = "result"_sd;
     static constexpr StringData kRecordId = "recordId"_sd;
     static constexpr StringData kReturnKey = "returnKey"_sd;
-    static constexpr StringData kOplogTs = "oplogTs"_sd;
     static constexpr StringData kSnapshotId = "snapshotId"_sd;
     static constexpr StringData kIndexId = "indexId"_sd;
     static constexpr StringData kIndexKey = "indexKey"_sd;
+    static constexpr StringData kIndexKeyPattern = "indexKeyPattern"_sd;
 
     PlanStageSlots() = default;
 
@@ -256,10 +257,10 @@ public:
     static constexpr StringData kResult = PlanStageSlots::kResult;
     static constexpr StringData kRecordId = PlanStageSlots::kRecordId;
     static constexpr StringData kReturnKey = PlanStageSlots::kReturnKey;
-    static constexpr StringData kOplogTs = PlanStageSlots::kOplogTs;
     static constexpr StringData kSnapshotId = PlanStageSlots::kSnapshotId;
     static constexpr StringData kIndexId = PlanStageSlots::kIndexId;
     static constexpr StringData kIndexKey = PlanStageSlots::kIndexKey;
+    static constexpr StringData kIndexKeyPattern = PlanStageSlots::kIndexKeyPattern;
 
     SlotBasedStageBuilder(OperationContext* opCtx,
                           const CollectionPtr& collection,
@@ -337,7 +338,8 @@ private:
                          sbe::value::SlotId recordIdSlot,
                          sbe::value::SlotId snapshotIdSlot,
                          sbe::value::SlotId indexIdSlot,
-                         sbe::value::SlotId keyStringSlot,
+                         sbe::value::SlotId indexKeySlot,
+                         sbe::value::SlotId indexKeyPatternSlot,
                          StringMap<const IndexAccessMethod*> iamMap,
                          PlanNodeId planNodeId,
                          sbe::value::SlotVector slotsToForward = {});
@@ -379,8 +381,7 @@ private:
     // A factory to construct shard filters.
     ShardFiltererFactoryInterface* _shardFiltererFactory;
 
-    // A callback that should be installed on "scan" and "ixscan" nodes. It will get invoked when
-    // these data access stages acquire their AutoGet*.
-    const sbe::LockAcquisitionCallback _lockAcquisitionCallback;
+    // Common parameters to SBE stage builder functions.
+    StageBuilderState _state;
 };
 }  // namespace mongo::stage_builder

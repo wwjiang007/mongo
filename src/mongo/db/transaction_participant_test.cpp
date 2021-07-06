@@ -94,7 +94,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         boost::none,                   // pre-image optime
         boost::none,                   // post-image optime
         boost::none,                   // ShardId of resharding recipient
-        boost::none);                  // _id
+        boost::none,                   // _id
+        boost::none);                  // needsRetryImage
 }
 
 class OpObserverMock : public OpObserverNoop {
@@ -134,6 +135,7 @@ public:
     bool onTransactionAbortThrowsException = false;
     bool transactionAborted = false;
 
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -257,8 +259,8 @@ protected:
         {
             // Set up a collection so that TransactionParticipant::prepareTransaction() can safely
             // access it.
-            AutoGetOrCreateDb autoDb(opCtx(), kNss.db(), MODE_X);
-            auto db = autoDb.getDb();
+            AutoGetDb autoDb(opCtx(), kNss.db(), MODE_X);
+            auto db = autoDb.ensureDbExists();
             ASSERT_TRUE(db);
 
             WriteUnitOfWork wuow(opCtx());
@@ -334,7 +336,9 @@ void insertTxnRecord(OperationContext* opCtx, unsigned i, DurableTxnStateEnum st
     record.setLastWriteOpTime(repl::OpTime(ts, 0));
     record.setLastWriteDate(Date_t::now());
 
-    AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
+    AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+    auto db = autoDb.ensureDbExists();
+    ASSERT(db);
     WriteUnitOfWork wuow(opCtx);
     auto coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
     ASSERT(coll);
@@ -592,8 +596,8 @@ TEST_F(TxnParticipantTest, PrepareFailsOnTemporaryCollection) {
 
     // Create a temporary collection so that we can write to it.
     {
-        AutoGetOrCreateDb autoDb(opCtx(), kNss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(opCtx(), kNss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         WriteUnitOfWork wuow(opCtx());
@@ -4267,7 +4271,9 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
 
     auto deleteTxnRecord = [&](unsigned i) {
         Timestamp ts(1, i);
-        AutoGetOrCreateDb autoDb(opCtx(), nss.db(), MODE_X);
+        AutoGetDb autoDb(opCtx(), nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
+        ASSERT(db);
         WriteUnitOfWork wuow(opCtx());
         auto coll = CollectionCatalog::get(opCtx())->lookupCollectionByNamespace(opCtx(), nss);
         ASSERT(coll);
@@ -4322,7 +4328,9 @@ TEST_F(TxnParticipantTest, OldestActiveTransactionTimestamp) {
 TEST_F(TxnParticipantTest, OldestActiveTransactionTimestampTimeout) {
     // Block getOldestActiveTimestamp() by locking the config database.
     auto nss = NamespaceString::kSessionTransactionsTableNamespace;
-    AutoGetOrCreateDb autoDb(opCtx(), nss.db(), MODE_X);
+    AutoGetDb autoDb(opCtx(), nss.db(), MODE_X);
+    auto db = autoDb.ensureDbExists();
+    ASSERT(db);
     auto statusWith = TransactionParticipant::getOldestActiveTimestamp(Timestamp());
     ASSERT_FALSE(statusWith.isOK());
     ASSERT_TRUE(ErrorCodes::isInterruption(statusWith.getStatus().code()));

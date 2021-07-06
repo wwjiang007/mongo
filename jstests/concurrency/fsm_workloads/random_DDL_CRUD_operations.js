@@ -5,15 +5,14 @@
  * and verifies guarantees are not broken.
  *
  * @tags: [
+ *   requires_fcv_50,
  *   requires_sharding,
- *   # TODO (SERVER-54881): ensure the new DDL paths work with balancer, autosplit
- *   # and causal consistency.
  *   assumes_balancer_off,
  *   assumes_autosplit_off,
  *   does_not_support_causal_consistency,
- *   # TODO (SERVER-54881): ensure the new DDL paths work with add/remove shards
+ *   # TODO (SERVER-56879): Support add/remove shards in new DDL paths
  *   does_not_support_add_remove_shards,
- *   # TODO (SERVER-54905): ensure all DDL are resilient.
+ *   # The mutex mechanism used in CRUD and drop states does not support stepdown
  *   does_not_support_stepdowns,
  *   # Can be removed once PM-1965-Milestone-1 is completed.
  *   does_not_support_transactions,
@@ -21,9 +20,29 @@
  *  ]
  */
 
+load("jstests/libs/uuid_util.js");
+
 var $config = (function() {
     function threadCollectionName(prefix, tid) {
         return prefix + tid;
+    }
+
+    function countDocuments(coll, query) {
+        var count;
+        assert.soon(() => {
+            try {
+                count = coll.countDocuments(query);
+                return true;
+            } catch (e) {
+                if (e.code === ErrorCodes.QueryPlanKilled) {
+                    // Retry. Can happen due to concurrent rename collection.
+                    return false;
+                }
+                throw e;
+            }
+        });
+
+        return count;
     }
 
     let data = {numChunks: 20, documentsPerChunk: 5, CRUDMutex: 'CRUDMutex'};
@@ -79,8 +98,11 @@ var $config = (function() {
             jsTestLog('drop state tid:' + tid + ' currentTid:' + this.tid +
                       ' collection:' + targetThreadColl);
             mutexLock(db, tid, targetThreadColl);
-            assertAlways.eq(db[targetThreadColl].drop(), true);
-            mutexUnlock(db, tid, targetThreadColl);
+            try {
+                assertAlways.eq(db[targetThreadColl].drop(), true);
+            } finally {
+                mutexUnlock(db, tid, targetThreadColl);
+            }
             jsTestLog('drop state finished');
         },
         rename: function(db, collName, connCache) {
@@ -90,12 +112,12 @@ var $config = (function() {
                 tid = Random.randInt(this.threadCount);
             const srcCollName = threadCollectionName(collName, tid);
             const srcColl = db[srcCollName];
-            const numInitialDocs = srcColl.countDocuments({});
             // Rename collection
-            const destCollName = threadCollectionName(collName, tid + '_' + new Date().getTime());
+            const destCollName =
+                threadCollectionName(collName, tid + '_' + extractUUIDFromObject(UUID()));
             try {
                 jsTestLog('rename state tid:' + tid + ' currentTid:' + this.tid +
-                          ' collection:' + srcCollName);
+                          ' collection:' + srcCollName + ' dst:' + destCollName);
                 assertAlways.commandWorked(srcColl.renameCollection(destCollName));
             } catch (e) {
                 const exceptionCode = e.code;
@@ -156,42 +178,46 @@ var $config = (function() {
             }
 
             mutexLock(db, tid, targetThreadColl);
-            jsTestLog('CRUD - Insert tid:' + tid + ' currentTid:' + this.tid +
-                      ' collection:' + targetThreadColl);
-            // Check if insert succeeded
-            var res = insertBulkOp.execute();
-            assertAlways.commandWorked(res);
+            try {
+                jsTestLog('CRUD - Insert tid:' + tid + ' currentTid:' + this.tid +
+                          ' collection:' + targetThreadColl);
+                // Check if insert succeeded
+                var res = insertBulkOp.execute();
+                assertAlways.commandWorked(res);
 
-            let currentDocs = coll.countDocuments({generation: generation});
-            // Check guarantees IF NO CONCURRENT DROP is running.
-            // If a concurrent rename came in, then either the full operation succeded (meaning
-            // there will be 0 documents left) or the insert came in first.
-            assertAlways(currentDocs === numDocs || currentDocs === 0);
+                let currentDocs = countDocuments(coll, {generation: generation});
 
-            jsTestLog('CRUD - Update tid:' + tid + ' currentTid:' + this.tid +
-                      ' collection:' + targetThreadColl);
-            var res = coll.update({generation: generation}, {$set: {updated: true}}, {multi: true});
-            if (res.hasWriteError()) {
-                var err = res.getWriteError();
-                if (err.code == ErrorCodes.QueryPlanKilled) {
-                    // Update is expected to throw ErrorCodes::QueryPlanKilled if performed
-                    // concurrently with a rename (SERVER-31695).
-                    mutexUnlock(db, tid, targetThreadColl);
-                    jsTestLog('CRUD state finished earlier because query plan was killed.');
-                    return;
+                // Check guarantees IF NO CONCURRENT DROP is running.
+                // If a concurrent rename came in, then either the full operation succeded (meaning
+                // there will be 0 documents left) or the insert came in first.
+                assertAlways(currentDocs === numDocs || currentDocs === 0);
+
+                jsTestLog('CRUD - Update tid:' + tid + ' currentTid:' + this.tid +
+                          ' collection:' + targetThreadColl);
+                var res =
+                    coll.update({generation: generation}, {$set: {updated: true}}, {multi: true});
+                if (res.hasWriteError()) {
+                    var err = res.getWriteError();
+                    if (err.code == ErrorCodes.QueryPlanKilled) {
+                        // Update is expected to throw ErrorCodes::QueryPlanKilled if performed
+                        // concurrently with a rename (SERVER-31695).
+                        jsTestLog('CRUD state finished earlier because query plan was killed.');
+                        return;
+                    }
+                    throw e;
                 }
-                throw e;
-            }
-            assertAlways.commandWorked(res);
+                assertAlways.commandWorked(res);
 
-            // Delete Data
-            jsTestLog('CRUD - Remove tid:' + tid + ' currentTid:' + this.tid +
-                      ' collection:' + targetThreadColl);
-            // Check if delete succeeded
-            coll.remove({generation: generation}, {multi: true});
-            // Check guarantees IF NO CONCURRENT DROP is running.
-            assertAlways.eq(coll.countDocuments({generation: generation}), 0);
-            mutexUnlock(db, tid, targetThreadColl);
+                // Delete Data
+                jsTestLog('CRUD - Remove tid:' + tid + ' currentTid:' + this.tid +
+                          ' collection:' + targetThreadColl);
+                // Check if delete succeeded
+                coll.remove({generation: generation}, {multi: true});
+                // Check guarantees IF NO CONCURRENT DROP is running.
+                assertAlways.eq(countDocuments(coll, {generation: generation}), 0);
+            } finally {
+                mutexUnlock(db, tid, targetThreadColl);
+            }
             jsTestLog('CRUD state finished');
         }
     };
@@ -202,22 +228,25 @@ var $config = (function() {
         }
     };
 
+    let teardown = function(db, collName, cluster) {};
+
     let transitions = {
-        init: {create: 1.0},
-        create: {create: 0.01, CRUD: 0.33, drop: 0.33, rename: 0.33},
-        CRUD: {create: 0.33, CRUD: 0.01, drop: 0.33, rename: 0.33},
-        drop: {create: 0.33, CRUD: 0.33, drop: 0.01, rename: 0.33},
-        rename: {create: 0.33, CRUD: 0.33, drop: 0.33, rename: 0.01}
+        init: {create: 0.25, CRUD: 0.25, drop: 0.25, rename: 0.25},
+        create: {create: 0.25, CRUD: 0.25, drop: 0.25, rename: 0.25},
+        CRUD: {create: 0.25, CRUD: 0.25, drop: 0.25, rename: 0.25},
+        drop: {create: 0.25, CRUD: 0.25, drop: 0.25, rename: 0.25},
+        rename: {create: 0.25, CRUD: 0.25, drop: 0.25, rename: 0.25}
     };
 
     return {
-        threadCount: 5,
-        iterations: 50,
+        threadCount: 12,
+        iterations: 64,
         startState: 'init',
         states: states,
         transitions: transitions,
         data: data,
         setup: setup,
+        teardown: teardown,
         passConnectionCache: true
     };
 })();

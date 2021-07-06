@@ -127,11 +127,11 @@ jsTestLog("Allowing migration to commit");
 dataSyncFp.off();
 assert.soon(() => {
     const state =
-        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).state;
+        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).donor.state;
     return state === TenantMigrationTest.DonorAccessState.kBlockWritesAndReads ||
         state === TenantMigrationTest.DonorAccessState.kReject;
 });
-assert.commandWorked(migrationThread.returnData());
+TenantMigrationTest.assertCommitted(migrationThread.returnData());
 
 // The index creation threads should be done.
 racyIndexThread.join();

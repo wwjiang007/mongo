@@ -94,9 +94,6 @@ EncryptedDBClientBase::EncryptedDBClientBase(std::unique_ptr<DBClientBase> conn,
     : _conn(std::move(conn)), _encryptionOptions(std::move(encryptionOptions)), _cx(cx) {
     validateCollection(cx, collection);
     _collection = JS::Heap<JS::Value>(collection);
-    uassert(31078,
-            "Cannot use WriteMode Legacy with Field Level Encryption",
-            shellGlobalParams.writeMode != "legacy");
 };
 
 std::string EncryptedDBClientBase::getServerAddress() const {
@@ -629,7 +626,8 @@ std::shared_ptr<SymmetricKey> EncryptedDBClientBase::getDataKey(const UUID& uuid
 
 std::shared_ptr<SymmetricKey> EncryptedDBClientBase::getDataKeyFromDisk(const UUID& uuid) {
     NamespaceString fullNameNS = getCollectionNS();
-    BSONObj dataKeyObj = _conn->findOne(fullNameNS.ns(), QUERY("_id" << uuid));
+    BSONObj dataKeyObj = _conn->findOne(
+        fullNameNS.ns(), QUERY("_id" << uuid), nullptr, 0, repl::ReadConcernArgs::kImplicitDefault);
     if (dataKeyObj.isEmpty()) {
         uasserted(ErrorCodes::BadValue, "Invalid keyID.");
     }
@@ -661,6 +659,10 @@ std::shared_ptr<SymmetricKey> EncryptedDBClientBase::getDataKeyFromDisk(const UU
 #ifdef MONGO_CONFIG_SSL
 const SSLConfiguration* EncryptedDBClientBase::getSSLConfiguration() {
     return _conn->getSSLConfiguration();
+}
+
+bool EncryptedDBClientBase::isTLS() {
+    return _conn->isTLS();
 }
 #endif
 

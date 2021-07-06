@@ -54,7 +54,7 @@ public:
     bool isEphemeral() const final {
         return true;
     }
-    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final {}
+    void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) final {}
     void closeCatalog(OperationContext* opCtx) final {}
     Status closeDatabase(OperationContext* opCtx, StringData db) final {
         return Status::OK();
@@ -103,9 +103,6 @@ public:
         return nullptr;
     }
     void setJournalListener(JournalListener* jl) final {}
-    bool supportsClusteredIdIndex() const final {
-        return false;
-    }
     bool supportsRecoverToStableTimestamp() const final {
         return false;
     }
@@ -154,7 +151,7 @@ public:
         OldestActiveTransactionTimestampCallback callback) final {}
 
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) final {
+        OperationContext* opCtx, LastShutdownState lastShutdownState) final {
         return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {
@@ -170,13 +167,10 @@ public:
         return {};
     }
     void addDropPendingIdent(const Timestamp& dropTimestamp,
-                             const NamespaceString& nss,
                              std::shared_ptr<Ident> ident,
                              DropIdentCallback&& onDrop) final {}
     void checkpoint() final {}
-    Status currentFilesCompatible(OperationContext* opCtx) const final {
-        return Status::OK();
-    }
+
     int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) final {
         return 0;
     }
@@ -204,6 +198,8 @@ public:
     }
 
     void unpinOldestTimestamp(const std::string& requestingServiceName) final {}
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) final {}
 };
 
 }  // namespace mongo

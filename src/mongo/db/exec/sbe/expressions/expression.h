@@ -70,87 +70,6 @@ public:
     RuntimeEnvironment& operator=(const RuntimeEnvironment&&) = delete;
     ~RuntimeEnvironment();
 
-    /**
-     * Registers and returns a SlotId for the given slot 'name'. The 'slotIdGenerator' is used
-     * to generate a new SlotId for the given slot 'name', which is then registered with this
-     * environment by creating a new SlotAccessor. The value 'val' is then stored within the
-     * SlotAccessor and the newly generated SlotId is returned.
-     *
-     * Both owned and unowned values can be stored in the runtime environment.
-     *
-     * A user exception is raised if this slot 'name' has been already registered.
-     */
-    value::SlotId registerSlot(StringData name,
-                               value::TypeTags tag,
-                               value::Value val,
-                               bool owned,
-                               value::SlotIdGenerator* slotIdGenerator);
-
-    /**
-     * Returns a SlotId registered for the given slot 'name'. If the slot with the specified name
-     * hasn't been registered, a user exception is raised.
-     */
-    value::SlotId getSlot(StringData name);
-
-    /**
-     * Returns a SlotId registered for the given slot 'name'. If the slot with the specified name
-     * hasn't been registered, boost::none is returned.
-     */
-    boost::optional<value::SlotId> getSlotIfExists(StringData name);
-
-    /**
-     * Store the given value in the specified slot within this runtime environment instance.
-     *
-     * A user exception is raised if the SlotId is not registered within this environment, or
-     * if this environment is used with a parallel plan.
-     */
-    void resetSlot(value::SlotId slot, value::TypeTags tag, value::Value val, bool owned);
-
-    /**
-     * Returns a SlotAccessor for the given SlotId which must be previously registered within this
-     * Environment by invoking 'registerSlot' method.
-     *
-     * A user exception is raised if the SlotId is not registered within this environment.
-     */
-    value::SlotAccessor* getAccessor(value::SlotId slot);
-
-    /**
-     * Make a copy of his environment. The new environment will have its own set of SlotAccessors
-     * pointing to the same shared data holding slot values.
-     *
-     * To create a copy of the runtime environment for a parallel execution plan, the 'isSmp' flag
-     * must be set to 'true'. This will result in this environment being unconverted to a parallel
-     * environment, as well as the newly created copy.
-     */
-    std::unique_ptr<RuntimeEnvironment> makeCopy(bool isSmp);
-
-    /**
-     * Dumps all the slots currently defined in this environment into the given string builder.
-     */
-    void debugString(StringBuilder* builder);
-
-private:
-    RuntimeEnvironment(const RuntimeEnvironment&);
-
-    struct State {
-        auto pushSlot(StringData type, value::SlotId slot) {
-            auto index = vals.size();
-
-            typeTags.push_back(value::TypeTags::Nothing);
-            vals.push_back(0);
-            owned.push_back(false);
-
-            auto [it, inserted] = slots.emplace(type, std::make_pair(slot, index));
-            uassert(4946302, str::stream() << "duplicate environment slot: " << slot, inserted);
-            return index;
-        }
-
-        StringMap<std::pair<value::SlotId, size_t>> slots;
-        std::vector<value::TypeTags> typeTags;
-        std::vector<value::Value> vals;
-        std::vector<bool> owned;
-    };
-
     class Accessor final : public value::SlotAccessor {
     public:
         Accessor(RuntimeEnvironment* env, size_t index) : _env{env}, _index{index} {}
@@ -184,6 +103,103 @@ private:
         const size_t _index;
     };
 
+    /**
+     * Registers and returns a SlotId for the given slot 'name'. The 'slotIdGenerator' is used
+     * to generate a new SlotId for the given slot 'name', which is then registered with this
+     * environment by creating a new SlotAccessor. The value 'val' is then stored within the
+     * SlotAccessor and the newly generated SlotId is returned.
+     *
+     * Both owned and unowned values can be stored in the runtime environment.
+     *
+     * A user exception is raised if this slot 'name' has been already registered.
+     */
+    value::SlotId registerSlot(StringData name,
+                               value::TypeTags tag,
+                               value::Value val,
+                               bool owned,
+                               value::SlotIdGenerator* slotIdGenerator);
+
+    /**
+     * Same as above, but allows to register an unnamed slot.
+     */
+    value::SlotId registerSlot(value::TypeTags tag,
+                               value::Value val,
+                               bool owned,
+                               value::SlotIdGenerator* slotIdGenerator);
+
+    /**
+     * Returns a SlotId registered for the given slot 'name'. If the slot with the specified name
+     * hasn't been registered, a user exception is raised.
+     */
+    value::SlotId getSlot(StringData name);
+
+    /**
+     * Returns a SlotId registered for the given slot 'name'. If the slot with the specified name
+     * hasn't been registered, boost::none is returned.
+     */
+    boost::optional<value::SlotId> getSlotIfExists(StringData name);
+
+    /**
+     * Store the given value in the specified slot within this runtime environment instance.
+     *
+     * A user exception is raised if the SlotId is not registered within this environment, or
+     * if this environment is used with a parallel plan.
+     */
+    void resetSlot(value::SlotId slot, value::TypeTags tag, value::Value val, bool owned);
+
+    /**
+     * Returns a SlotAccessor for the given SlotId which must be previously registered within this
+     * Environment by invoking 'registerSlot' method.
+     *
+     * A user exception is raised if the SlotId is not registered within this environment.
+     */
+    Accessor* getAccessor(value::SlotId slot);
+
+    /**
+     * Make a copy of his environment. The new environment will have its own set of SlotAccessors
+     * pointing to the same shared data holding slot values.
+     *
+     * To create a copy of the runtime environment for a parallel execution plan, the 'isSmp' flag
+     * must be set to 'true'. This will result in this environment being unconverted to a parallel
+     * environment, as well as the newly created copy.
+     */
+    std::unique_ptr<RuntimeEnvironment> makeCopy(bool isSmp);
+
+    /**
+     * Dumps all the slots currently defined in this environment into the given string builder.
+     */
+    void debugString(StringBuilder* builder);
+
+private:
+    RuntimeEnvironment(const RuntimeEnvironment&);
+
+    struct State {
+        size_t pushSlot(value::SlotId slot) {
+            auto index = vals.size();
+
+            typeTags.push_back(value::TypeTags::Nothing);
+            vals.push_back(0);
+            owned.push_back(false);
+
+            auto [_, inserted] = slots.emplace(slot, index);
+            uassert(4946302, str::stream() << "duplicate environment slot: " << slot, inserted);
+            return index;
+        }
+
+        void nameSlot(StringData name, value::SlotId slot) {
+            uassert(5645901, str::stream() << "undefined slot: " << slot, slots.count(slot));
+            auto [_, inserted] = namedSlots.emplace(name, slot);
+            uassert(5645902, str::stream() << "duplicate named slot: " << name, inserted);
+        }
+
+        StringMap<value::SlotId> namedSlots;
+        value::SlotMap<size_t> slots;
+
+        std::vector<value::TypeTags> typeTags;
+        std::vector<value::Value> vals;
+        std::vector<bool> owned;
+    };
+
     void emplaceAccessor(value::SlotId slot, size_t index) {
         _accessors.emplace(slot, Accessor{this, index});
     }
@@ -200,6 +216,11 @@ struct CompileCtx {
     CompileCtx(std::unique_ptr<RuntimeEnvironment> env) : env{std::move(env)} {}
 
     value::SlotAccessor* getAccessor(value::SlotId slot);
+
+    RuntimeEnvironment::Accessor* getRuntimeEnvAccessor(value::SlotId slotId) {
+        return env->getAccessor(slotId);
+    }
+
     std::shared_ptr<SpoolBuffer> getSpoolBuffer(SpoolId spool);
 
     void pushCorrelated(value::SlotId slot, value::SlotAccessor* accessor);

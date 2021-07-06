@@ -1,7 +1,10 @@
 /**
  * Test that $lookup within a sharded transaction reads from the correct snapshot.
- * @tags: [requires_find_command, requires_sharding, uses_multi_shard_transaction,
- *         uses_transactions]
+ * @tags: [
+ *   requires_sharding,
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
+ * ]
  */
 (function() {
 "use strict";
@@ -78,6 +81,18 @@ const testLookupDoesNotSeeDocumentsOutsideSnapshot = function() {
 
     assert.commandWorked(session.abortTransaction_forTesting());
 };
+
+// Stop running the tests if the flag allowing $lookup into a sharded collection is enabled because
+// an invariant fails during the aggregation of the pipeline in a transaction where the collection
+// is unsharded.
+// TODO SERVER-57957: Possibly remove this check.
+const getShardedLookupParam = st.s.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
+const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
+    getShardedLookupParam.featureFlagShardedLookup.value;
+if (isShardedLookupEnabled) {
+    st.stop();
+    return;
+}
 
 // Run the test once, with all of the data on shard 1. This means that the merging shard (shard
 // 0) will not be targeted. This is interesting because in contrast to the case below, the

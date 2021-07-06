@@ -134,7 +134,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
             mongos.await_ready()
 
         client = self.mongo_client()
-        self._auth_to_db(client)
+        interface.authenticate(client, self.auth_options)
 
         # Turn off the balancer if it is not meant to be enabled.
         if not self.enable_balancer:
@@ -184,7 +184,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
                               for mongod in shard.nodes]
 
             for client, port in mongod_clients:
-                self._auth_to_db(client)
+                interface.authenticate(client, self.auth_options)
 
                 while True:
                     # The choice of namespace (local.fooCollection) does not affect the output.
@@ -199,25 +199,17 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
                             .format(port, interface.Fixture.AWAIT_READY_TIMEOUT_SECS))
                     time.sleep(0.1)
 
-    def _auth_to_db(self, client):
-        """Authenticate client for the 'authenticationDatabase'."""
-        if self.auth_options is not None:
-            auth_db = client[self.auth_options["authenticationDatabase"]]
-            auth_db.authenticate(self.auth_options["username"],
-                                 password=self.auth_options["password"],
-                                 mechanism=self.auth_options["authenticationMechanism"])
-
     def stop_balancer(self, timeout_ms=60000):
         """Stop the balancer."""
         client = self.mongo_client()
-        self._auth_to_db(client)
+        interface.authenticate(client, self.auth_options)
         client.admin.command({"balancerStop": 1}, maxTimeMS=timeout_ms)
         self.logger.info("Stopped the balancer")
 
     def start_balancer(self, timeout_ms=60000):
         """Start the balancer."""
         client = self.mongo_client()
-        self._auth_to_db(client)
+        interface.authenticate(client, self.auth_options)
         client.admin.command({"balancerStart": 1}, maxTimeMS=timeout_ms)
         self.logger.info("Started the balancer")
 
@@ -302,11 +294,16 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "config")
         mongod_options["replSet"] = ShardedClusterFixture._CONFIGSVR_REPLSET_NAME
         mongod_options["storageEngine"] = "wiredTiger"
+        config_svr_mixed_bin_version = None
+        if self.mixed_bin_versions is not None:
+            config_svr_mixed_bin_version = self.fixturelib.get_config(
+            ).CONFIG_SVR_MIXED_BIN_VERSIONS
 
-        return interface.make_fixture(
+        return self.fixturelib.make_fixture(
             "ReplicaSetFixture", mongod_logger, self.job_num, mongod_options=mongod_options,
             mongod_executable=self.mongod_executable, preserve_dbpath=preserve_dbpath,
-            num_nodes=num_nodes, auth_options=auth_options, mixed_bin_versions=None,
+            num_nodes=num_nodes, auth_options=auth_options,
+            mixed_bin_versions=config_svr_mixed_bin_version,
             replset_config_options=replset_config_options,
             shard_logging_prefix=shard_logging_prefix, **configsvr_options)
 
@@ -339,7 +336,7 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
         mongod_options["replSet"] = ShardedClusterFixture._SHARD_REPLSET_NAME_PREFIX + str(index)
 
-        return interface.make_fixture(
+        return self.fixturelib.make_fixture(
             "ReplicaSetFixture", mongod_logger, self.job_num,
             mongod_executable=self.mongod_executable, mongod_options=mongod_options,
             preserve_dbpath=preserve_dbpath, num_nodes=num_rs_nodes_per_shard,
@@ -410,7 +407,9 @@ class _MongoSFixture(interface.Fixture):
             self.fixturelib.default_if_none(mongos_options, {})).copy()
 
         self.mongos = None
-        self.port = None
+        self.port = fixturelib.get_next_port(job_num)
+        self.mongos_options["port"] = self.port
+
         self._dbpath_prefix = dbpath_prefix
 
     def setup(self):
@@ -421,9 +420,9 @@ class _MongoSFixture(interface.Fixture):
             self.mongos_options["logappend"] = ""
 
         launcher = MongosLauncher(self.fixturelib)
-        mongos, self.port = launcher.launch_mongos_program(self.logger, self.job_num,
-                                                           executable=self.mongos_executable,
-                                                           mongos_options=self.mongos_options)
+        mongos, _ = launcher.launch_mongos_program(self.logger, self.job_num,
+                                                   executable=self.mongos_executable,
+                                                   mongos_options=self.mongos_options)
         self.mongos_options["port"] = self.port
         try:
             self.logger.info("Starting mongos on port %d...\n%s", self.port, mongos.as_command())
@@ -515,9 +514,6 @@ class _MongoSFixture(interface.Fixture):
 
     def get_internal_connection_string(self):
         """Return the internal connection string."""
-        if self.mongos is None:
-            raise ValueError("Must call setup() before calling get_internal_connection_string()")
-
         return "localhost:%d" % self.port
 
     def get_driver_connection_url(self):
@@ -551,8 +547,8 @@ class MongosLauncher(object):
     def default_mongos_log_component_verbosity(self):
         """Return the default 'logComponentVerbosity' value to use for mongos processes."""
         if self.config.EVERGREEN_TASK_ID:
-            return self.fixturelib.make_historic(DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY)
-        return self.fixturelib.make_historic(DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY)
+            return DEFAULT_EVERGREEN_MONGOS_LOG_COMPONENT_VERBOSITY
+        return DEFAULT_MONGOS_LOG_COMPONENT_VERBOSITY
 
     def launch_mongos_program(  # pylint: disable=too-many-arguments
             self, logger, job_num, test_id=None, executable=None, process_kwargs=None,
@@ -564,8 +560,7 @@ class MongosLauncher(object):
 
         # Apply the --setParameter command line argument. Command line options to resmoke.py override
         # the YAML configuration.
-        suite_set_parameters = mongos_options.setdefault("set_parameters",
-                                                         self.fixturelib.make_historic({}))
+        suite_set_parameters = mongos_options.setdefault("set_parameters", {})
 
         if self.config.MONGOS_SET_PARAMETERS is not None:
             suite_set_parameters.update(yaml.safe_load(self.config.MONGOS_SET_PARAMETERS))

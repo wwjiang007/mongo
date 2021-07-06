@@ -4,6 +4,7 @@
 // @tags: [
 //   assumes_unsharded_collection,
 //   assumes_write_concern_unchanged,
+//   requires_multi_updates,
 //   requires_non_retryable_writes,
 //   requires_fastcount,
 // ]
@@ -14,8 +15,6 @@
 
 var coll = db.getCollection("batch_write_update");
 coll.drop();
-
-assert(coll.getDB().getMongo().useWriteCommands(), "test is not running with write commands");
 
 var request;
 var result;

@@ -31,16 +31,6 @@
 
 namespace mongo {
 
-namespace {
-// Convert expected error codes to BSONNULL, but uassert other unexpected codes.
-Value orNull(StatusWith<Value> val) {
-    if (val.getStatus().code() == ErrorCodes::BadValue ||
-        val.getStatus().code() == ErrorCodes::TypeMismatch)
-        return Value(BSONNULL);
-    return uassertStatusOK(val);
-}
-}  // namespace
-
 Value WindowFunctionExecDerivative::getNext() {
     auto endpoints = _iter.getEndpoints(_bounds);
     if (!endpoints)
@@ -52,57 +42,63 @@ Value WindowFunctionExecDerivative::getNext() {
 
     // Conceptually, $derivative computes 'rise/run' where 'rise' is dimensionless and 'run' is
     // a time. The result has dimension 1/time, which doesn't correspond to any BSON type, so
-    // 'outputUnit' tells us how to express the result as a dimensionless BSON number.
+    // 'unit' tells us how to express the result as a dimensionless BSON number.
     //
     // However, BSON also can't represent a time (duration) directly. BSONType::Date represents
     // a point in time, but there is no type that represents an amount of time. Subtracting two
     // Date values implicitly converts them to milliseconds.
 
     // So, when we compute 'rise/run', the answer is expressed in units '1/millisecond'. If an
-    // 'outputUnit' is specified, we scale the answer by 'millisecond/outputUnit' to
-    // re-express it in '1/outputUnit'.
+    // 'unit' is specified, we scale the answer by 'millisecond/unit' to
+    // re-express it in '1/unit'.
     Value leftTime = _time->evaluate(leftDoc, &_time->getExpressionContext()->variables);
     Value rightTime = _time->evaluate(rightDoc, &_time->getExpressionContext()->variables);
-    if (_outputUnitMillis) {
-        // If an outputUnit is specified, we require both endpoints to be dates. We don't
+    if (_unitMillis) {
+        // If a unit is specified, we require both endpoints to be dates. We don't
         // want to interpret bare numbers as milliseconds, when we don't know what unit they
         // really represent.
         //
         // For example: imagine the '_time' field contains floats representing seconds: then
         // 'rise/run' will already be expressed in units of 1/second. If you think "my data is
-        // seconds" and write 'outputUnit: "second"', and we applied the scale factor of
-        // 'millisecond/outputUnit', then the final answer would be wrong by a factor of 1000.
-        if (leftTime.getType() != BSONType::Date || rightTime.getType() != BSONType::Date) {
-            return kDefault;
-        }
+        // seconds" and write 'unit: "second"', and we applied the scale factor of
+        // 'millisecond/unit', then the final answer would be wrong by a factor of 1000.
+        uassert(5624900,
+                "$derivative with 'unit' expects the sortBy field to be a Date",
+                leftTime.getType() == BSONType::Date && rightTime.getType() == BSONType::Date);
     } else {
-        // Without outputUnit, we require both time values to be numeric.
-        if (!leftTime.numeric() || !rightTime.numeric())
-            return kDefault;
+        // Without unit, we require both time values to be numeric.
+        uassert(5624901,
+                "$derivative where the sortBy is a Date requires an 'unit'",
+                leftTime.getType() != BSONType::Date && rightTime.getType() != BSONType::Date);
+        uassert(5624902,
+                "$derivative (with no 'unit') expects the sortBy field to be numeric",
+                leftTime.numeric() && rightTime.numeric());
     }
     // Now leftTime and rightTime are either both numeric, or both dates.
     // $subtract on two dates gives us the difference in milliseconds.
-    Value run = orNull(ExpressionSubtract::apply(std::move(rightTime), std::move(leftTime)));
-    if (run.nullish())
-        return kDefault;
+    Value run =
+        uassertStatusOK(ExpressionSubtract::apply(std::move(rightTime), std::move(leftTime)));
 
-    Value rise = orNull(ExpressionSubtract::apply(
+    Value rise = uassertStatusOK(ExpressionSubtract::apply(
         _position->evaluate(rightDoc, &_position->getExpressionContext()->variables),
         _position->evaluate(leftDoc, &_position->getExpressionContext()->variables)));
-    if (rise.nullish())
-        return kDefault;
+    uassert(5624903, "$derivative input must not be null or missing", !rise.nullish());
 
-    Value result = orNull(ExpressionDivide::apply(std::move(rise), std::move(run)));
-    if (result.nullish())
+    auto divideStatus = ExpressionDivide::apply(std::move(rise), std::move(run));
+    if (divideStatus.getStatus().code() == ErrorCodes::BadValue) {
+        // Divide by zero can't be an error. On the first document of a partition, a window like
+        // 'documents: [-1, 0]' contains only one document, so 'run' is zero.
         return kDefault;
+    }
+    Value result = uassertStatusOK(divideStatus);
 
-    if (_outputUnitMillis) {
-        // 'result' has units 1/millisecond; scale by millisecond/outputUnit to express in
-        // 1/outputUnit.
+    if (_unitMillis) {
+        // 'result' has units 1/millisecond; scale by millisecond/unit to express in
+        // 1/unit.
 
         // tassert because at this point the result should already be numeric, so if
         // ExpressionMultiply returns a non-OK Status then something has gone wrong.
-        auto statusWithResult = ExpressionMultiply::apply(result, Value(*_outputUnitMillis));
+        auto statusWithResult = ExpressionMultiply::apply(result, Value(*_unitMillis));
         tassert(statusWithResult);
         result = statusWithResult.getValue();
     }

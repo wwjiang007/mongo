@@ -42,7 +42,6 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_contract_gen.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/bson/dotted_path_support.h"
@@ -51,6 +50,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 #include "mongo/util/testing_proctor.h"
 
@@ -71,17 +71,9 @@ auto authorizationSessionCreateRegistration =
     MONGO_WEAK_FUNCTION_REGISTRATION(AuthorizationSession::create, authorizationSessionCreateImpl);
 
 constexpr StringData ADMIN_DBNAME = "admin"_sd;
+constexpr StringData SYSTEM_BUCKETS_PREFIX = "system.buckets."_sd;
 
 bool checkContracts() {
-
-    // Only check contracts if the feature is enabled.
-    // TODO SERVER-55908 - Remove feature flag check
-    if (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-        !feature_flags::gFeatureFlagAuthorizationContract.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        return false;
-    }
-
     // Only check contracts in testing modes, invalid contracts should not break customers.
     if (!TestingProctor::instance().isEnabled()) {
         return false;
@@ -90,11 +82,12 @@ bool checkContracts() {
     return true;
 }
 
+MONGO_FAIL_POINT_DEFINE(allowMultipleUsersWithApiStrict);
 }  // namespace
 
 AuthorizationSessionImpl::AuthorizationSessionImpl(
     std::unique_ptr<AuthzSessionExternalState> externalState, InstallMockForTestingOrAuthImpl)
-    : _externalState(std::move(externalState)), _impersonationFlag(false), _checkContracts(false) {}
+    : _externalState(std::move(externalState)), _impersonationFlag(false) {}
 
 AuthorizationSessionImpl::~AuthorizationSessionImpl() {
     invariant(_authenticatedUsers.count() == 0,
@@ -112,16 +105,60 @@ void AuthorizationSessionImpl::startRequest(OperationContext* opCtx) {
 
 void AuthorizationSessionImpl::startContractTracking() {
     if (!checkContracts()) {
-        _checkContracts = false;
         return;
     }
 
-    _checkContracts = true;
     _contract.clear();
 }
 
 Status AuthorizationSessionImpl::addAndAuthorizeUser(OperationContext* opCtx,
                                                      const UserName& userName) {
+    auto checkForMultipleUsers = [&]() {
+        const auto userCount = _authenticatedUsers.count();
+        if (userCount == 0) {
+            // This is the first authentication.
+            return;
+        }
+
+        auto previousUser = _authenticatedUsers.lookupByDBName(userName.getDB());
+        if (previousUser) {
+            const auto& previousUserName = previousUser->getName();
+            if (previousUserName.getUser() == userName.getUser()) {
+                LOGV2_WARNING(5626700,
+                              "Client has attempted to reauthenticate as a single user",
+                              "user"_attr = userName);
+            } else {
+                LOGV2_WARNING(5626701,
+                              "Client has attempted to authenticate as multiple users on the "
+                              "same database",
+                              "previousUser"_attr = previousUserName,
+                              "user"_attr = userName);
+            }
+        } else {
+            LOGV2_WARNING(5626702,
+                          "Client has attempted to authenticate on multiple databases",
+                          "previousUsers"_attr = _authenticatedUsers.toBSON(),
+                          "user"_attr = userName);
+        }
+
+        const auto hasStrictAPI = APIParameters::get(opCtx).getAPIStrict().value_or(false);
+        if (!hasStrictAPI) {
+            // We're allowed to skip the uassert because we're not so strict.
+            return;
+        }
+
+        if (allowMultipleUsersWithApiStrict.shouldFail()) {
+            // We've explicitly allowed this for testing.
+            return;
+        }
+
+        uasserted(5626703, "Each client connection may only be authenticated once");
+    };
+
+    // Check before we start to reveal as little as possible. Note that we do not need the lock
+    // because only the Client thread can mutate _authenticatedUsers.
+    checkForMultipleUsers();
+
     AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
     auto swUser = authzManager->acquireUser(opCtx, userName);
     if (!swUser.isOK()) {
@@ -373,7 +410,7 @@ bool AuthorizationSessionImpl::isAuthorizedForActionsOnNamespace(const Namespace
     return isAuthorizedForPrivilege(Privilege(ResourcePattern::forExactNamespace(ns), actions));
 }
 
-static const int resourceSearchListCapacity = 5;
+static const int resourceSearchListCapacity = 7;
 /**
  * Builds from "target" an exhaustive list of all ResourcePatterns that match "target".
  *
@@ -404,6 +441,14 @@ static const int resourceSearchListCapacity = 5;
  *                  db,
  *                  coll,
  *                  db.coll }
+ * target is a system buckets collection, db.system.buckets.coll:
+ *   searchList = { ResourcePattern::forAnyResource(),
+ *                  ResourcePattern::forAnySystemBuckets(),
+ *                  ResourcePattern::forAnySystemBucketsInDatabase("db"),
+ *                  ResourcePattern::forAnySystemBucketsInAnyDatabase("coll"),
+ *                  ResourcePattern::forExactSystemBucketsCollection("db", "coll"),
+ *                  system.buckets.coll,
+ *                  db.system.buckets.coll }
  * target is a system collection, db.system.coll:
  *   searchList = { ResourcePattern::forAnyResource(),
  *                  system.coll,
@@ -424,6 +469,16 @@ static int buildResourceSearchList(const ResourcePattern& target,
                 resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
             }
             resourceSearchList[size++] = ResourcePattern::forDatabaseName(target.ns().db());
+        } else if (target.ns().coll().startsWith(SYSTEM_BUCKETS_PREFIX) &&
+                   target.ns().coll().size() > SYSTEM_BUCKETS_PREFIX.size()) {
+            auto bucketColl = target.ns().coll().substr(SYSTEM_BUCKETS_PREFIX.size());
+            resourceSearchList[size++] =
+                ResourcePattern::forExactSystemBucketsCollection(target.ns().db(), bucketColl);
+            resourceSearchList[size++] = ResourcePattern::forAnySystemBuckets();
+            resourceSearchList[size++] =
+                ResourcePattern::forAnySystemBucketsInDatabase(target.ns().db());
+            resourceSearchList[size++] =
+                ResourcePattern::forAnySystemBucketsInAnyDatabase(bucketColl);
         }
 
         // All collections can be matched by a collection resource for their name
@@ -623,6 +678,12 @@ bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(StringD
             return true;
         }
 
+        // Any resource will match any system_buckets collection in the database
+        if (user->hasActionsForResource(ResourcePattern::forAnySystemBuckets()) ||
+            user->hasActionsForResource(ResourcePattern::forAnySystemBucketsInDatabase(db))) {
+            return true;
+        }
+
         // If the user is authorized for anyNormalResource, then they implicitly have access
         // to most databases.
         if (db != "local" && db != "config" &&
@@ -640,9 +701,22 @@ bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(StringD
                 return true;
             }
 
+            // User can see system_buckets in any database so we consider them to have permission in
+            // this database
+            if (privilege.first.isAnySystemBucketsCollectionInAnyDB()) {
+                return true;
+            }
+
             // If the user has an exact namespace privilege on a collection in this database, they
             // have access to a resource in this database.
             if (privilege.first.isExactNamespacePattern() &&
+                privilege.first.databaseToMatch() == db) {
+                return true;
+            }
+
+            // If the user has an exact namespace privilege on a system.buckets collection in this
+            // database, they have access to a resource in this database.
+            if (privilege.first.isExactSystemBucketsCollection() &&
                 privilege.first.databaseToMatch() == db) {
                 return true;
             }
@@ -855,11 +929,6 @@ void AuthorizationSessionImpl::verifyContract(const AuthorizationContract* contr
     }
 
     if (!checkContracts()) {
-        return;
-    }
-
-    // Do not check a contract if we decided earlier not to clear the contract tracking state.
-    if (!_checkContracts) {
         return;
     }
 

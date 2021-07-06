@@ -49,7 +49,6 @@
 #include "mongo/db/pipeline/expression_walker.h"
 #include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/sbe_stage_builder_eval_frame.h"
-#include "mongo/db/query/sbe_stage_builder_helpers.h"
 #include "mongo/util/str.h"
 
 #include <absl/container/flat_hash_map.h>
@@ -57,18 +56,6 @@
 
 namespace mongo::stage_builder {
 namespace {
-std::pair<sbe::value::TypeTags, sbe::value::Value> convertFrom(Value val) {
-    // TODO: Either make this conversion unnecessary by changing the value representation in
-    // ExpressionConstant, or provide a nicer way to convert directly from Document/Value to
-    // sbe::Value.
-    BSONObjBuilder bob;
-    val.addToBsonObj(&bob, ""_sd);
-    auto obj = bob.done();
-    auto be = obj.objdata();
-    auto end = be + obj.objsize();
-    return sbe::bson::convertFrom(false, be + 4, end, 0);
-}
-
 struct ExpressionVisitorContext {
     struct VarsFrame {
         std::deque<Variables::Id> variablesToBind;
@@ -82,19 +69,12 @@ struct ExpressionVisitorContext {
             : variablesToBind{std::forward<Args>(args)...}, slotsForLetVariables{} {}
     };
 
-    ExpressionVisitorContext(std::unique_ptr<sbe::PlanStage> inputStage,
-                             sbe::value::SlotIdGenerator* slotIdGenerator,
-                             sbe::value::FrameIdGenerator* frameIdGenerator,
+    ExpressionVisitorContext(StageBuilderState& state,
+                             EvalStage inputStage,
                              sbe::value::SlotId rootSlot,
-                             const sbe::value::SlotVector& relevantSlots,
-                             sbe::RuntimeEnvironment* env,
                              PlanNodeId planNodeId)
-        : slotIdGenerator(slotIdGenerator),
-          frameIdGenerator(frameIdGenerator),
-          rootSlot(rootSlot),
-          runtimeEnvironment(env),
-          planNodeId(planNodeId) {
-        evalStack.emplaceFrame(EvalStage{std::move(inputStage), relevantSlots});
+        : state(state), rootSlot(rootSlot), planNodeId(planNodeId) {
+        evalStack.emplaceFrame(std::move(inputStage));
     }
 
     void ensureArity(size_t arity) {
@@ -138,15 +118,13 @@ struct ExpressionVisitorContext {
     std::tuple<sbe::value::SlotId, std::unique_ptr<sbe::EExpression>, EvalStage> done() {
         invariant(evalStack.framesCount() == 1);
         auto [expr, stage] = popFrame();
-        return {slotIdGenerator->generate(),
-                std::move(expr),
-                stageOrLimitCoScan(std::move(stage), planNodeId)};
+        return {state.slotId(), std::move(expr), stageOrLimitCoScan(std::move(stage), planNodeId)};
     }
+
+    StageBuilderState& state;
 
     EvalStack<> evalStack;
 
-    sbe::value::SlotIdGenerator* slotIdGenerator;
-    sbe::value::FrameIdGenerator* frameIdGenerator;
     sbe::value::SlotId rootSlot;
 
     // The lexical environment for the expression being traversed. A variable reference takes the
@@ -155,10 +133,6 @@ struct ExpressionVisitorContext {
     // such variable to an SBE slot using this mapping.
     std::map<Variables::Id, sbe::value::SlotId> environment;
     std::stack<VarsFrame> varsFrameStack;
-
-    // See the comment above the generateExpression() declaration for an explanation of the
-    // 'relevantSlots' list.
-    sbe::RuntimeEnvironment* runtimeEnvironment;
 
     // The id of the QuerySolutionNode to which the expression we are converting to SBE is attached.
     const PlanNodeId planNodeId;
@@ -265,7 +239,7 @@ std::pair<sbe::value::SlotId, EvalStage> generateTraverse(
  */
 void generateStringCaseConversionExpression(ExpressionVisitorContext* _context,
                                             const std::string& caseConversionFunction) {
-    auto frameId = _context->frameIdGenerator->generate();
+    auto frameId = _context->state.frameId();
     auto str = sbe::makeEs(_context->popExpr());
     sbe::EVariable inputRef(frameId, 0);
     uint32_t typeMask = (getBSONTypeMask(sbe::value::TypeTags::StringSmall) |
@@ -304,7 +278,7 @@ void buildArrayAccessByConstantIndex(ExpressionVisitorContext* context,
 
     auto array = context->popExpr();
 
-    auto frameId = context->frameIdGenerator->generate();
+    auto frameId = context->state.frameId();
     auto binds = sbe::makeEs(std::move(array));
     sbe::EVariable arrayRef{frameId, 0};
 
@@ -338,157 +312,160 @@ std::unique_ptr<sbe::EExpression> generateRegexNullResponse(StringData exprName)
     return sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0);
 }
 
-class ExpressionPreVisitor final : public ExpressionVisitor {
+class ExpressionPreVisitor final : public ExpressionConstVisitor {
 public:
     ExpressionPreVisitor(ExpressionVisitorContext* context) : _context{context} {}
 
-    void visit(ExpressionConstant* expr) final {}
-    void visit(ExpressionAbs* expr) final {}
-    void visit(ExpressionAdd* expr) final {}
-    void visit(ExpressionAllElementsTrue* expr) final {}
-    void visit(ExpressionAnd* expr) final {
+    void visit(const ExpressionConstant* expr) final {}
+    void visit(const ExpressionAbs* expr) final {}
+    void visit(const ExpressionAdd* expr) final {}
+    void visit(const ExpressionAllElementsTrue* expr) final {}
+    void visit(const ExpressionAnd* expr) final {
         visitMultiBranchLogicExpression(expr, sbe::EPrimBinary::logicAnd);
     }
-    void visit(ExpressionAnyElementTrue* expr) final {}
-    void visit(ExpressionArray* expr) final {}
-    void visit(ExpressionArrayElemAt* expr) final {}
-    void visit(ExpressionFirst* expr) final {}
-    void visit(ExpressionLast* expr) final {}
-    void visit(ExpressionObjectToArray* expr) final {}
-    void visit(ExpressionArrayToObject* expr) final {}
-    void visit(ExpressionBsonSize* expr) final {}
-    void visit(ExpressionCeil* expr) final {}
-    void visit(ExpressionCoerceToBool* expr) final {}
-    void visit(ExpressionCompare* expr) final {}
-    void visit(ExpressionConcat* expr) final {}
-    void visit(ExpressionConcatArrays* expr) final {
+    void visit(const ExpressionAnyElementTrue* expr) final {}
+    void visit(const ExpressionArray* expr) final {}
+    void visit(const ExpressionArrayElemAt* expr) final {}
+    void visit(const ExpressionFirst* expr) final {}
+    void visit(const ExpressionLast* expr) final {}
+    void visit(const ExpressionObjectToArray* expr) final {}
+    void visit(const ExpressionArrayToObject* expr) final {}
+    void visit(const ExpressionBsonSize* expr) final {}
+    void visit(const ExpressionCeil* expr) final {}
+    void visit(const ExpressionCoerceToBool* expr) final {}
+    void visit(const ExpressionCompare* expr) final {}
+    void visit(const ExpressionConcat* expr) final {}
+    void visit(const ExpressionConcatArrays* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionCond* expr) final {
+    void visit(const ExpressionCond* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionDateDiff* expr) final {}
-    void visit(ExpressionDateFromString* expr) final {}
-    void visit(ExpressionDateFromParts* expr) final {}
-    void visit(ExpressionDateToParts* expr) final {}
-    void visit(ExpressionDateToString* expr) final {}
-    void visit(ExpressionDateTrunc* expr) final {}
-    void visit(ExpressionDivide* expr) final {}
-    void visit(ExpressionExp* expr) final {}
-    void visit(ExpressionFieldPath* expr) final {}
-    void visit(ExpressionFilter* expr) final {}
-    void visit(ExpressionFloor* expr) final {}
-    void visit(ExpressionIfNull* expr) final {
+    void visit(const ExpressionDateDiff* expr) final {}
+    void visit(const ExpressionDateFromString* expr) final {}
+    void visit(const ExpressionDateFromParts* expr) final {}
+    void visit(const ExpressionDateToParts* expr) final {}
+    void visit(const ExpressionDateToString* expr) final {}
+    void visit(const ExpressionDateTrunc* expr) final {}
+    void visit(const ExpressionDivide* expr) final {}
+    void visit(const ExpressionExp* expr) final {}
+    void visit(const ExpressionFieldPath* expr) final {}
+    void visit(const ExpressionFilter* expr) final {}
+    void visit(const ExpressionFloor* expr) final {}
+    void visit(const ExpressionIfNull* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionIn* expr) final {}
-    void visit(ExpressionIndexOfArray* expr) final {}
-    void visit(ExpressionIndexOfBytes* expr) final {}
-    void visit(ExpressionIndexOfCP* expr) final {}
-    void visit(ExpressionIsNumber* expr) final {}
-    void visit(ExpressionLet* expr) final {
+    void visit(const ExpressionIn* expr) final {}
+    void visit(const ExpressionIndexOfArray* expr) final {}
+    void visit(const ExpressionIndexOfBytes* expr) final {}
+    void visit(const ExpressionIndexOfCP* expr) final {}
+    void visit(const ExpressionIsNumber* expr) final {}
+    void visit(const ExpressionLet* expr) final {
         _context->varsFrameStack.push(ExpressionVisitorContext::VarsFrame{
             std::begin(expr->getOrderedVariableIds()), std::end(expr->getOrderedVariableIds())});
     }
-    void visit(ExpressionLn* expr) final {}
-    void visit(ExpressionLog* expr) final {}
-    void visit(ExpressionLog10* expr) final {}
-    void visit(ExpressionMap* expr) final {}
-    void visit(ExpressionMeta* expr) final {}
-    void visit(ExpressionMod* expr) final {}
-    void visit(ExpressionMultiply* expr) final {}
-    void visit(ExpressionNot* expr) final {}
-    void visit(ExpressionObject* expr) final {}
-    void visit(ExpressionOr* expr) final {
+    void visit(const ExpressionLn* expr) final {}
+    void visit(const ExpressionLog* expr) final {}
+    void visit(const ExpressionLog10* expr) final {}
+    void visit(const ExpressionMap* expr) final {}
+    void visit(const ExpressionMeta* expr) final {}
+    void visit(const ExpressionMod* expr) final {}
+    void visit(const ExpressionMultiply* expr) final {}
+    void visit(const ExpressionNot* expr) final {}
+    void visit(const ExpressionObject* expr) final {}
+    void visit(const ExpressionOr* expr) final {
         visitMultiBranchLogicExpression(expr, sbe::EPrimBinary::logicOr);
     }
-    void visit(ExpressionPow* expr) final {}
-    void visit(ExpressionRange* expr) final {}
-    void visit(ExpressionReduce* expr) final {}
-    void visit(ExpressionReplaceOne* expr) final {}
-    void visit(ExpressionReplaceAll* expr) final {}
-    void visit(ExpressionSetDifference* expr) final {}
-    void visit(ExpressionSetEquals* expr) final {}
-    void visit(ExpressionSetIntersection* expr) final {}
-    void visit(ExpressionSetIsSubset* expr) final {}
-    void visit(ExpressionSetUnion* expr) final {}
-    void visit(ExpressionSize* expr) final {}
-    void visit(ExpressionReverseArray* expr) final {}
-    void visit(ExpressionSlice* expr) final {}
-    void visit(ExpressionIsArray* expr) final {}
-    void visit(ExpressionRound* expr) final {}
-    void visit(ExpressionSplit* expr) final {}
-    void visit(ExpressionSqrt* expr) final {}
-    void visit(ExpressionStrcasecmp* expr) final {}
-    void visit(ExpressionSubstrBytes* expr) final {}
-    void visit(ExpressionSubstrCP* expr) final {}
-    void visit(ExpressionStrLenBytes* expr) final {}
-    void visit(ExpressionBinarySize* expr) final {}
-    void visit(ExpressionStrLenCP* expr) final {}
-    void visit(ExpressionSubtract* expr) final {}
-    void visit(ExpressionSwitch* expr) final {
+    void visit(const ExpressionPow* expr) final {}
+    void visit(const ExpressionRange* expr) final {}
+    void visit(const ExpressionReduce* expr) final {}
+    void visit(const ExpressionReplaceOne* expr) final {}
+    void visit(const ExpressionReplaceAll* expr) final {}
+    void visit(const ExpressionSetDifference* expr) final {}
+    void visit(const ExpressionSetEquals* expr) final {}
+    void visit(const ExpressionSetIntersection* expr) final {}
+    void visit(const ExpressionSetIsSubset* expr) final {}
+    void visit(const ExpressionSetUnion* expr) final {}
+    void visit(const ExpressionSize* expr) final {}
+    void visit(const ExpressionReverseArray* expr) final {}
+    void visit(const ExpressionSlice* expr) final {}
+    void visit(const ExpressionIsArray* expr) final {}
+    void visit(const ExpressionRound* expr) final {}
+    void visit(const ExpressionSplit* expr) final {}
+    void visit(const ExpressionSqrt* expr) final {}
+    void visit(const ExpressionStrcasecmp* expr) final {}
+    void visit(const ExpressionSubstrBytes* expr) final {}
+    void visit(const ExpressionSubstrCP* expr) final {}
+    void visit(const ExpressionStrLenBytes* expr) final {}
+    void visit(const ExpressionBinarySize* expr) final {}
+    void visit(const ExpressionStrLenCP* expr) final {}
+    void visit(const ExpressionSubtract* expr) final {}
+    void visit(const ExpressionSwitch* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionTestApiVersion* expr) final {}
-    void visit(ExpressionToLower* expr) final {}
-    void visit(ExpressionToUpper* expr) final {}
-    void visit(ExpressionTrim* expr) final {}
-    void visit(ExpressionTrunc* expr) final {}
-    void visit(ExpressionType* expr) final {}
-    void visit(ExpressionZip* expr) final {}
-    void visit(ExpressionConvert* expr) final {}
-    void visit(ExpressionRegexFind* expr) final {}
-    void visit(ExpressionRegexFindAll* expr) final {}
-    void visit(ExpressionRegexMatch* expr) final {}
-    void visit(ExpressionCosine* expr) final {}
-    void visit(ExpressionSine* expr) final {}
-    void visit(ExpressionTangent* expr) final {}
-    void visit(ExpressionArcCosine* expr) final {}
-    void visit(ExpressionArcSine* expr) final {}
-    void visit(ExpressionArcTangent* expr) final {}
-    void visit(ExpressionArcTangent2* expr) final {}
-    void visit(ExpressionHyperbolicArcTangent* expr) final {}
-    void visit(ExpressionHyperbolicArcCosine* expr) final {}
-    void visit(ExpressionHyperbolicArcSine* expr) final {}
-    void visit(ExpressionHyperbolicTangent* expr) final {}
-    void visit(ExpressionHyperbolicCosine* expr) final {}
-    void visit(ExpressionHyperbolicSine* expr) final {}
-    void visit(ExpressionDegreesToRadians* expr) final {}
-    void visit(ExpressionRadiansToDegrees* expr) final {}
-    void visit(ExpressionDayOfMonth* expr) final {}
-    void visit(ExpressionDayOfWeek* expr) final {}
-    void visit(ExpressionDayOfYear* expr) final {}
-    void visit(ExpressionHour* expr) final {}
-    void visit(ExpressionMillisecond* expr) final {}
-    void visit(ExpressionMinute* expr) final {}
-    void visit(ExpressionMonth* expr) final {}
-    void visit(ExpressionSecond* expr) final {}
-    void visit(ExpressionWeek* expr) final {}
-    void visit(ExpressionIsoWeekYear* expr) final {}
-    void visit(ExpressionIsoDayOfWeek* expr) final {}
-    void visit(ExpressionIsoWeek* expr) final {}
-    void visit(ExpressionYear* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorAvg>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorMax>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorMin>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorSum>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {}
-    void visit(ExpressionTests::Testable* expr) final {}
-    void visit(ExpressionInternalJsEmit* expr) final {}
-    void visit(ExpressionInternalFindSlice* expr) final {}
-    void visit(ExpressionInternalFindPositional* expr) final {}
-    void visit(ExpressionInternalFindElemMatch* expr) final {}
-    void visit(ExpressionFunction* expr) final {}
-    void visit(ExpressionRandom* expr) final {}
-    void visit(ExpressionToHashedIndexKey* expr) final {}
-    void visit(ExpressionDateAdd* expr) final {}
-    void visit(ExpressionDateSubtract* expr) final {}
-    void visit(ExpressionGetField* expr) final {}
+    void visit(const ExpressionTestApiVersion* expr) final {}
+    void visit(const ExpressionToLower* expr) final {}
+    void visit(const ExpressionToUpper* expr) final {}
+    void visit(const ExpressionTrim* expr) final {}
+    void visit(const ExpressionTrunc* expr) final {}
+    void visit(const ExpressionType* expr) final {}
+    void visit(const ExpressionZip* expr) final {}
+    void visit(const ExpressionConvert* expr) final {}
+    void visit(const ExpressionRegexFind* expr) final {}
+    void visit(const ExpressionRegexFindAll* expr) final {}
+    void visit(const ExpressionRegexMatch* expr) final {}
+    void visit(const ExpressionCosine* expr) final {}
+    void visit(const ExpressionSine* expr) final {}
+    void visit(const ExpressionTangent* expr) final {}
+    void visit(const ExpressionArcCosine* expr) final {}
+    void visit(const ExpressionArcSine* expr) final {}
+    void visit(const ExpressionArcTangent* expr) final {}
+    void visit(const ExpressionArcTangent2* expr) final {}
+    void visit(const ExpressionHyperbolicArcTangent* expr) final {}
+    void visit(const ExpressionHyperbolicArcCosine* expr) final {}
+    void visit(const ExpressionHyperbolicArcSine* expr) final {}
+    void visit(const ExpressionHyperbolicTangent* expr) final {}
+    void visit(const ExpressionHyperbolicCosine* expr) final {}
+    void visit(const ExpressionHyperbolicSine* expr) final {}
+    void visit(const ExpressionDegreesToRadians* expr) final {}
+    void visit(const ExpressionRadiansToDegrees* expr) final {}
+    void visit(const ExpressionDayOfMonth* expr) final {}
+    void visit(const ExpressionDayOfWeek* expr) final {}
+    void visit(const ExpressionDayOfYear* expr) final {}
+    void visit(const ExpressionHour* expr) final {}
+    void visit(const ExpressionMillisecond* expr) final {}
+    void visit(const ExpressionMinute* expr) final {}
+    void visit(const ExpressionMonth* expr) final {}
+    void visit(const ExpressionSecond* expr) final {}
+    void visit(const ExpressionWeek* expr) final {}
+    void visit(const ExpressionIsoWeekYear* expr) final {}
+    void visit(const ExpressionIsoDayOfWeek* expr) final {}
+    void visit(const ExpressionIsoWeek* expr) final {}
+    void visit(const ExpressionYear* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorAvg>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorMax>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorMin>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorSum>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {}
+    void visit(const ExpressionTests::Testable* expr) final {}
+    void visit(const ExpressionInternalJsEmit* expr) final {}
+    void visit(const ExpressionInternalFindSlice* expr) final {}
+    void visit(const ExpressionInternalFindPositional* expr) final {}
+    void visit(const ExpressionInternalFindElemMatch* expr) final {}
+    void visit(const ExpressionFunction* expr) final {}
+    void visit(const ExpressionRandom* expr) final {}
+    void visit(const ExpressionToHashedIndexKey* expr) final {}
+    void visit(const ExpressionDateAdd* expr) final {}
+    void visit(const ExpressionDateSubtract* expr) final {}
+    void visit(const ExpressionGetField* expr) final {}
+    void visit(const ExpressionSetField* expr) final {}
+    void visit(const ExpressionTsSecond* expr) final {}
+    void visit(const ExpressionTsIncrement* expr) final {}
 
 private:
-    void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
+    void visitMultiBranchLogicExpression(const Expression* expr, sbe::EPrimBinary::Op logicOp) {
         invariant(logicOp == sbe::EPrimBinary::logicOr || logicOp == sbe::EPrimBinary::logicAnd);
 
         if (expr->getChildren().size() < 2) {
@@ -503,66 +480,66 @@ private:
     ExpressionVisitorContext* _context;
 };
 
-class ExpressionInVisitor final : public ExpressionVisitor {
+class ExpressionInVisitor final : public ExpressionConstVisitor {
 public:
     ExpressionInVisitor(ExpressionVisitorContext* context) : _context{context} {}
 
-    void visit(ExpressionConstant* expr) final {}
-    void visit(ExpressionAbs* expr) final {}
-    void visit(ExpressionAdd* expr) final {}
-    void visit(ExpressionAllElementsTrue* expr) final {}
-    void visit(ExpressionAnd* expr) final {
+    void visit(const ExpressionConstant* expr) final {}
+    void visit(const ExpressionAbs* expr) final {}
+    void visit(const ExpressionAdd* expr) final {}
+    void visit(const ExpressionAllElementsTrue* expr) final {}
+    void visit(const ExpressionAnd* expr) final {
         visitMultiBranchLogicExpression(expr, sbe::EPrimBinary::logicAnd);
     }
-    void visit(ExpressionAnyElementTrue* expr) final {}
-    void visit(ExpressionArray* expr) final {}
-    void visit(ExpressionArrayElemAt* expr) final {}
-    void visit(ExpressionFirst* expr) final {}
-    void visit(ExpressionLast* expr) final {}
-    void visit(ExpressionObjectToArray* expr) final {}
-    void visit(ExpressionArrayToObject* expr) final {}
-    void visit(ExpressionBsonSize* expr) final {}
-    void visit(ExpressionCeil* expr) final {}
-    void visit(ExpressionCoerceToBool* expr) final {}
-    void visit(ExpressionCompare* expr) final {}
-    void visit(ExpressionConcat* expr) final {}
-    void visit(ExpressionConcatArrays* expr) final {
+    void visit(const ExpressionAnyElementTrue* expr) final {}
+    void visit(const ExpressionArray* expr) final {}
+    void visit(const ExpressionArrayElemAt* expr) final {}
+    void visit(const ExpressionFirst* expr) final {}
+    void visit(const ExpressionLast* expr) final {}
+    void visit(const ExpressionObjectToArray* expr) final {}
+    void visit(const ExpressionArrayToObject* expr) final {}
+    void visit(const ExpressionBsonSize* expr) final {}
+    void visit(const ExpressionCeil* expr) final {}
+    void visit(const ExpressionCoerceToBool* expr) final {}
+    void visit(const ExpressionCompare* expr) final {}
+    void visit(const ExpressionConcat* expr) final {}
+    void visit(const ExpressionConcatArrays* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionCond* expr) final {
+    void visit(const ExpressionCond* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionDateDiff* expr) final {}
-    void visit(ExpressionDateFromString* expr) final {}
-    void visit(ExpressionDateFromParts* expr) final {}
-    void visit(ExpressionDateToParts* expr) final {}
-    void visit(ExpressionDateToString* expr) final {}
-    void visit(ExpressionDateTrunc*) final {}
-    void visit(ExpressionDivide* expr) final {}
-    void visit(ExpressionExp* expr) final {}
-    void visit(ExpressionFieldPath* expr) final {}
-    void visit(ExpressionFilter* expr) final {
+    void visit(const ExpressionDateDiff* expr) final {}
+    void visit(const ExpressionDateFromString* expr) final {}
+    void visit(const ExpressionDateFromParts* expr) final {}
+    void visit(const ExpressionDateToParts* expr) final {}
+    void visit(const ExpressionDateToString* expr) final {}
+    void visit(const ExpressionDateTrunc*) final {}
+    void visit(const ExpressionDivide* expr) final {}
+    void visit(const ExpressionExp* expr) final {}
+    void visit(const ExpressionFieldPath* expr) final {}
+    void visit(const ExpressionFilter* expr) final {
         // This visitor executes after visiting the expression that will evaluate to the array for
         // filtering and before visiting the filter condition expression.
         auto variableId = expr->getVariableId();
         invariant(_context->environment.find(variableId) == _context->environment.end());
 
-        auto currentElementSlot = _context->slotIdGenerator->generate();
+        auto currentElementSlot = _context->state.slotId();
         _context->environment.insert({variableId, currentElementSlot});
 
         // Push new frame to provide clean context for sub-tree generated by filter predicate.
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionFloor* expr) final {}
-    void visit(ExpressionIfNull* expr) final {
+    void visit(const ExpressionFloor* expr) final {}
+    void visit(const ExpressionIfNull* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionIn* expr) final {}
-    void visit(ExpressionIndexOfArray* expr) final {}
-    void visit(ExpressionIndexOfBytes* expr) final {}
-    void visit(ExpressionIndexOfCP* expr) final {}
-    void visit(ExpressionIsNumber* expr) final {}
-    void visit(ExpressionLet* expr) final {
+    void visit(const ExpressionIn* expr) final {}
+    void visit(const ExpressionIndexOfArray* expr) final {}
+    void visit(const ExpressionIndexOfBytes* expr) final {}
+    void visit(const ExpressionIndexOfCP* expr) final {}
+    void visit(const ExpressionIsNumber* expr) final {}
+    void visit(const ExpressionLet* expr) final {
         // This visitor fires after each variable definition in a $let expression. The top of the
         // _context's expression stack will be an expression defining the variable initializer. We
         // use a separate frame stack ('varsFrameStack') to keep track of which variable we are
@@ -577,7 +554,7 @@ public:
 
         // We create two bindings. First, the initializer result is bound to a slot when this
         // ProjectStage executes.
-        auto slotToBind = _context->slotIdGenerator->generate();
+        auto slotToBind = _context->state.slotId();
         _context->setCurrentStage(makeProject(_context->extractCurrentEvalStage(),
                                               _context->planNodeId,
                                               slotToBind,
@@ -590,105 +567,108 @@ public:
         invariant(_context->environment.find(varToBind) == _context->environment.end());
         _context->environment.insert({varToBind, slotToBind});
     }
-    void visit(ExpressionLn* expr) final {}
-    void visit(ExpressionLog* expr) final {}
-    void visit(ExpressionLog10* expr) final {}
-    void visit(ExpressionMap* expr) final {}
-    void visit(ExpressionMeta* expr) final {}
-    void visit(ExpressionMod* expr) final {}
-    void visit(ExpressionMultiply* expr) final {}
-    void visit(ExpressionNot* expr) final {}
-    void visit(ExpressionObject* expr) final {}
-    void visit(ExpressionOr* expr) final {
+    void visit(const ExpressionLn* expr) final {}
+    void visit(const ExpressionLog* expr) final {}
+    void visit(const ExpressionLog10* expr) final {}
+    void visit(const ExpressionMap* expr) final {}
+    void visit(const ExpressionMeta* expr) final {}
+    void visit(const ExpressionMod* expr) final {}
+    void visit(const ExpressionMultiply* expr) final {}
+    void visit(const ExpressionNot* expr) final {}
+    void visit(const ExpressionObject* expr) final {}
+    void visit(const ExpressionOr* expr) final {
         visitMultiBranchLogicExpression(expr, sbe::EPrimBinary::logicOr);
     }
-    void visit(ExpressionPow* expr) final {}
-    void visit(ExpressionRange* expr) final {}
-    void visit(ExpressionReduce* expr) final {}
-    void visit(ExpressionReplaceOne* expr) final {}
-    void visit(ExpressionReplaceAll* expr) final {}
-    void visit(ExpressionSetDifference* expr) final {}
-    void visit(ExpressionSetEquals* expr) final {}
-    void visit(ExpressionSetIntersection* expr) final {}
-    void visit(ExpressionSetIsSubset* expr) final {}
-    void visit(ExpressionSetUnion* expr) final {}
-    void visit(ExpressionSize* expr) final {}
-    void visit(ExpressionReverseArray* expr) final {}
-    void visit(ExpressionSlice* expr) final {}
-    void visit(ExpressionIsArray* expr) final {}
-    void visit(ExpressionRound* expr) final {}
-    void visit(ExpressionSplit* expr) final {}
-    void visit(ExpressionSqrt* expr) final {}
-    void visit(ExpressionStrcasecmp* expr) final {}
-    void visit(ExpressionSubstrBytes* expr) final {}
-    void visit(ExpressionSubstrCP* expr) final {}
-    void visit(ExpressionStrLenBytes* expr) final {}
-    void visit(ExpressionBinarySize* expr) final {}
-    void visit(ExpressionStrLenCP* expr) final {}
-    void visit(ExpressionSubtract* expr) final {}
-    void visit(ExpressionSwitch* expr) final {
+    void visit(const ExpressionPow* expr) final {}
+    void visit(const ExpressionRange* expr) final {}
+    void visit(const ExpressionReduce* expr) final {}
+    void visit(const ExpressionReplaceOne* expr) final {}
+    void visit(const ExpressionReplaceAll* expr) final {}
+    void visit(const ExpressionSetDifference* expr) final {}
+    void visit(const ExpressionSetEquals* expr) final {}
+    void visit(const ExpressionSetIntersection* expr) final {}
+    void visit(const ExpressionSetIsSubset* expr) final {}
+    void visit(const ExpressionSetUnion* expr) final {}
+    void visit(const ExpressionSize* expr) final {}
+    void visit(const ExpressionReverseArray* expr) final {}
+    void visit(const ExpressionSlice* expr) final {}
+    void visit(const ExpressionIsArray* expr) final {}
+    void visit(const ExpressionRound* expr) final {}
+    void visit(const ExpressionSplit* expr) final {}
+    void visit(const ExpressionSqrt* expr) final {}
+    void visit(const ExpressionStrcasecmp* expr) final {}
+    void visit(const ExpressionSubstrBytes* expr) final {}
+    void visit(const ExpressionSubstrCP* expr) final {}
+    void visit(const ExpressionStrLenBytes* expr) final {}
+    void visit(const ExpressionBinarySize* expr) final {}
+    void visit(const ExpressionStrLenCP* expr) final {}
+    void visit(const ExpressionSubtract* expr) final {}
+    void visit(const ExpressionSwitch* expr) final {
         _context->evalStack.emplaceFrame(EvalStage{});
     }
-    void visit(ExpressionTestApiVersion* expr) final {}
-    void visit(ExpressionToLower* expr) final {}
-    void visit(ExpressionToUpper* expr) final {}
-    void visit(ExpressionTrim* expr) final {}
-    void visit(ExpressionTrunc* expr) final {}
-    void visit(ExpressionType* expr) final {}
-    void visit(ExpressionZip* expr) final {}
-    void visit(ExpressionConvert* expr) final {}
-    void visit(ExpressionRegexFind* expr) final {}
-    void visit(ExpressionRegexFindAll* expr) final {}
-    void visit(ExpressionRegexMatch* expr) final {}
-    void visit(ExpressionCosine* expr) final {}
-    void visit(ExpressionSine* expr) final {}
-    void visit(ExpressionTangent* expr) final {}
-    void visit(ExpressionArcCosine* expr) final {}
-    void visit(ExpressionArcSine* expr) final {}
-    void visit(ExpressionArcTangent* expr) final {}
-    void visit(ExpressionArcTangent2* expr) final {}
-    void visit(ExpressionHyperbolicArcTangent* expr) final {}
-    void visit(ExpressionHyperbolicArcCosine* expr) final {}
-    void visit(ExpressionHyperbolicArcSine* expr) final {}
-    void visit(ExpressionHyperbolicTangent* expr) final {}
-    void visit(ExpressionHyperbolicCosine* expr) final {}
-    void visit(ExpressionHyperbolicSine* expr) final {}
-    void visit(ExpressionDegreesToRadians* expr) final {}
-    void visit(ExpressionRadiansToDegrees* expr) final {}
-    void visit(ExpressionDayOfMonth* expr) final {}
-    void visit(ExpressionDayOfWeek* expr) final {}
-    void visit(ExpressionDayOfYear* expr) final {}
-    void visit(ExpressionHour* expr) final {}
-    void visit(ExpressionMillisecond* expr) final {}
-    void visit(ExpressionMinute* expr) final {}
-    void visit(ExpressionMonth* expr) final {}
-    void visit(ExpressionSecond* expr) final {}
-    void visit(ExpressionWeek* expr) final {}
-    void visit(ExpressionIsoWeekYear* expr) final {}
-    void visit(ExpressionIsoDayOfWeek* expr) final {}
-    void visit(ExpressionIsoWeek* expr) final {}
-    void visit(ExpressionYear* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorAvg>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorMax>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorMin>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorSum>* expr) final {}
-    void visit(ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {}
-    void visit(ExpressionTests::Testable* expr) final {}
-    void visit(ExpressionInternalJsEmit* expr) final {}
-    void visit(ExpressionInternalFindSlice* expr) final {}
-    void visit(ExpressionInternalFindPositional* expr) final {}
-    void visit(ExpressionInternalFindElemMatch* expr) final {}
-    void visit(ExpressionFunction* expr) final {}
-    void visit(ExpressionRandom* expr) final {}
-    void visit(ExpressionToHashedIndexKey* expr) final {}
-    void visit(ExpressionDateAdd* expr) final {}
-    void visit(ExpressionDateSubtract* expr) final {}
-    void visit(ExpressionGetField* expr) final {}
+    void visit(const ExpressionTestApiVersion* expr) final {}
+    void visit(const ExpressionToLower* expr) final {}
+    void visit(const ExpressionToUpper* expr) final {}
+    void visit(const ExpressionTrim* expr) final {}
+    void visit(const ExpressionTrunc* expr) final {}
+    void visit(const ExpressionType* expr) final {}
+    void visit(const ExpressionZip* expr) final {}
+    void visit(const ExpressionConvert* expr) final {}
+    void visit(const ExpressionRegexFind* expr) final {}
+    void visit(const ExpressionRegexFindAll* expr) final {}
+    void visit(const ExpressionRegexMatch* expr) final {}
+    void visit(const ExpressionCosine* expr) final {}
+    void visit(const ExpressionSine* expr) final {}
+    void visit(const ExpressionTangent* expr) final {}
+    void visit(const ExpressionArcCosine* expr) final {}
+    void visit(const ExpressionArcSine* expr) final {}
+    void visit(const ExpressionArcTangent* expr) final {}
+    void visit(const ExpressionArcTangent2* expr) final {}
+    void visit(const ExpressionHyperbolicArcTangent* expr) final {}
+    void visit(const ExpressionHyperbolicArcCosine* expr) final {}
+    void visit(const ExpressionHyperbolicArcSine* expr) final {}
+    void visit(const ExpressionHyperbolicTangent* expr) final {}
+    void visit(const ExpressionHyperbolicCosine* expr) final {}
+    void visit(const ExpressionHyperbolicSine* expr) final {}
+    void visit(const ExpressionDegreesToRadians* expr) final {}
+    void visit(const ExpressionRadiansToDegrees* expr) final {}
+    void visit(const ExpressionDayOfMonth* expr) final {}
+    void visit(const ExpressionDayOfWeek* expr) final {}
+    void visit(const ExpressionDayOfYear* expr) final {}
+    void visit(const ExpressionHour* expr) final {}
+    void visit(const ExpressionMillisecond* expr) final {}
+    void visit(const ExpressionMinute* expr) final {}
+    void visit(const ExpressionMonth* expr) final {}
+    void visit(const ExpressionSecond* expr) final {}
+    void visit(const ExpressionWeek* expr) final {}
+    void visit(const ExpressionIsoWeekYear* expr) final {}
+    void visit(const ExpressionIsoDayOfWeek* expr) final {}
+    void visit(const ExpressionIsoWeek* expr) final {}
+    void visit(const ExpressionYear* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorAvg>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorMax>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorMin>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorSum>* expr) final {}
+    void visit(const ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {}
+    void visit(const ExpressionTests::Testable* expr) final {}
+    void visit(const ExpressionInternalJsEmit* expr) final {}
+    void visit(const ExpressionInternalFindSlice* expr) final {}
+    void visit(const ExpressionInternalFindPositional* expr) final {}
+    void visit(const ExpressionInternalFindElemMatch* expr) final {}
+    void visit(const ExpressionFunction* expr) final {}
+    void visit(const ExpressionRandom* expr) final {}
+    void visit(const ExpressionToHashedIndexKey* expr) final {}
+    void visit(const ExpressionDateAdd* expr) final {}
+    void visit(const ExpressionDateSubtract* expr) final {}
+    void visit(const ExpressionGetField* expr) final {}
+    void visit(const ExpressionSetField* expr) final {}
+    void visit(const ExpressionTsSecond* expr) final {}
+    void visit(const ExpressionTsIncrement* expr) final {}
 
 private:
-    void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
+    void visitMultiBranchLogicExpression(const Expression* expr, sbe::EPrimBinary::Op logicOp) {
         // The infix visitor should only visit expressions with more than one child.
         invariant(expr->getChildren().size() >= 2);
         invariant(logicOp == sbe::EPrimBinary::logicOr || logicOp == sbe::EPrimBinary::logicAnd);
@@ -718,7 +698,7 @@ struct DoubleBound {
     bool inclusive;
 };
 
-class ExpressionPostVisitor final : public ExpressionVisitor {
+class ExpressionPostVisitor final : public ExpressionConstVisitor {
 public:
     ExpressionPostVisitor(ExpressionVisitorContext* context) : _context{context} {}
 
@@ -728,13 +708,13 @@ public:
         Union,
     };
 
-    void visit(ExpressionConstant* expr) final {
-        auto [tag, val] = convertFrom(expr->getValue());
+    void visit(const ExpressionConstant* expr) final {
+        auto [tag, val] = makeValue(expr->getValue());
         _context->pushExpr(sbe::makeE<sbe::EConstant>(tag, val));
     }
 
-    void visit(ExpressionAbs* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionAbs* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -753,10 +733,10 @@ public:
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(absExpr)));
     }
 
-    void visit(ExpressionAdd* expr) final {
+    void visit(const ExpressionAdd* expr) final {
         size_t arity = expr->getChildren().size();
         _context->ensureArity(arity);
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
 
         auto generateNotNumberOrDate = [frameId](const sbe::value::SlotId slotId) {
             sbe::EVariable var{frameId, slotId};
@@ -772,25 +752,38 @@ public:
             sbe::EVariable lhsVar{frameId, 0};
             sbe::EVariable rhsVar{frameId, 1};
 
-            auto addExpr = sbe::makeE<sbe::EIf>(
-                makeBinaryOp(sbe::EPrimBinary::logicOr,
-                             generateNullOrMissing(frameId, 0),
-                             generateNullOrMissing(frameId, 1)),
-                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
-                sbe::makeE<sbe::EIf>(
-                    makeBinaryOp(sbe::EPrimBinary::logicOr,
-                                 generateNotNumberOrDate(0),
-                                 generateNotNumberOrDate(1)),
-                    sbe::makeE<sbe::EFail>(
-                        ErrorCodes::Error{4974201},
-                        "only numbers and dates are allowed in an $add expression"),
-                    sbe::makeE<sbe::EIf>(
-                        makeBinaryOp(sbe::EPrimBinary::logicAnd,
-                                     makeFunction("isDate", lhsVar.clone()),
-                                     makeFunction("isDate", rhsVar.clone())),
-                        sbe::makeE<sbe::EFail>(ErrorCodes::Error{4974202},
-                                               "only one date allowed in an $add expression"),
-                        makeBinaryOp(sbe::EPrimBinary::add, lhsVar.clone(), rhsVar.clone()))));
+            auto addExpr = makeLocalBind(
+                _context->state.frameIdGenerator,
+                [&](sbe::EVariable lhsIsDate, sbe::EVariable rhsIsDate) {
+                    return buildMultiBranchConditional(
+                        CaseValuePair{makeBinaryOp(sbe::EPrimBinary::logicOr,
+                                                   generateNullOrMissing(frameId, 0),
+                                                   generateNullOrMissing(frameId, 1)),
+                                      sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+                        CaseValuePair{
+                            makeBinaryOp(sbe::EPrimBinary::logicOr,
+                                         generateNotNumberOrDate(0),
+                                         generateNotNumberOrDate(1)),
+                            sbe::makeE<sbe::EFail>(
+                                ErrorCodes::Error{4974201},
+                                "only numbers and dates are allowed in an $add expression")},
+                        CaseValuePair{
+                            makeBinaryOp(
+                                sbe::EPrimBinary::logicAnd, lhsIsDate.clone(), rhsIsDate.clone()),
+                            sbe::makeE<sbe::EFail>(ErrorCodes::Error{4974202},
+                                                   "only one date allowed in an $add expression")},
+                        // An EPrimBinary::add expression, which compiles directly into an "add"
+                        // instruction, efficiently handles the general case for for $add with
+                        // exactly two operands, but when one of the operands is a date, we need to
+                        // use the "doubleDoubleSum" function to perform the required conversions.
+                        CaseValuePair{
+                            makeBinaryOp(
+                                sbe::EPrimBinary::logicOr, lhsIsDate.clone(), rhsIsDate.clone()),
+                            makeFunction("doubleDoubleSum", lhsVar.clone(), rhsVar.clone())},
+                        makeBinaryOp(sbe::EPrimBinary::add, lhsVar.clone(), rhsVar.clone()));
+                },
+                makeFunction("isDate", lhsVar.clone()),
+                makeFunction("isDate", rhsVar.clone()));
 
             _context->pushExpr(
                 sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(addExpr)));
@@ -846,25 +839,25 @@ public:
         }
     }
 
-    void visit(ExpressionAllElementsTrue* expr) final {
+    void visit(const ExpressionAllElementsTrue* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionAnd* expr) final {
+    void visit(const ExpressionAnd* expr) final {
         visitMultiBranchLogicExpression(expr, sbe::EPrimBinary::logicAnd);
     }
-    void visit(ExpressionAnyElementTrue* expr) final {
+    void visit(const ExpressionAnyElementTrue* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionArray* expr) final {
+    void visit(const ExpressionArray* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionArrayElemAt* expr) final {
+    void visit(const ExpressionArrayElemAt* expr) final {
         _context->ensureArity(2);
 
         auto index = _context->popExpr();
         auto array = _context->popExpr();
 
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(std::move(array), std::move(index));
         sbe::EVariable arrayRef{frameId, 0};
         sbe::EVariable indexRef{frameId, 1};
@@ -872,7 +865,7 @@ public:
         auto int32Index = [&]() {
             auto convertedIndex = sbe::makeE<sbe::ENumericConvert>(
                 indexRef.clone(), sbe::value::TypeTags::NumberInt32);
-            auto frameId = _context->frameIdGenerator->generate();
+            auto frameId = _context->state.frameId();
             auto binds = sbe::makeEs(std::move(convertedIndex));
             sbe::EVariable convertedIndexRef{frameId, 0};
 
@@ -905,26 +898,26 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(arrayElemAtExpr)));
     }
-    void visit(ExpressionFirst* expr) final {
+    void visit(const ExpressionFirst* expr) final {
         buildArrayAccessByConstantIndex(_context, expr->getOpName(), 0);
     }
-    void visit(ExpressionLast* expr) final {
+    void visit(const ExpressionLast* expr) final {
         buildArrayAccessByConstantIndex(_context, expr->getOpName(), -1);
     }
-    void visit(ExpressionObjectToArray* expr) final {
+    void visit(const ExpressionObjectToArray* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionArrayToObject* expr) final {
+    void visit(const ExpressionArrayToObject* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionBsonSize* expr) final {
+    void visit(const ExpressionBsonSize* expr) final {
         // Build an expression which evaluates the size of a BSON document and validates the input
         // argument.
         // 1. If the argument is null or empty, return null.
         // 2. Else, if the argument is a BSON document, return its size.
         // 3. Else, raise an error.
 
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -939,8 +932,8 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(bsonSizeExpr)));
     }
-    void visit(ExpressionCeil* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionCeil* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -955,19 +948,19 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(ceilExpr)));
     }
-    void visit(ExpressionCoerceToBool* expr) final {
+    void visit(const ExpressionCoerceToBool* expr) final {
         // Since $coerceToBool is internal-only and there are not yet any input expressions that
         // generate an ExpressionCoerceToBool expression, we will leave it as unreachable for now.
         MONGO_UNREACHABLE;
     }
-    void visit(ExpressionCompare* expr) final {
+    void visit(const ExpressionCompare* expr) final {
         _context->ensureArity(2);
         std::vector<std::unique_ptr<sbe::EExpression>> operands(2);
         for (auto it = operands.rbegin(); it != operands.rend(); ++it) {
             *it = _context->popExpr();
         }
 
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         sbe::EVariable lhsRef(frameId, 0);
         sbe::EVariable rhsRef(frameId, 1);
 
@@ -995,7 +988,7 @@ public:
         // comparisons (for example, a number will always compare as less than a string). The other
         // comparison primitives are designed for comparing values of the same type.
         auto cmp3w = makeBinaryOp(
-            sbe::EPrimBinary::cmp3w, lhsRef.clone(), rhsRef.clone(), _context->runtimeEnvironment);
+            sbe::EPrimBinary::cmp3w, lhsRef.clone(), rhsRef.clone(), _context->state.env);
         auto cmp = (comparisonOperator == sbe::EPrimBinary::cmp3w)
             ? std::move(cmp3w)
             : makeBinaryOp(comparisonOperator,
@@ -1026,10 +1019,10 @@ public:
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(operands), std::move(cmpWithFallback)));
     }
 
-    void visit(ExpressionConcat* expr) final {
+    void visit(const ExpressionConcat* expr) final {
         auto arity = expr->getChildren().size();
         _context->ensureArity(arity);
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
 
         std::vector<std::unique_ptr<sbe::EExpression>> binds;
         std::vector<std::unique_ptr<sbe::EExpression>> checkNullArg;
@@ -1075,7 +1068,7 @@ public:
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(concatExpr)));
     }
 
-    void visit(ExpressionConcatArrays* expr) final {
+    void visit(const ExpressionConcatArrays* expr) final {
         // Pop eval frames pushed by pre and in visitors off the stack.
         std::vector<EvalExprStagePair> branches;
         auto numChildren = expr->getChildren().size();
@@ -1093,18 +1086,18 @@ public:
         };
 
         auto makeNullLimitCoscanTree = [&]() {
-            auto outputSlot = _context->slotIdGenerator->generate();
+            auto outputSlot = _context->state.slotId();
             auto nullEvalStage =
                 makeProject({makeLimitCoScanTree(_context->planNodeId), sbe::makeSV()},
                             _context->planNodeId,
                             outputSlot,
                             sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0));
-            return EvalExprStagePair{outputSlot, std::move(nullEvalStage)};
+            return std::make_pair(outputSlot, std::move(nullEvalStage));
         };
 
         // Build a union stage to consolidate array input branches into a stream.
-        auto [unionEvalExpr, unionEvalStage] =
-            generateUnion(std::move(branches), {}, _context->planNodeId, _context->slotIdGenerator);
+        auto [unionEvalExpr, unionEvalStage] = generateUnion(
+            std::move(branches), {}, _context->planNodeId, _context->state.slotIdGenerator);
         auto unionSlot = getUnionOutputSlot(unionEvalExpr);
         sbe::EVariable unionVar{unionSlot};
 
@@ -1126,26 +1119,27 @@ public:
         unionWithNullBranches.emplace_back(sbe::makeE<sbe::EVariable>(unionSlot),
                                            std::move(filter));
         unionWithNullBranches.emplace_back(makeNullLimitCoscanTree());
-        auto [unionWithNullExpr, unionWithNullStage] = generateUnion(
-            std::move(unionWithNullBranches), {}, _context->planNodeId, _context->slotIdGenerator);
+        auto [unionWithNullExpr, unionWithNullStage] =
+            generateUnion(std::move(unionWithNullBranches),
+                          {},
+                          _context->planNodeId,
+                          _context->state.slotIdGenerator);
         auto unionWithNullSlot = getUnionOutputSlot(unionWithNullExpr);
 
         // Create a limit stage to EOF once numChildren results have been obtained.
         auto limitNumChildren =
-            makeLimitTree(std::move(unionWithNullStage.stage), _context->planNodeId, numChildren);
+            makeLimitSkip(std::move(unionWithNullStage), _context->planNodeId, numChildren);
 
         // Create a group stage to aggregate elements into a single array.
-        auto collatorSlot = _context->runtimeEnvironment->getSlotIfExists("collator"_sd);
+        auto collatorSlot = _context->state.env->getSlotIfExists("collator"_sd);
         auto addToArrayExpr =
             makeFunction("addToArray", sbe::makeE<sbe::EVariable>(unionWithNullSlot));
-        auto groupSlot = _context->slotIdGenerator->generate();
-        auto groupStage =
-            sbe::makeS<sbe::HashAggStage>(std::move(limitNumChildren),
-                                          sbe::makeSV(),
-                                          sbe::makeEM(groupSlot, std::move(addToArrayExpr)),
-                                          collatorSlot,
-                                          _context->planNodeId);
-        EvalStage groupEvalStage = {std::move(groupStage), sbe::makeSV(groupSlot)};
+        auto groupSlot = _context->state.slotId();
+        auto groupStage = makeHashAgg(std::move(limitNumChildren),
+                                      sbe::makeSV(),
+                                      sbe::makeEM(groupSlot, std::move(addToArrayExpr)),
+                                      collatorSlot,
+                                      _context->planNodeId);
 
         // Build subtree to handle nulls. If an input is null, return null. Otherwise, unwind the
         // input twice, and concatenate it into an array using addToArray. This is necessary to
@@ -1157,9 +1151,9 @@ public:
         // of inputs.
         auto unwindEvalStage = makeUnwind(
             makeUnwind({makeLimitCoScanStage(_context->planNodeId).stage, sbe::makeSV(groupSlot)},
-                       _context->slotIdGenerator,
+                       _context->state.slotIdGenerator,
                        _context->planNodeId),
-            _context->slotIdGenerator,
+            _context->state.slotIdGenerator,
             _context->planNodeId);
         auto unwindSlot = unwindEvalStage.outSlots.front();
 
@@ -1167,31 +1161,32 @@ public:
         // output when the input consists entirely of arrays.
         auto finalAddToArrayExpr =
             makeFunction("addToArray", sbe::makeE<sbe::EVariable>(unwindSlot));
-        auto finalGroupSlot = _context->slotIdGenerator->generate();
-        auto finalGroupStage = sbe::makeS<sbe::HashAggStage>(
-            std::move(unwindEvalStage.stage),
-            sbe::makeSV(),
-            sbe::makeEM(finalGroupSlot, std::move(finalAddToArrayExpr)),
-            collatorSlot,
-            _context->planNodeId);
+        auto finalGroupSlot = _context->state.slotId();
+        auto finalGroupStage =
+            makeHashAgg(std::move(unwindEvalStage),
+                        sbe::makeSV(),
+                        sbe::makeEM(finalGroupSlot, std::move(finalAddToArrayExpr)),
+                        collatorSlot,
+                        _context->planNodeId);
 
         // Create a branch stage to select between the branch that produces one null if any elements
         // in the original input were null or missing, or otherwise select the branch that unwinds
         // and concatenates elements into the output array.
-        auto [nullExpr, nullStage] = makeNullLimitCoscanTree();
+        auto [nullSlot, nullStage] = makeNullLimitCoscanTree();
         auto nullIsMemberExpr =
             makeIsMember(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
                          sbe::makeE<sbe::EVariable>(groupSlot));
-        auto branchNullEvalStage =
-            makeBranch(std::move(nullIsMemberExpr),
-                       std::move(nullStage),
-                       {std::move(finalGroupStage), sbe::makeSV(finalGroupSlot)},
-                       _context->slotIdGenerator,
-                       _context->planNodeId);
-        auto branchSlot = branchNullEvalStage.outSlots.front();
+        auto branchSlot = _context->state.slotId();
+        auto branchNullEvalStage = makeBranch(std::move(nullStage),
+                                              std::move(finalGroupStage),
+                                              std::move(nullIsMemberExpr),
+                                              sbe::makeSV(nullSlot),
+                                              sbe::makeSV(finalGroupSlot),
+                                              sbe::makeSV(branchSlot),
+                                              _context->planNodeId);
 
         // Create nlj to connect outer group with inner branch that handles null input.
-        auto nljStage = makeLoopJoin(std::move(groupEvalStage),
+        auto nljStage = makeLoopJoin(std::move(groupStage),
                                      std::move(branchNullEvalStage),
                                      _context->planNodeId,
                                      _context->getLexicalEnvironment());
@@ -1204,12 +1199,12 @@ public:
 
         _context->pushExpr(sbe::makeE<sbe::EVariable>(branchSlot), std::move(finalNljStage));
     }
-    void visit(ExpressionCond* expr) final {
+    void visit(const ExpressionCond* expr) final {
         visitConditionalExpression(expr);
     }
-    void visit(ExpressionDateDiff* expr) final {
+    void visit(const ExpressionDateDiff* expr) final {
         using namespace std::literals;
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         std::vector<std::unique_ptr<sbe::EExpression>> arguments;
         std::vector<std::unique_ptr<sbe::EExpression>> bindings;
         sbe::EVariable startDateRef(frameId, 0);
@@ -1235,7 +1230,7 @@ public:
         auto endDateExpression = _context->popExpr();
         auto startDateExpression = _context->popExpr();
 
-        auto timezoneDBSlot = _context->runtimeEnvironment->getSlot("timeZoneDB"_sd);
+        auto timezoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
 
         //  Set parameters for an invocation of built-in "dateDiff" function.
         arguments.push_back(sbe::makeE<sbe::EVariable>(timezoneDBSlot));
@@ -1335,10 +1330,10 @@ public:
         _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
             frameId, std::move(bindings), std::move(dateDiffExpression)));
     }
-    void visit(ExpressionDateFromString* expr) final {
+    void visit(const ExpressionDateFromString* expr) final {
         unsupportedExpression("$dateFromString");
     }
-    void visit(ExpressionDateFromParts* expr) final {
+    void visit(const ExpressionDateFromParts* expr) final {
         // This expression can carry null children depending on the set of fields provided,
         // to compute a date from parts so we only need to pop if a child exists.
         auto children = expr->getChildren();
@@ -1361,7 +1356,7 @@ public:
         // isoWeekYear inputs are provided so we don't need to enforce that at this depth.
         auto isIsoWeekYear = eIsoWeekYear ? true : false;
 
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         sbe::EVariable yearRef(frameId, 0);
         sbe::EVariable monthRef(frameId, 1);
         sbe::EVariable dayRef(frameId, 2);
@@ -1472,7 +1467,7 @@ public:
             } else {
                 boundChecks.push_back(boundedCheck(yearRef, 1, 9999, "isoWeekYear"));
                 operands.push_back(fieldConversionBinding(
-                    std::move(eIsoWeekYear), _context->frameIdGenerator, "isoWeekYear"));
+                    std::move(eIsoWeekYear), _context->state.frameIdGenerator, "isoWeekYear"));
             }
             if (!eIsoWeek) {
                 eIsoWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1481,7 +1476,7 @@ public:
             } else {
                 boundChecks.push_back(boundedCheck(monthRef, minInt16, maxInt16, "isoWeek"));
                 operands.push_back(fieldConversionBinding(
-                    std::move(eIsoWeek), _context->frameIdGenerator, "isoWeek"));
+                    std::move(eIsoWeek), _context->state.frameIdGenerator, "isoWeek"));
             }
             if (!eIsoDayOfWeek) {
                 eIsoDayOfWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1490,7 +1485,7 @@ public:
             } else {
                 boundChecks.push_back(boundedCheck(dayRef, minInt16, maxInt16, "isoDayOfWeek"));
                 operands.push_back(fieldConversionBinding(
-                    std::move(eIsoDayOfWeek), _context->frameIdGenerator, "isoDayOfWeek"));
+                    std::move(eIsoDayOfWeek), _context->state.frameIdGenerator, "isoDayOfWeek"));
             }
         } else {
             // The regular year/month/day case.
@@ -1500,8 +1495,8 @@ public:
                 operands.push_back(std::move(eYear));
             } else {
                 boundChecks.push_back(boundedCheck(yearRef, 1, 9999, "year"));
-                operands.push_back(
-                    fieldConversionBinding(std::move(eYear), _context->frameIdGenerator, "year"));
+                operands.push_back(fieldConversionBinding(
+                    std::move(eYear), _context->state.frameIdGenerator, "year"));
             }
             if (!eMonth) {
                 eMonth = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1509,8 +1504,8 @@ public:
                 operands.push_back(std::move(eMonth));
             } else {
                 boundChecks.push_back(boundedCheck(monthRef, minInt16, maxInt16, "month"));
-                operands.push_back(
-                    fieldConversionBinding(std::move(eMonth), _context->frameIdGenerator, "month"));
+                operands.push_back(fieldConversionBinding(
+                    std::move(eMonth), _context->state.frameIdGenerator, "month"));
             }
             if (!eDay) {
                 eDay = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1518,8 +1513,8 @@ public:
                 operands.push_back(std::move(eDay));
             } else {
                 boundChecks.push_back(boundedCheck(dayRef, minInt16, maxInt16, "day"));
-                operands.push_back(
-                    fieldConversionBinding(std::move(eDay), _context->frameIdGenerator, "day"));
+                operands.push_back(fieldConversionBinding(
+                    std::move(eDay), _context->state.frameIdGenerator, "day"));
             }
         }
         if (!eHour) {
@@ -1529,7 +1524,7 @@ public:
         } else {
             boundChecks.push_back(boundedCheck(hourRef, minInt16, maxInt16, "hour"));
             operands.push_back(
-                fieldConversionBinding(std::move(eHour), _context->frameIdGenerator, "hour"));
+                fieldConversionBinding(std::move(eHour), _context->state.frameIdGenerator, "hour"));
         }
         if (!eMinute) {
             eMinute = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1537,8 +1532,8 @@ public:
             operands.push_back(std::move(eMinute));
         } else {
             boundChecks.push_back(boundedCheck(minRef, minInt16, maxInt16, "minute"));
-            operands.push_back(
-                fieldConversionBinding(std::move(eMinute), _context->frameIdGenerator, "minute"));
+            operands.push_back(fieldConversionBinding(
+                std::move(eMinute), _context->state.frameIdGenerator, "minute"));
         }
         if (!eSecond) {
             eSecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1547,8 +1542,8 @@ public:
         } else {
             // MQL doesn't place bound restrictions on the second field, because seconds carry over
             // to minutes and can be large ints such as 71,841,012 or even unix epochs.
-            operands.push_back(
-                fieldConversionBinding(std::move(eSecond), _context->frameIdGenerator, "second"));
+            operands.push_back(fieldConversionBinding(
+                std::move(eSecond), _context->state.frameIdGenerator, "second"));
         }
         if (!eMillisecond) {
             eMillisecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
@@ -1558,14 +1553,14 @@ public:
             // MQL doesn't enforce bound restrictions on millisecond fields because milliseconds
             // carry over to seconds.
             operands.push_back(fieldConversionBinding(
-                std::move(eMillisecond), _context->frameIdGenerator, "millisecond"));
+                std::move(eMillisecond), _context->state.frameIdGenerator, "millisecond"));
         }
         if (!eTimezone) {
             eTimezone = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::StringSmall, 0);
             operands.push_back(std::move(eTimezone));
         } else {
             // Validate that eTimezone is a string.
-            auto tzFrameId = _context->frameIdGenerator->generate();
+            auto tzFrameId = _context->state.frameId();
             sbe::EVariable timezoneRef(tzFrameId, 0);
             operands.push_back(sbe::makeE<sbe::ELocalBind>(
                 tzFrameId,
@@ -1604,7 +1599,7 @@ public:
         // for datetime computation. This global object is registered as an unowned value in the
         // runtime environment so we pass the corresponding slot to the datePartsWeekYear and
         // dateParts functions as a variable.
-        auto timeZoneDBSlot = _context->runtimeEnvironment->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto computeDate = makeFunction(isIsoWeekYear ? "datePartsWeekYear" : "dateParts",
                                         sbe::makeE<sbe::EVariable>(timeZoneDBSlot),
                                         yearRef.clone(),
@@ -1639,8 +1634,8 @@ public:
             frameId, std::move(operands), std::move(computeDateOrNull)));
     }
 
-    void visit(ExpressionDateToParts* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionDateToParts* expr) final {
+        auto frameId = _context->state.frameId();
         auto children = expr->getChildren();
         std::unique_ptr<sbe::EExpression> date, timezone, isoflag;
         std::unique_ptr<sbe::EExpression> totalExprDateToParts;
@@ -1672,10 +1667,9 @@ public:
         }
 
         // Add timezoneDB to arguments.
-        args.push_back(
-            sbe::makeE<sbe::EVariable>(_context->runtimeEnvironment->getSlot("timeZoneDB"_sd)));
+        args.push_back(sbe::makeE<sbe::EVariable>(_context->state.env->getSlot("timeZoneDB"_sd)));
         isoargs.push_back(
-            sbe::makeE<sbe::EVariable>(_context->runtimeEnvironment->getSlot("timeZoneDB"_sd)));
+            sbe::makeE<sbe::EVariable>(_context->state.env->getSlot("timeZoneDB"_sd)));
 
         // Add date to arguments.
         operands.push_back(std::move(date));
@@ -1709,13 +1703,12 @@ public:
             CaseValuePair{makeNot(makeFunction("isString", timezoneRef.clone())),
                           sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997701},
                                                  "$dateToParts timezone must be a string")},
-            CaseValuePair{
-                makeNot(makeFunction("isTimezone",
-                                     sbe::makeE<sbe::EVariable>(
-                                         _context->runtimeEnvironment->getSlot("timeZoneDB"_sd)),
-                                     timezoneRef.clone())),
-                sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997704},
-                                       "$dateToParts timezone must be a valid timezone")},
+            CaseValuePair{makeNot(makeFunction("isTimezone",
+                                               sbe::makeE<sbe::EVariable>(
+                                                   _context->state.env->getSlot("timeZoneDB"_sd)),
+                                               timezoneRef.clone())),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997704},
+                                                 "$dateToParts timezone must be a valid timezone")},
             CaseValuePair{generateNullOrMissing(frameId, 2),
                           sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
             CaseValuePair{makeNot(sbe::makeE<sbe::ETypeMatch>(isoflagRef.clone(), isoTypeMask)),
@@ -1731,19 +1724,19 @@ public:
         _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
             frameId, std::move(operands), std::move(totalDateToPartsFunc)));
     }
-    void visit(ExpressionDateToString* expr) final {
+    void visit(const ExpressionDateToString* expr) final {
         unsupportedExpression("$dateFromString");
     }
-    void visit(ExpressionDateTrunc*) final {
+    void visit(const ExpressionDateTrunc*) final {
         unsupportedExpression("$dateTrunc");
     }
-    void visit(ExpressionDivide* expr) final {
+    void visit(const ExpressionDivide* expr) final {
         _context->ensureArity(2);
 
         auto rhs = _context->popExpr();
         auto lhs = _context->popExpr();
 
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(std::move(lhs), std::move(rhs));
         sbe::EVariable lhsRef{frameId, 0};
         sbe::EVariable rhsRef{frameId, 1};
@@ -1767,8 +1760,8 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(divideExpr)));
     }
-    void visit(ExpressionExp* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionExp* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -1783,21 +1776,38 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(expExpr)));
     }
-    void visit(ExpressionFieldPath* expr) final {
-        if (expr->getVariableId() == Variables::kRemoveId) {
-            // The case of $$REMOVE. Note that MQL allows a path in this situation (e.g.,
-            // "$$REMOVE.foo.bar") but ignores it.
-            _context->pushExpr(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0));
-            return;
-        }
-
+    void visit(const ExpressionFieldPath* expr) final {
         sbe::value::SlotId slotId;
-        if (!expr->isVariableReference()) {
-            slotId = _context->rootSlot;
+
+        if (!Variables::isUserDefinedVariable(expr->getVariableId())) {
+            if (expr->getVariableId() == Variables::kRootId) {
+                slotId = _context->rootSlot;
+            } else if (expr->getVariableId() == Variables::kRemoveId) {
+                // For the field paths that begin with "$$REMOVE", we always produce Nothing,
+                // so no traversal is necessary.
+                _context->pushExpr(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0));
+                return;
+            } else {
+                auto it = Variables::kIdToBuiltinVarName.find(expr->getVariableId());
+                tassert(5611300,
+                        "Encountered unexpected system variable ID",
+                        it != Variables::kIdToBuiltinVarName.end());
+
+                auto variableSlot = _context->state.env->getSlotIfExists(it->second);
+                uassert(5611301,
+                        str::stream()
+                            << "Builtin variable '$$" << it->second << "' is not available",
+                        variableSlot.has_value());
+
+                slotId = *variableSlot;
+            }
         } else {
             auto it = _context->environment.find(expr->getVariableId());
-            invariant(it != _context->environment.end());
-            slotId = it->second;
+            if (it != _context->environment.end()) {
+                slotId = it->second;
+            } else {
+                slotId = _context->state.getGlobalVariableSlot(expr->getVariableId());
+            }
         }
 
         if (expr->getFieldPath().getPathLength() == 1) {
@@ -1814,11 +1824,11 @@ public:
                                                     expectsDocumentInputOnly,
                                                     expr->getFieldPathWithoutCurrentPrefix(),
                                                     _context->planNodeId,
-                                                    _context->slotIdGenerator);
+                                                    _context->state.slotIdGenerator);
 
         _context->pushExpr(sbe::makeE<sbe::EVariable>(outputSlot), std::move(stage));
     }
-    void visit(ExpressionFilter* expr) final {
+    void visit(const ExpressionFilter* expr) final {
         // Extract filter predicate expression and sub-tree.
         auto [filterPredicate, filterStage] = _context->popFrame();
 
@@ -1850,7 +1860,7 @@ public:
         //         fail()
         // )
         // <current sub-tree stage>
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(std::move(input));
         sbe::EVariable inputRef(frameId, 0);
 
@@ -1872,7 +1882,7 @@ public:
                                              std::move(inputArray));
 
         auto inputIsNotNullish = makeNot(generateNullOrMissing(inputArrayVariable));
-        auto inputIsNotNullishSlot = _context->slotIdGenerator->generate();
+        auto inputIsNotNullishSlot = _context->state.slotId();
         auto fromBranch = makeProject(std::move(projectInputArray),
                                       _context->planNodeId,
                                       inputIsNotNullishSlot,
@@ -1887,7 +1897,7 @@ public:
         //
         // Filter predicate can return non-boolean values. To fix this, we generate expression to
         // coerce it to bool type.
-        frameId = _context->frameIdGenerator->generate();
+        frameId = _context->state.frameId();
         auto boolFilterPredicate =
             sbe::makeE<sbe::ELocalBind>(frameId,
                                         sbe::makeEs(std::move(filterPredicate)),
@@ -1906,7 +1916,7 @@ public:
         //   evaluated to true
         // * inputArraySlot - slot where 'in' branch of traverse stage stores current array
         //   element if it satisfies the filter predicate
-        auto filteredArraySlot = _context->slotIdGenerator->generate();
+        auto filteredArraySlot = _context->state.slotId();
         auto traverseStage = makeTraverse(std::move(fromBranch),
                                           std::move(innerBranch),
                                           inputArraySlot /* inField */,
@@ -1927,8 +1937,8 @@ public:
 
         _context->pushExpr(std::move(result), std::move(traverseStage));
     }
-    void visit(ExpressionFloor* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionFloor* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -1943,7 +1953,7 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(floorExpr)));
     }
-    void visit(ExpressionIfNull* expr) final {
+    void visit(const ExpressionIfNull* expr) final {
         auto numChildren = expr->getChildren().size();
         invariant(numChildren >= 2);
 
@@ -1976,7 +1986,7 @@ public:
         };
 
         auto [resultExpr, opStage] = generateSingleResultUnion(
-            std::move(branches), branchFn, _context->planNodeId, _context->slotIdGenerator);
+            std::move(branches), branchFn, _context->planNodeId, _context->state.slotIdGenerator);
 
         auto loopJoinStage = makeLoopJoin(_context->extractCurrentEvalStage(),
                                           std::move(opStage),
@@ -1985,22 +1995,22 @@ public:
 
         _context->pushExpr(resultExpr.extractExpr(), std::move(loopJoinStage));
     }
-    void visit(ExpressionIn* expr) final {
+    void visit(const ExpressionIn* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionIndexOfArray* expr) final {
+    void visit(const ExpressionIndexOfArray* expr) final {
         unsupportedExpression(expr->getOpName());
     }
 
-    void visit(ExpressionIndexOfBytes* expr) final {
+    void visit(const ExpressionIndexOfBytes* expr) final {
         visitIndexOfFunction(expr, _context, "indexOfBytes");
     }
 
-    void visit(ExpressionIndexOfCP* expr) final {
+    void visit(const ExpressionIndexOfCP* expr) final {
         visitIndexOfFunction(expr, _context, "indexOfCP");
     }
-    void visit(ExpressionIsNumber* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionIsNumber* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2013,7 +2023,7 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(exprIsNum)));
     }
-    void visit(ExpressionLet* expr) final {
+    void visit(const ExpressionLet* expr) final {
         // The evaluated result of the $let is the evaluated result of its "in" field, which is
         // already on top of the stack. The "infix" visitor has already popped the variable
         // initializers off the expression stack.
@@ -2039,8 +2049,8 @@ public:
         // Note that there is no need to remove SlotId bindings from the the _context's environment.
         // The AST parser already enforces scope rules.
     }
-    void visit(ExpressionLn* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionLn* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2063,11 +2073,11 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(lnExpr)));
     }
-    void visit(ExpressionLog* expr) final {
+    void visit(const ExpressionLog* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionLog10* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionLog10* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2090,14 +2100,14 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(log10Expr)));
     }
-    void visit(ExpressionMap* expr) final {
+    void visit(const ExpressionMap* expr) final {
         unsupportedExpression("$map");
     }
-    void visit(ExpressionMeta* expr) final {
+    void visit(const ExpressionMeta* expr) final {
         unsupportedExpression("$meta");
     }
-    void visit(ExpressionMod* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionMod* expr) final {
+        auto frameId = _context->state.frameId();
         auto rhs = _context->popExpr();
         auto lhs = _context->popExpr();
         auto binds = sbe::makeEs(std::move(lhs), std::move(rhs));
@@ -2133,10 +2143,10 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(modExpr)));
     }
-    void visit(ExpressionMultiply* expr) final {
+    void visit(const ExpressionMultiply* expr) final {
         auto arity = expr->getChildren().size();
         _context->ensureArity(arity);
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
 
         std::vector<std::unique_ptr<sbe::EExpression>> binds;
         std::vector<std::unique_ptr<sbe::EExpression>> variables;
@@ -2197,8 +2207,8 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(multiplyExpr)));
     }
-    void visit(ExpressionNot* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionNot* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
 
         auto notExpr = makeNot(generateCoerceToBoolExpression({frameId, 0}));
@@ -2206,23 +2216,91 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(notExpr)));
     }
-    void visit(ExpressionObject* expr) final {
+    void visit(const ExpressionObject* expr) final {
         unsupportedExpression("$object");
     }
-    void visit(ExpressionOr* expr) final {
+    void visit(const ExpressionOr* expr) final {
         visitMultiBranchLogicExpression(expr, sbe::EPrimBinary::logicOr);
     }
-    void visit(ExpressionPow* expr) final {
+    void visit(const ExpressionPow* expr) final {
         unsupportedExpression("$pow");
     }
-    void visit(ExpressionRange* expr) final {
-        unsupportedExpression(expr->getOpName());
+    void visit(const ExpressionRange* expr) final {
+        auto outerFrameId = _context->state.frameId();
+        auto innerFrameId = _context->state.frameId();
+
+        sbe::EVariable startRef(outerFrameId, 0);
+        sbe::EVariable endRef(outerFrameId, 1);
+        sbe::EVariable stepRef(outerFrameId, 2);
+
+        sbe::EVariable convertedStartRef(innerFrameId, 0);
+        sbe::EVariable convertedEndRef(innerFrameId, 1);
+        sbe::EVariable convertedStepRef(innerFrameId, 2);
+
+        auto step = expr->getChildren().size() == 3
+            ? _context->popExpr()
+            : sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+        auto end = _context->popExpr();
+        auto start = _context->popExpr();
+
+        auto rangeExpr = sbe::makeE<sbe::ELocalBind>(
+            outerFrameId,
+            sbe::makeEs(std::move(start), std::move(end), std::move(step)),
+            buildMultiBranchConditional(
+                CaseValuePair{
+                    generateNonNumericCheck(startRef),
+                    sbe::makeE<sbe::EFail>(ErrorCodes::Error{5154300},
+                                           "$range only supports numeric types for start")},
+                CaseValuePair{generateNonNumericCheck(endRef),
+                              sbe::makeE<sbe::EFail>(ErrorCodes::Error{5154301},
+                                                     "$range only supports numeric types for end")},
+                CaseValuePair{
+                    generateNonNumericCheck(stepRef),
+                    sbe::makeE<sbe::EFail>(ErrorCodes::Error{5154302},
+                                           "$range only supports numeric types for step")},
+                sbe::makeE<sbe::ELocalBind>(
+                    innerFrameId,
+                    sbe::makeEs(sbe::makeE<sbe::ENumericConvert>(startRef.clone(),
+                                                                 sbe::value::TypeTags::NumberInt32),
+                                sbe::makeE<sbe::ENumericConvert>(endRef.clone(),
+                                                                 sbe::value::TypeTags::NumberInt32),
+                                sbe::makeE<sbe::ENumericConvert>(
+                                    stepRef.clone(), sbe::value::TypeTags::NumberInt32)),
+                    buildMultiBranchConditional(
+                        CaseValuePair{
+                            makeNot(makeFunction("exists", convertedStartRef.clone())),
+                            sbe::makeE<sbe::EFail>(
+                                ErrorCodes::Error{5154303},
+                                "$range start argument cannot be represented as a 32-bit integer")},
+                        CaseValuePair{
+                            makeNot(makeFunction("exists", convertedEndRef.clone())),
+                            sbe::makeE<sbe::EFail>(
+                                ErrorCodes::Error{5154304},
+                                "$range end argument cannot be represented as a 32-bit integer")},
+                        CaseValuePair{
+                            makeNot(makeFunction("exists", convertedStepRef.clone())),
+                            sbe::makeE<sbe::EFail>(
+                                ErrorCodes::Error{5154305},
+                                "$range step argument cannot be represented as a 32-bit integer")},
+                        CaseValuePair{
+                            makeBinaryOp(
+                                sbe::EPrimBinary::eq,
+                                convertedStepRef.clone(),
+                                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0)),
+                            sbe::makeE<sbe::EFail>(ErrorCodes::Error{5154306},
+                                                   "$range requires a non-zero step value")},
+                        makeFunction("newArrayFromRange",
+                                     convertedStartRef.clone(),
+                                     convertedEndRef.clone(),
+                                     convertedStepRef.clone())))));
+
+        _context->pushExpr(std::move(rangeExpr));
     }
-    void visit(ExpressionReduce* expr) final {
+    void visit(const ExpressionReduce* expr) final {
         unsupportedExpression("$reduce");
     }
-    void visit(ExpressionReplaceOne* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionReplaceOne* expr) final {
+        auto frameId = _context->state.frameId();
 
         auto replacement = _context->popExpr();
         auto find = _context->popExpr();
@@ -2282,7 +2360,7 @@ public:
         auto isEmptyFindStr = makeBinaryOp(sbe::EPrimBinary::eq,
                                            findRef.clone(),
                                            sbe::makeE<sbe::EConstant>(emptyStrTag, emptyStrVal),
-                                           _context->runtimeEnvironment);
+                                           _context->state.env);
 
         auto replaceOrReturnInputExpr = sbe::makeE<sbe::EIf>(
             std::move(isEmptyFindStr),
@@ -2297,33 +2375,33 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(replaceOneExpr)));
     }
-    void visit(ExpressionReplaceAll* expr) final {
+    void visit(const ExpressionReplaceAll* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSetDifference* expr) final {
+    void visit(const ExpressionSetDifference* expr) final {
         invariant(expr->getChildren().size() == 2);
 
         generateSetExpression(expr, SetOperation::Difference);
     }
-    void visit(ExpressionSetEquals* expr) final {
+    void visit(const ExpressionSetEquals* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSetIntersection* expr) final {
+    void visit(const ExpressionSetIntersection* expr) final {
         generateSetExpression(expr, SetOperation::Intersection);
     }
 
-    void visit(ExpressionSetIsSubset* expr) final {
+    void visit(const ExpressionSetIsSubset* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSetUnion* expr) final {
+    void visit(const ExpressionSetUnion* expr) final {
         generateSetExpression(expr, SetOperation::Union);
     }
 
-    void visit(ExpressionSize* expr) final {
+    void visit(const ExpressionSize* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionReverseArray* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionReverseArray* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef{frameId, 0};
 
@@ -2339,11 +2417,11 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(exprRevArr)));
     }
-    void visit(ExpressionSlice* expr) final {
+    void visit(const ExpressionSlice* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionIsArray* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionIsArray* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2352,11 +2430,11 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(exprIsArr)));
     }
-    void visit(ExpressionRound* expr) final {
+    void visit(const ExpressionRound* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSplit* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionSplit* expr) final {
+        auto frameId = _context->state.frameId();
         std::vector<std::unique_ptr<sbe::EExpression>> args;
         std::vector<std::unique_ptr<sbe::EExpression>> binds;
         sbe::EVariable stringExpressionRef(frameId, 0);
@@ -2389,7 +2467,7 @@ public:
             return makeBinaryOp(sbe::EPrimBinary::eq,
                                 var.clone(),
                                 sbe::makeE<sbe::EConstant>(emptyStrTag, emptyStrVal),
-                                _context->runtimeEnvironment);
+                                _context->state.env);
         };
 
         auto checkIsNullOrMissing = makeBinaryOp(sbe::EPrimBinary::logicOr,
@@ -2424,8 +2502,8 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(totalSplitFunc)));
     }
-    void visit(ExpressionSqrt* expr) final {
-        auto frameId = _context->frameIdGenerator->generate();
+    void visit(const ExpressionSqrt* expr) final {
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2444,213 +2522,225 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(lnExpr)));
     }
-    void visit(ExpressionStrcasecmp* expr) final {
+    void visit(const ExpressionStrcasecmp* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSubstrBytes* expr) final {
+    void visit(const ExpressionSubstrBytes* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSubstrCP* expr) final {
+    void visit(const ExpressionSubstrCP* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionStrLenBytes* expr) final {
+    void visit(const ExpressionStrLenBytes* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionBinarySize* expr) final {
+    void visit(const ExpressionBinarySize* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionStrLenCP* expr) final {
+    void visit(const ExpressionStrLenCP* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSubtract* expr) final {
+    void visit(const ExpressionSubtract* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionSwitch* expr) final {
+    void visit(const ExpressionSwitch* expr) final {
         visitConditionalExpression(expr);
     }
-    void visit(ExpressionTestApiVersion* expr) final {
+    void visit(const ExpressionTestApiVersion* expr) final {
         _context->pushExpr(
             makeConstant(sbe::value::TypeTags::NumberInt32, sbe::value::bitcastFrom<int32_t>(1)));
     }
-    void visit(ExpressionToLower* expr) final {
+    void visit(const ExpressionToLower* expr) final {
         generateStringCaseConversionExpression(_context, "toLower");
     }
-    void visit(ExpressionToUpper* expr) final {
+    void visit(const ExpressionToUpper* expr) final {
         generateStringCaseConversionExpression(_context, "toUpper");
     }
-    void visit(ExpressionTrim* expr) final {
+    void visit(const ExpressionTrim* expr) final {
         unsupportedExpression("$trim");
     }
-    void visit(ExpressionTrunc* expr) final {
+    void visit(const ExpressionTrunc* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionType* expr) final {
+    void visit(const ExpressionType* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionZip* expr) final {
+    void visit(const ExpressionZip* expr) final {
         unsupportedExpression("$zip");
     }
-    void visit(ExpressionConvert* expr) final {
+    void visit(const ExpressionConvert* expr) final {
         unsupportedExpression("$convert");
     }
-    void visit(ExpressionRegexFind* expr) final {
+    void visit(const ExpressionRegexFind* expr) final {
         generateRegexExpression(expr, "regexFind");
     }
-    void visit(ExpressionRegexFindAll* expr) final {
+    void visit(const ExpressionRegexFindAll* expr) final {
         generateRegexExpression(expr, "regexFindAll");
     }
-    void visit(ExpressionRegexMatch* expr) final {
+    void visit(const ExpressionRegexMatch* expr) final {
         generateRegexExpression(expr, "regexMatch");
     }
-    void visit(ExpressionCosine* expr) final {
+    void visit(const ExpressionCosine* expr) final {
         generateTrigonometricExpressionWithBounds(
             "cos", DoubleBound::minInfinity(), DoubleBound::plusInfinity());
     }
-    void visit(ExpressionSine* expr) final {
+    void visit(const ExpressionSine* expr) final {
         generateTrigonometricExpressionWithBounds(
             "sin", DoubleBound::minInfinity(), DoubleBound::plusInfinity());
     }
-    void visit(ExpressionTangent* expr) final {
+    void visit(const ExpressionTangent* expr) final {
         generateTrigonometricExpressionWithBounds(
             "tan", DoubleBound::minInfinity(), DoubleBound::plusInfinity());
     }
-    void visit(ExpressionArcCosine* expr) final {
+    void visit(const ExpressionArcCosine* expr) final {
         generateTrigonometricExpressionWithBounds(
             "acos", DoubleBound(-1.0, true), DoubleBound(1.0, true));
     }
-    void visit(ExpressionArcSine* expr) final {
+    void visit(const ExpressionArcSine* expr) final {
         generateTrigonometricExpressionWithBounds(
             "asin", DoubleBound(-1.0, true), DoubleBound(1.0, true));
     }
-    void visit(ExpressionArcTangent* expr) final {
+    void visit(const ExpressionArcTangent* expr) final {
         generateTrigonometricExpression("atan");
     }
-    void visit(ExpressionArcTangent2* expr) final {
-        generateTrigonometricExpression("atan2");
+    void visit(const ExpressionArcTangent2* expr) final {
+        generateTrigonometricExpressionBinary("atan2");
     }
-    void visit(ExpressionHyperbolicArcTangent* expr) final {
+    void visit(const ExpressionHyperbolicArcTangent* expr) final {
         generateTrigonometricExpressionWithBounds(
             "atanh", DoubleBound(-1.0, true), DoubleBound(1.0, true));
     }
-    void visit(ExpressionHyperbolicArcCosine* expr) final {
+    void visit(const ExpressionHyperbolicArcCosine* expr) final {
         generateTrigonometricExpressionWithBounds(
             "acosh", DoubleBound(1.0, true), DoubleBound::plusInfinity());
     }
-    void visit(ExpressionHyperbolicArcSine* expr) final {
+    void visit(const ExpressionHyperbolicArcSine* expr) final {
         generateTrigonometricExpression("asinh");
     }
-    void visit(ExpressionHyperbolicCosine* expr) final {
+    void visit(const ExpressionHyperbolicCosine* expr) final {
         generateTrigonometricExpression("cosh");
     }
-    void visit(ExpressionHyperbolicSine* expr) final {
+    void visit(const ExpressionHyperbolicSine* expr) final {
         generateTrigonometricExpression("sinh");
     }
-    void visit(ExpressionHyperbolicTangent* expr) final {
+    void visit(const ExpressionHyperbolicTangent* expr) final {
         generateTrigonometricExpression("tanh");
     }
-    void visit(ExpressionDegreesToRadians* expr) final {
+    void visit(const ExpressionDegreesToRadians* expr) final {
         generateTrigonometricExpression("degreesToRadians");
     }
-    void visit(ExpressionRadiansToDegrees* expr) final {
+    void visit(const ExpressionRadiansToDegrees* expr) final {
         generateTrigonometricExpression("radiansToDegrees");
     }
-    void visit(ExpressionDayOfMonth* expr) final {
+    void visit(const ExpressionDayOfMonth* expr) final {
         generateDayOfExpression("dayOfMonth", expr);
     }
-    void visit(ExpressionDayOfWeek* expr) final {
+    void visit(const ExpressionDayOfWeek* expr) final {
         generateDayOfExpression("dayOfWeek", expr);
     }
-    void visit(ExpressionDayOfYear* expr) final {
+    void visit(const ExpressionDayOfYear* expr) final {
         generateDayOfExpression("dayOfYear", expr);
     }
-    void visit(ExpressionHour* expr) final {
+    void visit(const ExpressionHour* expr) final {
         unsupportedExpression("$hour");
     }
-    void visit(ExpressionMillisecond* expr) final {
+    void visit(const ExpressionMillisecond* expr) final {
         unsupportedExpression("$millisecond");
     }
-    void visit(ExpressionMinute* expr) final {
+    void visit(const ExpressionMinute* expr) final {
         unsupportedExpression("$minute");
     }
-    void visit(ExpressionMonth* expr) final {
+    void visit(const ExpressionMonth* expr) final {
         unsupportedExpression("$month");
     }
-    void visit(ExpressionSecond* expr) final {
+    void visit(const ExpressionSecond* expr) final {
         unsupportedExpression("$second");
     }
-    void visit(ExpressionWeek* expr) final {
+    void visit(const ExpressionWeek* expr) final {
         unsupportedExpression("$week");
     }
-    void visit(ExpressionIsoWeekYear* expr) final {
+    void visit(const ExpressionIsoWeekYear* expr) final {
         unsupportedExpression("$isoWeekYear");
     }
-    void visit(ExpressionIsoDayOfWeek* expr) final {
+    void visit(const ExpressionIsoDayOfWeek* expr) final {
         unsupportedExpression("$isoDayOfWeek");
     }
-    void visit(ExpressionIsoWeek* expr) final {
+    void visit(const ExpressionIsoWeek* expr) final {
         unsupportedExpression("$isoWeek");
     }
-    void visit(ExpressionYear* expr) final {
+    void visit(const ExpressionYear* expr) final {
         unsupportedExpression("$year");
     }
-    void visit(ExpressionFromAccumulator<AccumulatorAvg>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorAvg>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionFromAccumulator<AccumulatorMax>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorMax>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionFromAccumulator<AccumulatorMin>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorMin>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorStdDevSamp>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionFromAccumulator<AccumulatorSum>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorSum>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {
+    void visit(const ExpressionFromAccumulator<AccumulatorMergeObjects>* expr) final {
         unsupportedExpression(expr->getOpName());
     }
-    void visit(ExpressionTests::Testable* expr) final {
+    void visit(const ExpressionTests::Testable* expr) final {
         unsupportedExpression("$test");
     }
-    void visit(ExpressionInternalJsEmit* expr) final {
+    void visit(const ExpressionInternalJsEmit* expr) final {
         unsupportedExpression("$internalJsEmit");
     }
-    void visit(ExpressionInternalFindSlice* expr) final {
+    void visit(const ExpressionInternalFindSlice* expr) final {
         unsupportedExpression("$internalFindSlice");
     }
-    void visit(ExpressionInternalFindPositional* expr) final {
+    void visit(const ExpressionInternalFindPositional* expr) final {
         unsupportedExpression("$internalFindPositional");
     }
-    void visit(ExpressionInternalFindElemMatch* expr) final {
+    void visit(const ExpressionInternalFindElemMatch* expr) final {
         unsupportedExpression("$internalFindElemMatch");
     }
-    void visit(ExpressionFunction* expr) final {
+    void visit(const ExpressionFunction* expr) final {
         unsupportedExpression("$function");
     }
 
-    void visit(ExpressionRandom* expr) final {
+    void visit(const ExpressionRandom* expr) final {
         unsupportedExpression(expr->getOpName());
     }
 
-    void visit(ExpressionToHashedIndexKey* expr) final {
+    void visit(const ExpressionToHashedIndexKey* expr) final {
         unsupportedExpression("$toHashedIndexKey");
     }
 
-    void visit(ExpressionDateAdd* expr) final {
+    void visit(const ExpressionDateAdd* expr) final {
         generateDateArithmeticsExpression(expr, "dateAdd");
     }
 
-    void visit(ExpressionDateSubtract* expr) final {
+    void visit(const ExpressionDateSubtract* expr) final {
         generateDateArithmeticsExpression(expr, "dateSubtract");
     }
 
-    void visit(ExpressionGetField* expr) final {
+    void visit(const ExpressionGetField* expr) final {
         unsupportedExpression("$getField");
+    }
+
+    void visit(const ExpressionSetField* expr) final {
+        unsupportedExpression("$setField");
+    }
+
+    void visit(const ExpressionTsSecond* expr) final {
+        unsupportedExpression("$tsSecond");
+    }
+
+    void visit(const ExpressionTsIncrement* expr) final {
+        unsupportedExpression("$tsIncrement");
     }
 
 private:
@@ -2660,7 +2750,7 @@ private:
      * together using binary and/or EExpressions so that the result has MQL's short-circuit
      * semantics.
      */
-    void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
+    void visitMultiBranchLogicExpression(const Expression* expr, sbe::EPrimBinary::Op logicOp) {
         invariant(logicOp == sbe::EPrimBinary::logicAnd || logicOp == sbe::EPrimBinary::logicOr);
 
         size_t numChildren = expr->getChildren().size();
@@ -2674,7 +2764,7 @@ private:
         } else if (numChildren == 1) {
             // No need for short circuiting logic in a singleton $and/$or. Just execute the branch
             // and return its result as a bool.
-            auto frameId = _context->frameIdGenerator->generate();
+            auto frameId = _context->state.frameId();
             _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
                 frameId,
                 sbe::makeEs(_context->popExpr()),
@@ -2687,7 +2777,7 @@ private:
         for (size_t i = 0; i < numChildren; ++i) {
             auto [expr, stage] = _context->popFrame();
 
-            auto frameId = _context->frameIdGenerator->generate();
+            auto frameId = _context->state.frameId();
             auto coercedExpr = sbe::makeE<sbe::ELocalBind>(
                 frameId,
                 sbe::makeEs(std::move(expr)),
@@ -2697,11 +2787,12 @@ private:
         }
         std::reverse(branches.begin(), branches.end());
 
-        auto [resultExpr, opStage] = generateShortCircuitingLogicalOp(logicOp,
-                                                                      std::move(branches),
-                                                                      _context->planNodeId,
-                                                                      _context->slotIdGenerator,
-                                                                      BooleanStateHelper{});
+        auto [resultExpr, opStage] =
+            generateShortCircuitingLogicalOp(logicOp,
+                                             std::move(branches),
+                                             _context->planNodeId,
+                                             _context->state.slotIdGenerator,
+                                             BooleanStateHelper{});
 
         auto loopJoinStage = makeLoopJoin(_context->extractCurrentEvalStage(),
                                           std::move(opStage),
@@ -2715,7 +2806,7 @@ private:
      * Handle $switch and $cond, which have different syntax but are structurally identical in the
      * AST.
      */
-    void visitConditionalExpression(Expression* expr) {
+    void visitConditionalExpression(const Expression* expr) {
         // The default case is always the last child in the ExpressionSwitch. If it is unspecified
         // in the user's query, it is a nullptr. In ExpressionCond, the last child is the "else"
         // branch, and it is guaranteed not to be nullptr.
@@ -2738,14 +2829,14 @@ private:
                 continue;
             }
 
-            auto thenSlot = _context->slotIdGenerator->generate();
+            auto thenSlot = _context->state.slotId();
             auto thenStage =
                 makeProject(std::move(stage), _context->planNodeId, thenSlot, std::move(expr));
 
             // Construct a FilterStage tree that will EOF if "case" expression returns false. In
             // this case inner branch of loop join with "then" expression will never be executed.
             std::tie(expr, stage) = _context->popFrame();
-            auto frameId = _context->frameIdGenerator->generate();
+            auto frameId = _context->state.frameId();
             auto coercedExpr = sbe::makeE<sbe::ELocalBind>(
                 frameId,
                 sbe::makeEs(std::move(expr)),
@@ -2767,7 +2858,7 @@ private:
         std::reverse(branches.begin(), branches.end());
 
         auto [resultExpr, resultStage] = generateSingleResultUnion(
-            std::move(branches), {}, _context->planNodeId, _context->slotIdGenerator);
+            std::move(branches), {}, _context->planNodeId, _context->state.slotIdGenerator);
 
         auto loopJoinStage = makeLoopJoin(_context->extractCurrentEvalStage(),
                                           std::move(resultStage),
@@ -2777,8 +2868,8 @@ private:
         _context->pushExpr(resultExpr.extractExpr(), std::move(loopJoinStage));
     }
 
-    void generateDayOfExpression(StringData exprName, Expression* expr) {
-        auto frameId = _context->frameIdGenerator->generate();
+    void generateDayOfExpression(StringData exprName, const Expression* expr) {
+        auto frameId = _context->state.frameId();
         std::vector<std::unique_ptr<sbe::EExpression>> args;
         std::vector<std::unique_ptr<sbe::EExpression>> binds;
         sbe::EVariable dateRef(frameId, 0);
@@ -2797,7 +2888,7 @@ private:
         }();
         auto date = _context->popExpr();
 
-        auto timeZoneDBSlot = _context->runtimeEnvironment->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         args.push_back(sbe::makeE<sbe::EVariable>(timeZoneDBSlot));
 
         // Add date to arguments.
@@ -2879,7 +2970,7 @@ private:
      * is numeric and is not null.
      */
     void generateTrigonometricExpression(StringData exprName) {
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2898,13 +2989,43 @@ private:
     }
 
     /**
+     * Shared expression building logic for binary trigonometric expressions to make sure the
+     * operands are numeric and are not null.
+     */
+    void generateTrigonometricExpressionBinary(StringData exprName) {
+        _context->ensureArity(2);
+
+        auto genericTrignomentricExpr = makeLocalBind(
+            _context->state.frameIdGenerator,
+            [&](sbe::EVariable lhs, sbe::EVariable rhs) {
+                return buildMultiBranchConditional(
+                    CaseValuePair{makeBinaryOp(sbe::EPrimBinary::logicOr,
+                                               generateNullOrMissing(lhs),
+                                               generateNullOrMissing(rhs)),
+                                  makeConstant(sbe::value::TypeTags::Null, 0)},
+                    CaseValuePair{
+                        makeBinaryOp(sbe::EPrimBinary::logicAnd,
+                                     makeFunction("isNumber", lhs.clone()),
+                                     makeFunction("isNumber", rhs.clone())),
+                        makeFunction(exprName.toString(), lhs.clone(), rhs.clone()),
+                    },
+                    sbe::makeE<sbe::EFail>(ErrorCodes::Error{5688500},
+                                           str::stream() << "$" << exprName
+                                                         << " supports only numeric types"));
+            },
+            _context->popExpr(),
+            _context->popExpr());
+        _context->pushExpr(std::move(genericTrignomentricExpr));
+    }
+
+    /**
      * Shared expression building logic for trignometric expressions with bounds for the valid
      * values of the argument.
      */
     void generateTrigonometricExpressionWithBounds(StringData exprName,
                                                    const DoubleBound& lowerBound,
                                                    const DoubleBound& upperBound) {
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
@@ -2949,10 +3070,10 @@ private:
     /*
      * Generates an EExpression that returns an index for $indexOfBytes or $indexOfCP.
      */
-    void visitIndexOfFunction(Expression* expr,
+    void visitIndexOfFunction(const Expression* expr,
                               ExpressionVisitorContext* _context,
                               const std::string& indexOfFunction) {
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto children = expr->getChildren();
         auto operandSize = children.size() <= 3 ? 3 : 4;
         std::vector<std::unique_ptr<sbe::EExpression>> operands(operandSize);
@@ -3064,12 +3185,12 @@ private:
     /**
      * Generic logic for building set expressions: setUnion, setIntersection, etc.
      */
-    void generateSetExpression(Expression* expr, SetOperation setOp) {
+    void generateSetExpression(const Expression* expr, SetOperation setOp) {
         using namespace std::literals;
 
         size_t arity = expr->getChildren().size();
         _context->ensureArity(arity);
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
 
         auto generateNotArray = [frameId](const sbe::value::SlotId slotId) {
             sbe::EVariable var{frameId, slotId};
@@ -3085,7 +3206,7 @@ private:
         checkExprsNull.reserve(arity);
         checkExprsNotArray.reserve(arity);
 
-        auto collatorSlot = _context->runtimeEnvironment->getSlotIfExists("collator"_sd);
+        auto collatorSlot = _context->state.env->getSlotIfExists("collator"_sd);
 
         auto [operatorName, setFunctionName] = [setOp, collatorSlot]() {
             switch (setOp) {
@@ -3151,7 +3272,7 @@ private:
     /**
      * Shared expression building logic for regex expressions.
      */
-    void generateRegexExpression(ExpressionRegex* expr, StringData exprName) {
+    void generateRegexExpression(const ExpressionRegex* expr, StringData exprName) {
         size_t arity = expr->hasOptions() ? 3 : 2;
         _context->ensureArity(arity);
 
@@ -3161,7 +3282,7 @@ private:
         auto input = _context->popExpr();
 
         // Create top level local bind.
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         auto binds = sbe::makeEs(std::move(input));
         sbe::EVariable inputVar{frameId, 0};
 
@@ -3173,7 +3294,7 @@ private:
 
         auto makeRegexFunctionCall = [&](std::unique_ptr<sbe::EExpression> compiledRegex) {
             return makeLocalBind(
-                _context->frameIdGenerator,
+                _context->state.frameIdGenerator,
                 [&](sbe::EVariable regexResult) {
                     return sbe::makeE<sbe::EIf>(
                         makeFunction("exists", regexResult.clone()),
@@ -3291,10 +3412,10 @@ private:
                 };
 
                 return makeLocalBind(
-                    _context->frameIdGenerator,
+                    _context->state.frameIdGenerator,
                     [&](sbe::EVariable stringOptions) {
                         auto checkBsonRegexOptions = makeLocalBind(
-                            _context->frameIdGenerator,
+                            _context->state.frameIdGenerator,
                             [&](sbe::EVariable bsonOptions) {
                                 return buildMultiBranchConditional(
                                     CaseValuePair{generateIsEmptyString(stringOptions),
@@ -3319,7 +3440,7 @@ private:
             // If there are options passed to the expression, we construct local bind with options
             // argument because it needs to be validated even when pattern is null.
             return makeLocalBind(
-                _context->frameIdGenerator,
+                _context->state.frameIdGenerator,
                 [&](sbe::EVariable options) {
                     auto compiledRegex =
                         makeFunction("regexCompile", std::move(patternArgument), options.clone());
@@ -3343,7 +3464,7 @@ private:
     /**
      * Generic logic for building $dateAdd and $dateSubtract expressions.
      */
-    void generateDateArithmeticsExpression(ExpressionDateArithmetics* expr,
+    void generateDateArithmeticsExpression(const ExpressionDateArithmetics* expr,
                                            const std::string& dateExprName) {
         auto children = expr->getChildren();
         auto arity = children.size();
@@ -3366,7 +3487,7 @@ private:
         binds.push_back(std::move(amountExpr));
         binds.push_back(std::move(timezoneExpr));
 
-        auto frameId = _context->frameIdGenerator->generate();
+        auto frameId = _context->state.frameId();
         sbe::EVariable startDateRef{frameId, 0};
         sbe::EVariable unitRef{frameId, 1};
         sbe::EVariable origAmountRef{frameId, 2};
@@ -3388,7 +3509,7 @@ private:
         binds.push_back(std::move(convertedAmountInt64));
 
         std::vector<std::unique_ptr<sbe::EExpression>> args;
-        auto timeZoneDBSlot = _context->runtimeEnvironment->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         args.push_back(sbe::makeE<sbe::EVariable>(timeZoneDBSlot));
         args.push_back(startDateRef.clone());
         args.push_back(unitRef.clone());
@@ -3462,27 +3583,27 @@ private:
 
 class ExpressionWalker final {
 public:
-    ExpressionWalker(ExpressionVisitor* preVisitor,
-                     ExpressionVisitor* inVisitor,
-                     ExpressionVisitor* postVisitor)
+    ExpressionWalker(ExpressionConstVisitor* preVisitor,
+                     ExpressionConstVisitor* inVisitor,
+                     ExpressionConstVisitor* postVisitor)
         : _preVisitor{preVisitor}, _inVisitor{inVisitor}, _postVisitor{postVisitor} {}
 
-    void preVisit(Expression* expr) {
+    void preVisit(const Expression* expr) {
         expr->acceptVisitor(_preVisitor);
     }
 
-    void inVisit(long long count, Expression* expr) {
+    void inVisit(long long count, const Expression* expr) {
         expr->acceptVisitor(_inVisitor);
     }
 
-    void postVisit(Expression* expr) {
+    void postVisit(const Expression* expr) {
         expr->acceptVisitor(_postVisitor);
     }
 
 private:
-    ExpressionVisitor* _preVisitor;
-    ExpressionVisitor* _inVisitor;
-    ExpressionVisitor* _postVisitor;
+    ExpressionConstVisitor* _preVisitor;
+    ExpressionConstVisitor* _inVisitor;
+    ExpressionConstVisitor* _postVisitor;
 };
 }  // namespace
 
@@ -3524,35 +3645,21 @@ std::unique_ptr<sbe::EExpression> generateCoerceToBoolExpression(sbe::EVariable 
             makeBinaryOp(sbe::EPrimBinary::logicAnd, makeNeqFalseCheck(), makeNeqZeroCheck())));
 }
 
-std::tuple<sbe::value::SlotId, std::unique_ptr<sbe::EExpression>, std::unique_ptr<sbe::PlanStage>>
-generateExpression(OperationContext* opCtx,
-                   Expression* expr,
-                   std::unique_ptr<sbe::PlanStage> stage,
-                   sbe::value::SlotIdGenerator* slotIdGenerator,
-                   sbe::value::FrameIdGenerator* frameIdGenerator,
-                   sbe::value::SlotId rootSlot,
-                   sbe::RuntimeEnvironment* env,
-                   PlanNodeId planNodeId,
-                   sbe::value::SlotVector* relevantSlots) {
-    auto tempRelevantSlots = sbe::makeSV(rootSlot);
-    relevantSlots = relevantSlots ? relevantSlots : &tempRelevantSlots;
-
-    ExpressionVisitorContext context(std::move(stage),
-                                     slotIdGenerator,
-                                     frameIdGenerator,
-                                     rootSlot,
-                                     *relevantSlots,
-                                     env,
-                                     planNodeId);
+std::tuple<sbe::value::SlotId, std::unique_ptr<sbe::EExpression>, EvalStage> generateExpression(
+    StageBuilderState& state,
+    Expression* expr,
+    EvalStage stage,
+    sbe::value::SlotId rootSlot,
+    PlanNodeId planNodeId) {
+    ExpressionVisitorContext context(state, std::move(stage), rootSlot, planNodeId);
 
     ExpressionPreVisitor preVisitor{&context};
     ExpressionInVisitor inVisitor{&context};
     ExpressionPostVisitor postVisitor{&context};
     ExpressionWalker walker{&preVisitor, &inVisitor, &postVisitor};
-    expression_walker::walk(&walker, expr);
+    expression_walker::walk<const Expression>(expr, &walker);
 
     auto [slotId, resultExpr, resultStage] = context.done();
-    *relevantSlots = std::move(resultStage.outSlots);
-    return {slotId, std::move(resultExpr), std::move(resultStage.stage)};
+    return {slotId, std::move(resultExpr), std::move(resultStage)};
 }
 }  // namespace mongo::stage_builder

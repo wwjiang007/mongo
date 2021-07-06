@@ -74,6 +74,10 @@ public:
                      const Options& options,
                      ThreadPool* writerPool);
 
+    void fillWriterVectors_forTest(OperationContext* opCtx,
+                                   std::vector<OplogEntry>* ops,
+                                   std::vector<std::vector<const OplogEntry*>>* writerVectors,
+                                   std::vector<std::vector<OplogEntry>>* derivedOps) noexcept;
 
 private:
     /**
@@ -136,7 +140,8 @@ protected:
      */
     virtual Status applyOplogBatchPerWorker(OperationContext* opCtx,
                                             std::vector<const OplogEntry*>* ops,
-                                            WorkerMultikeyPathInfo* workerMultikeyPathInfo);
+                                            WorkerMultikeyPathInfo* workerMultikeyPathInfo,
+                                            const bool isDataConsistent);
 };
 
 /**
@@ -144,7 +149,8 @@ protected:
  */
 Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                                        const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
-                                       OplogApplication::Mode oplogApplicationMode);
+                                       OplogApplication::Mode oplogApplicationMode,
+                                       const bool isDataConsistent);
 
 }  // namespace repl
 }  // namespace mongo

@@ -44,13 +44,17 @@ config.settings = {
 replTest.startSet();
 replTest.initiate(config);
 
+var primary = replTest.getPrimary();
+var secondaries = replTest.getSecondaries();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Without a sync source the heartbeat interval will be half of the election timeout, 30
 // seconds. It thus will take almost 30 seconds for the secondaries to set the primary as
 // their sync source and begin replicating.
 replTest.awaitReplication();
-var primary = replTest.getPrimary();
-var secondaries = replTest.getSecondaries();
-
 // Do a write to have something to read.
 assert.commandWorked(primary.getDB("test").foo.insert(
     {"number": 7}, {"writeConcern": {"w": "majority", "wtimeout": ReplSetTest.kDefaultTimeoutMS}}));
@@ -78,16 +82,16 @@ assert.eq(opTimeCmd.errmsg, "afterOpTime not compatible with linearizable read c
 assert.eq(opTimeCmd.code, ErrorCodes.FailedToParse);
 
 // A $out aggregation is not allowed with readConcern level "linearizable".
-let outResult = assert.throws(() => primary.getDB("test").foo.aggregate(
-                                  [{$out: "out"}], {readConcern: {level: "linearizable"}}));
-assert.eq(outResult.code, ErrorCodes.InvalidOptions);
+assert.throwsWithCode(() => primary.getDB("test").foo.aggregate(
+                          [{$out: "out"}], {readConcern: {level: "linearizable"}}),
+                      ErrorCodes.InvalidOptions);
 
 // A $merge aggregation is not allowed with readConcern level "linearizable".
-let mergeResult =
-    assert.throws(() => primary.getDB("test").foo.aggregate(
-                      [{$merge: {into: "out", whenMatched: "replace", whenNotMatched: "insert"}}],
-                      {readConcern: {level: "linearizable"}}));
-assert.eq(mergeResult.code, ErrorCodes.InvalidOptions);
+assert.throwsWithCode(
+    () => primary.getDB("test").foo.aggregate(
+        [{$merge: {into: "out", whenMatched: "replace", whenNotMatched: "insert"}}],
+        {readConcern: {level: "linearizable"}}),
+    ErrorCodes.InvalidOptions);
 
 primary = replTest.getPrimary();
 

@@ -22,7 +22,9 @@ variables:
       - name: schedule_global_auto_tasks
         variant: task_generation
   _real_expansions: &_expansion_updates
-    []
+    # TODO: Disable in SERVER-57226.
+    - key: enable_detect_changes
+      value: "true"
   ###
 
 ###
@@ -105,7 +107,7 @@ modules:
     repo: git@github.com:mongodb-labs/py-tpcc.git
     prefix: ../../src
     branch: master
-    ref: 2d19705337a40e24831a904266a648b85df5be84
+    ref: 46f8f42a71626fc2057d2604ab9359ccf0395ba0
 #  - name: mongo
 #    repo: git@github.com:mongodb/mongo.git
 #    prefix: ../../src
@@ -178,16 +180,26 @@ functions:
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
   f_dsi_post_run:
-    - command: shell.exec
-      params:
-        script: ./src/dsi/run-dsi post_run
-    - command: attach.results
-      params:
-        file_location: ./build/EvergreenResultsJson/results.json
+    # TODO: SERVER-57226 will let us move this json.send to after dsi's post_run.
+    # This is preferred to keep DSI execution contiguous.
     - command: json.send
       params:
         name: perf
         file: ./build/LegacyPerfJson/perf.json
+    - command: shell.exec
+      params:
+        script: ./src/dsi/run-dsi post_run
+    - command: perf.send
+      params:
+        file: ./build/CedarReports/cedar_report.json
+        aws_key: ${terraform_key}
+        aws_secret: ${terraform_secret}
+        bucket: genny-metrics
+        region: us-east-1
+        prefix: ${task_id}_${execution}
+    - command: attach.results
+      params:
+        file_location: ./build/EvergreenResultsJson/results.json
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -801,6 +813,7 @@ tasks:
     exec_timeout_secs: 216000 # 2.5 days
     commands:
       - func: f_run_dsi_workload
+        timeout_secs: 216000 # 2.5 days
         vars:
           test_control: "initialsync-logkeeper"
 

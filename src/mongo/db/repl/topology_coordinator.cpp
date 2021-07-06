@@ -515,11 +515,11 @@ bool TopologyCoordinator::_isEligibleSyncSource(int candidateIndex,
                     "lastOpTimeFetched"_attr = lastOpTimeFetched.toBSON());
         return false;
     }
-    // Candidate cannot be blacklisted.
-    if (_memberIsBlacklisted(memberConfig, now)) {
+    // Candidate cannot be denylisted.
+    if (_memberIsDenylisted(memberConfig, now)) {
         LOGV2_DEBUG(3873115,
                     1,
-                    "Cannot select sync source which is blacklisted",
+                    "Cannot select sync source which is denylisted",
                     "syncSourceCandidate"_attr = syncSourceCandidate);
         return false;
     }
@@ -575,9 +575,9 @@ boost::optional<HostAndPort> TopologyCoordinator::_chooseSyncSourceInitialChecks
             fassertFailed(50836);
         }
 
-        if (_memberIsBlacklisted(_rsConfig.getMemberAt(syncSourceIndex), now)) {
+        if (_memberIsDenylisted(_rsConfig.getMemberAt(syncSourceIndex), now)) {
             LOGV2(3873119,
-                  "Cannot select a sync source because forced candidate is blacklisted.",
+                  "Cannot select a sync source because forced candidate is denylisted.",
                   "syncSourceCandidate"_attr = hostAndPort.toString());
             return HostAndPort();
         }
@@ -610,17 +610,21 @@ boost::optional<HostAndPort> TopologyCoordinator::_chooseSyncSourceInitialChecks
 
 HostAndPort TopologyCoordinator::_choosePrimaryAsSyncSource(Date_t now,
                                                             const OpTime& lastOpTimeFetched) {
+    LOGV2_DEBUG(5676400,
+                2,
+                "Attempting to choose current primary as sync source",
+                "currentPrimaryIndex"_attr = _currentPrimaryIndex);
     if (_currentPrimaryIndex == -1) {
         LOGV2_DEBUG(21784,
                     1,
                     "Cannot select the primary as sync source because"
                     " the primary is unknown/down.");
         return HostAndPort();
-    } else if (_memberIsBlacklisted(*getCurrentPrimaryMember(), now)) {
+    } else if (_memberIsDenylisted(*getCurrentPrimaryMember(), now)) {
         LOGV2_DEBUG(
             3873116,
             1,
-            "Cannot select the primary as sync source because the primary member is blacklisted",
+            "Cannot select the primary as sync source because the primary member is denylisted",
             "primary"_attr = getCurrentPrimaryMember()->getHostAndPort());
         return HostAndPort();
     } else if (_currentPrimaryIndex == _selfIndex) {
@@ -646,41 +650,41 @@ HostAndPort TopologyCoordinator::_choosePrimaryAsSyncSource(Date_t now,
     }
 }
 
-bool TopologyCoordinator::_memberIsBlacklisted(const MemberConfig& memberConfig, Date_t now) const {
-    std::map<HostAndPort, Date_t>::const_iterator blacklisted =
-        _syncSourceBlacklist.find(memberConfig.getHostAndPort());
-    if (blacklisted != _syncSourceBlacklist.end()) {
-        if (blacklisted->second > now) {
+bool TopologyCoordinator::_memberIsDenylisted(const MemberConfig& memberConfig, Date_t now) const {
+    std::map<HostAndPort, Date_t>::const_iterator denylisted =
+        _syncSourceDenylist.find(memberConfig.getHostAndPort());
+    if (denylisted != _syncSourceDenylist.end()) {
+        if (denylisted->second > now) {
             return true;
         }
     }
     return false;
 }
 
-void TopologyCoordinator::blacklistSyncSource(const HostAndPort& host, Date_t until) {
+void TopologyCoordinator::denylistSyncSource(const HostAndPort& host, Date_t until) {
     LOGV2_DEBUG(21800,
                 2,
-                "blacklisting {syncSource} until {until}",
-                "Blacklisting sync source",
+                "denylisting {syncSource} until {until}",
+                "Denylisting sync source",
                 "syncSource"_attr = host,
                 "until"_attr = until.toString());
-    _syncSourceBlacklist[host] = until;
+    _syncSourceDenylist[host] = until;
 }
 
-void TopologyCoordinator::unblacklistSyncSource(const HostAndPort& host, Date_t now) {
-    std::map<HostAndPort, Date_t>::iterator hostItr = _syncSourceBlacklist.find(host);
-    if (hostItr != _syncSourceBlacklist.end() && now >= hostItr->second) {
+void TopologyCoordinator::undenylistSyncSource(const HostAndPort& host, Date_t now) {
+    std::map<HostAndPort, Date_t>::iterator hostItr = _syncSourceDenylist.find(host);
+    if (hostItr != _syncSourceDenylist.end() && now >= hostItr->second) {
         LOGV2_DEBUG(21801,
                     2,
-                    "unblacklisting {syncSource}",
-                    "Unblacklisting sync source",
+                    "undenylisting {syncSource}",
+                    "Undenylisting sync source",
                     "syncSource"_attr = host);
-        _syncSourceBlacklist.erase(hostItr);
+        _syncSourceDenylist.erase(hostItr);
     }
 }
 
-void TopologyCoordinator::clearSyncSourceBlacklist() {
-    _syncSourceBlacklist.clear();
+void TopologyCoordinator::clearSyncSourceDenylist() {
+    _syncSourceDenylist.clear();
 }
 
 void TopologyCoordinator::prepareSyncFromResponse(const HostAndPort& target,
@@ -1401,6 +1405,24 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
 
     invariant(memberId == memberData->getMemberId());
 
+    auto durableOpTime = args.durableOpTime;
+    auto durableWallTime = args.durableWallTime;
+
+    // Arbiters are always expected to report null durable optimes (and wall times).
+    // If that is not the case here, make sure to correct these times before ingesting them.
+    auto& memberInConfig = _rsConfig.getMemberAt(memberData->getConfigIndex());
+    if ((memberData->getState().arbiter() || memberInConfig.isArbiter()) &&
+        (!args.durableOpTime.isNull() || args.durableWallTime != Date_t())) {
+        LOGV2(5662001,
+              "Received non-null durable optime/walltime for arbiter from "
+              "replSetUpdatePosition. Ignoring value(s).",
+              "memberId"_attr = memberId,
+              "durableOpTime"_attr = args.durableOpTime,
+              "durableWallTime"_attr = args.durableWallTime);
+        durableOpTime = OpTime();
+        durableWallTime = Date_t();
+    }
+
     LOGV2_DEBUG(21815,
                 3,
                 "Node with memberID {memberId} currently has optime {oldLastAppliedOpTime} "
@@ -1411,12 +1433,12 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
                 "oldLastAppliedOpTime"_attr = memberData->getLastAppliedOpTime(),
                 "oldLastDurableOpTime"_attr = memberData->getLastDurableOpTime(),
                 "newAppliedOpTime"_attr = args.appliedOpTime,
-                "newDurableOpTime"_attr = args.durableOpTime);
+                "newDurableOpTime"_attr = durableOpTime);
 
     bool advancedOpTime = memberData->advanceLastAppliedOpTimeAndWallTime(
         {args.appliedOpTime, args.appliedWallTime}, now);
-    advancedOpTime = memberData->advanceLastDurableOpTimeAndWallTime(
-                         {args.durableOpTime, args.durableWallTime}, now) ||
+    advancedOpTime =
+        memberData->advanceLastDurableOpTimeAndWallTime({durableOpTime, durableWallTime}, now) ||
         advancedOpTime;
     return advancedOpTime;
 }
@@ -1463,6 +1485,11 @@ void TopologyCoordinator::_updatePrimaryFromHBDataV1(Date_t now) {
             }
         }
     }
+    LOGV2_DEBUG(5676401,
+                2,
+                "Updating primary index from heartbeat data",
+                "primaryIndex"_attr = primaryIndex,
+                "previousPrimaryIndex"_attr = _currentPrimaryIndex);
     _currentPrimaryIndex = primaryIndex;
 
     // Clear last heartbeat message on ourselves.
@@ -1487,14 +1514,22 @@ HeartbeatResponseAction TopologyCoordinator::_shouldTakeOverPrimary(int updatedC
     }
 
     // Don't schedule catchup takeover if catchup takeover or primary catchup is disabled.
-    bool catchupTakeoverDisabled =
+    const bool catchupTakeoverDisabled =
         ReplSetConfig::kCatchUpDisabled == _rsConfig.getCatchUpTimeoutPeriod() ||
         ReplSetConfig::kCatchUpTakeoverDisabled == _rsConfig.getCatchUpTakeoverDelay();
 
     bool scheduleCatchupTakeover = false;
     bool schedulePriorityTakeover = false;
 
-    if (!catchupTakeoverDisabled &&
+    // If we have a stale view of the new primary's opTime and believe its opTime to be
+    // less than our own, we may end up scheduling an unecessary takeover. Primaries
+    // increment the term as soon as they start a real election, but they do not write
+    // anything in that new term until they have finished their full state transition.
+    // Thus, if we have applied anything in the new term, it means that the primary is
+    // already past the catchup phase and we should not be attempting a catchup takeover.
+    const bool primaryAlreadyCaughtUp = (getMyLastAppliedOpTime().getTerm() == getTerm());
+
+    if (!catchupTakeoverDisabled && !primaryAlreadyCaughtUp &&
         (_memberData.at(primaryIndex).getLastAppliedOpTime() <
          _memberData.at(_selfIndex).getLastAppliedOpTime())) {
         LOGV2_FOR_ELECTION(23975,
@@ -1523,7 +1558,7 @@ HeartbeatResponseAction TopologyCoordinator::_shouldTakeOverPrimary(int updatedC
     }
 
     // Calculate rank of current node. A rank of 0 indicates that it has the highest priority.
-    auto currentNodePriority = _rsConfig.getMemberAt(_selfIndex).getPriority();
+    const auto currentNodePriority = _rsConfig.getMemberAt(_selfIndex).getPriority();
 
     // Schedule a priority takeover early only if we know that the current node has the highest
     // priority in the replica set, has a higher priority than the primary, and is the most
@@ -3007,10 +3042,11 @@ bool TopologyCoordinator::shouldChangeSyncSource(const HostAndPort& currentSourc
 
     int syncSourceIndex = oqMetadata.getSyncSourceIndex();
 
-    // Change sync source if chaining is disabled, we are not syncing from the primary, and we know
-    // who the new primary is. We do not consider chaining disabled if we are the primary, since
-    // we are in catchup mode.
-    auto chainingDisabled = !_rsConfig.isChainingAllowed() && _currentPrimaryIndex != _selfIndex;
+    // Change sync source if chaining is disabled (without overrides), we are not syncing from the
+    // primary, and we know who the new primary is. We do not consider chaining disabled if we are
+    // the primary, since we are in catchup mode.
+    auto chainingDisabled = !_rsConfig.isChainingAllowed() &&
+        !enableOverrideClusterChainingSetting.load() && _currentPrimaryIndex != _selfIndex;
     auto foundNewPrimary = _currentPrimaryIndex != -1 && _currentPrimaryIndex != currentSourceIndex;
     if (!replMetadata.getIsPrimary() && chainingDisabled && foundNewPrimary) {
         auto newPrimary = _rsConfig.getMemberAt(_currentPrimaryIndex).getHostAndPort();
@@ -3057,7 +3093,7 @@ bool TopologyCoordinator::shouldChangeSyncSource(const HostAndPort& currentSourc
             const MemberConfig& candidateConfig = _rsConfig.getMemberAt(itIndex);
             if (it->up() && (candidateConfig.isVoter() || !_selfConfig().isVoter()) &&
                 (candidateConfig.shouldBuildIndexes() || !_selfConfig().shouldBuildIndexes()) &&
-                it->getState().readable() && !_memberIsBlacklisted(candidateConfig, now) &&
+                it->getState().readable() && !_memberIsDenylisted(candidateConfig, now) &&
                 goalSecs < it->getHeartbeatAppliedOpTime().getSecs()) {
                 LOGV2(21834,
                       "Choosing new sync source because the most recent OpTime of our sync "

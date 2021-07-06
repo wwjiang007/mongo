@@ -53,7 +53,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/exit.h"
@@ -148,11 +147,10 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
  * Returns true if the collection associated with the given CollectionCatalogEntry has an index on
  * the _id field
  */
-bool checkIdIndexExists(OperationContext* opCtx, RecordId catalogId) {
-    auto durableCatalog = DurableCatalog::get(opCtx);
-    auto indexCount = durableCatalog->getTotalIndexCount(opCtx, catalogId);
+bool checkIdIndexExists(OperationContext* opCtx, const CollectionPtr& coll) {
+    auto indexCount = coll->getTotalIndexCount();
     auto indexNames = std::vector<std::string>(indexCount);
-    durableCatalog->getAllIndexes(opCtx, catalogId, &indexNames);
+    coll->getAllIndexes(&indexNames);
 
     for (auto name : indexNames) {
         if (name == "_id_") {
@@ -171,7 +169,7 @@ Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
     });
 
     const auto indexCatalog = collection->getIndexCatalog();
-    const auto idIndexSpec = indexCatalog->getDefaultIdIndexSpec();
+    const auto idIndexSpec = indexCatalog->getDefaultIdIndexSpec(collection);
 
     CollectionWriter collWriter(collection);
     auto swSpecs = indexer.init(opCtx, collWriter, idIndexSpec, MultiIndexBlock::kNoopOnInitFn);
@@ -225,15 +223,13 @@ Status ensureCollectionProperties(OperationContext* opCtx,
 
         // All user-created replicated collections created since MongoDB 4.0 have _id indexes.
         auto requiresIndex = coll->requiresIdIndex() && coll->ns().isReplicated();
-        auto collOptions =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, coll->getCatalogId());
+        const auto& collOptions = coll->getCollectionOptions();
         auto hasAutoIndexIdField = collOptions.autoIndexId == CollectionOptions::YES;
 
         // Even if the autoIndexId field is not YES, the collection may still have an _id index
         // that was created manually by the user. Check the list of indexes to confirm index
         // does not exist before attempting to build it or returning an error.
-        if (requiresIndex && !hasAutoIndexIdField &&
-            !checkIdIndexExists(opCtx, coll->getCatalogId())) {
+        if (requiresIndex && !hasAutoIndexIdField && !checkIdIndexExists(opCtx, coll)) {
             LOGV2(21001,
                   "collection {coll_ns} is missing an _id index",
                   "Collection is missing an _id index",
@@ -274,34 +270,6 @@ void openDatabases(OperationContext* opCtx, const StorageEngine* storageEngine, 
     }
 }
 
-// Check for storage engine file compatibility. Exits the process if there is an incompatibility.
-void assertFilesCompatible(OperationContext* opCtx, StorageEngine* storageEngine) {
-    auto status = storageEngine->currentFilesCompatible(opCtx);
-    if (status.isOK()) {
-        return;
-    }
-
-    if (status.code() == ErrorCodes::CanRepairToDowngrade) {
-        // Convert CanRepairToDowngrade statuses to MustUpgrade statuses to avoid logging a
-        // potentially confusing and inaccurate message.
-        //
-        // TODO SERVER-24097: Log a message informing the user that they can start the current
-        // version of mongod with --repair and then proceed with normal startup.
-        status = {ErrorCodes::MustUpgrade, status.reason()};
-    }
-    LOGV2_FATAL_CONTINUE(
-        21023,
-        "Unable to start mongod due to an incompatibility with the data files and this version "
-        "of mongod: {error}. Please consult our documentation when trying to downgrade to a "
-        "previous major release",
-        "Unable to start mongod due to an incompatibility with the data files and this version "
-        "of mongod. Please consult our documentation when trying to downgrade to a previous "
-        "major release",
-        "error"_attr = redact(status));
-    quickExit(EXIT_NEED_UPGRADE);
-    MONGO_UNREACHABLE;
-}
-
 /**
  * Returns 'true' if this server has a configuration document in local.system.replset.
  */
@@ -337,44 +305,73 @@ void assertCappedOplog(OperationContext* opCtx, Database* db) {
     }
 }
 
+void clearTempFilesExceptForResumableBuilds(const std::vector<ResumeIndexInfo>& indexBuildsToResume,
+                                            const boost::filesystem::path& tempDir) {
+    StringSet resumableIndexFiles;
+    for (const auto& resumeInfo : indexBuildsToResume) {
+        const auto& indexes = resumeInfo.getIndexes();
+        for (const auto& index : indexes) {
+            boost::optional<StringData> indexFilename = index.getFileName();
+            if (indexFilename) {
+                resumableIndexFiles.insert(indexFilename->toString());
+            }
+        }
+    }
+
+    auto dirItr = boost::filesystem::directory_iterator(tempDir);
+    auto dirEnd = boost::filesystem::directory_iterator();
+    for (; dirItr != dirEnd; ++dirItr) {
+        auto curFilename = dirItr->path().filename().string();
+        if (!resumableIndexFiles.contains(curFilename)) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(dirItr->path(), ec);
+            if (ec) {
+                LOGV2(5676601,
+                      "Failed to clear temp directory file",
+                      "filename"_attr = curFilename,
+                      "error"_attr = ec.message());
+            }
+        }
+    }
+}
+
 void reconcileCatalogAndRebuildUnfinishedIndexes(
     OperationContext* opCtx,
     StorageEngine* storageEngine,
-    LastStorageEngineShutdownState lastStorageEngineShutdownState) {
-
-    // When starting up after an unclean shutdown, we do not attempt to recover any state from the
-    // internal idents. Thus, we drop them in this case.
-    auto reconcilePolicy =
-        LastStorageEngineShutdownState::kUnclean == lastStorageEngineShutdownState
-        ? StorageEngine::InternalIdentReconcilePolicy::kDrop
-        : StorageEngine::InternalIdentReconcilePolicy::kRetain;
+    StorageEngine::LastShutdownState lastShutdownState) {
     auto reconcileResult =
-        fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx, reconcilePolicy));
+        fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx, lastShutdownState));
 
-    // If we did not find any index builds to resume or we are starting up after an unclean
-    // shutdown, nothing in the temp directory will be used. Thus, we can clear it.
+    auto tempDir = boost::filesystem::path(storageGlobalParams.dbpath).append("_tmp");
     if (reconcileResult.indexBuildsToResume.empty() ||
-        lastStorageEngineShutdownState == LastStorageEngineShutdownState::kUnclean) {
+        lastShutdownState == StorageEngine::LastShutdownState::kUnclean) {
+        // If we did not find any index builds to resume or we are starting up after an unclean
+        // shutdown, nothing in the temp directory will be used. Thus, we can clear it completely.
         LOGV2(5071100, "Clearing temp directory");
 
         boost::system::error_code ec;
-        boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/", ec);
+        boost::filesystem::remove_all(tempDir, ec);
 
         if (ec) {
             LOGV2(5071101, "Failed to clear temp directory", "error"_attr = ec.message());
         }
+    } else if (boost::filesystem::exists(tempDir)) {
+        // Clears the contents of the temp directory except for files for resumable builds.
+        LOGV2(5676600, "Clearing temp directory except for files for resumable builds");
+
+        clearTempFilesExceptForResumableBuilds(reconcileResult.indexBuildsToResume, tempDir);
     }
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
     // indexes on that collection are done at once, so we use a map to group them together.
     StringMap<IndexNameObjs> nsToIndexNameObjMap;
+    auto catalog = CollectionCatalog::get(opCtx);
     for (auto&& idxIdentifier : reconcileResult.indexesToRebuild) {
         NamespaceString collNss = idxIdentifier.nss;
         const std::string& indexName = idxIdentifier.indexName;
         auto swIndexSpecs =
-            getIndexNameObjs(opCtx, idxIdentifier.catalogId, [&indexName](const std::string& name) {
-                return name == indexName;
-            });
+            getIndexNameObjs(catalog->lookupCollectionByNamespace(opCtx, collNss),
+                             [&indexName](const std::string& name) { return name == indexName; });
         if (!swIndexSpecs.isOK() || swIndexSpecs.getValue().first.empty()) {
             fassert(40590,
                     {ErrorCodes::InternalError,
@@ -391,7 +388,6 @@ void reconcileCatalogAndRebuildUnfinishedIndexes(
         ino.second.emplace_back(std::move(indexesToRebuild.second.back()));
     }
 
-    auto catalog = CollectionCatalog::get(opCtx);
     for (const auto& entry : nsToIndexNameObjMap) {
         NamespaceString collNss(entry.first);
 
@@ -548,7 +544,7 @@ void startupRecoveryReadOnly(OperationContext* opCtx, StorageEngine* storageEngi
 // Perform routine startup recovery procedure.
 void startupRecovery(OperationContext* opCtx,
                      StorageEngine* storageEngine,
-                     LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+                     StorageEngine::LastShutdownState lastShutdownState) {
     invariant(!storageGlobalParams.readOnly && !storageGlobalParams.repair);
 
     // Determine whether this is a replica set node running in standalone mode. This must be set
@@ -560,8 +556,7 @@ void startupRecovery(OperationContext* opCtx,
 
     // Drops abandoned idents. Rebuilds unfinished indexes and restarts incomplete two-phase
     // index builds.
-    reconcileCatalogAndRebuildUnfinishedIndexes(
-        opCtx, storageEngine, lastStorageEngineShutdownState);
+    reconcileCatalogAndRebuildUnfinishedIndexes(opCtx, storageEngine, lastShutdownState);
 
     const auto& replSettings = repl::ReplicationCoordinator::get(opCtx)->getSettings();
 
@@ -603,7 +598,7 @@ namespace startup_recovery {
  * if data files are incompatible with the current binary version.
  */
 void repairAndRecoverDatabases(OperationContext* opCtx,
-                               LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+                               StorageEngine::LastShutdownState lastShutdownState) {
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Lock::GlobalWrite lk(opCtx);
 
@@ -619,10 +614,8 @@ void repairAndRecoverDatabases(OperationContext* opCtx,
     } else if (storageGlobalParams.readOnly) {
         startupRecoveryReadOnly(opCtx, storageEngine);
     } else {
-        startupRecovery(opCtx, storageEngine, lastStorageEngineShutdownState);
+        startupRecovery(opCtx, storageEngine, lastShutdownState);
     }
-
-    assertFilesCompatible(opCtx, storageEngine);
 }
 
 }  // namespace startup_recovery

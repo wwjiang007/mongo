@@ -44,7 +44,7 @@ using boost::intrusive_ptr;
 REGISTER_DOCUMENT_SOURCE(operationMetrics,
                          DocumentSourceOperationMetrics::LiteParsed::parse,
                          DocumentSourceOperationMetrics::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1);
+                         AllowedWithApiStrict::kNeverInVersion1);
 
 const char* DocumentSourceOperationMetrics::getSourceName() const {
     return kStageName.rawData();
@@ -53,6 +53,7 @@ const char* DocumentSourceOperationMetrics::getSourceName() const {
 namespace {
 static constexpr StringData kClearMetrics = "clearMetrics"_sd;
 static constexpr StringData kDatabaseName = "db"_sd;
+static constexpr StringData kLocalTimeFieldName = "localTime"_sd;
 }  // namespace
 
 DocumentSource::GetNextResult DocumentSourceOperationMetrics::doGetNext() {
@@ -63,9 +64,11 @@ DocumentSource::GetNextResult DocumentSourceOperationMetrics::doGetNext() {
             }
             return ResourceConsumption::get(pExpCtx->opCtx).getDbMetrics();
         }();
+        auto localTime = jsTime();  // fetch current time to include in all metrics documents
         for (auto& [dbName, metrics] : dbMetrics) {
             BSONObjBuilder builder;
             builder.append(kDatabaseName, dbName);
+            builder.appendDate(kLocalTimeFieldName, localTime);
             metrics.toBson(&builder);
             _operationMetrics.push_back(builder.obj());
         }

@@ -184,15 +184,6 @@ __wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, uint8_t previous_state, uint32
     /* Figure out whether reconciliation was done on the page */
     clean_page = __wt_page_evict_clean(page);
 
-    /*
-     * Discard all page-deleted information. If a truncate call deleted this page, there's memory
-     * associated with it we no longer need, eviction will have built a new version of the page.
-     */
-    if (ref->page_del != NULL) {
-        __wt_free(session, ref->page_del->update_list);
-        __wt_free(session, ref->page_del);
-    }
-
     /* Update the reference and discard the page. */
     if (__wt_ref_is_root(ref))
         __wt_ref_out(session, ref);
@@ -530,9 +521,7 @@ __evict_review(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t evict_flags, bool
         WT_RET(ret);
     }
 
-    /*
-     * It is always OK to evict pages from dead trees if they don't have children.
-     */
+    /* It is always OK to evict pages from dead trees if they don't have children. */
     if (F_ISSET(session->dhandle, WT_DHANDLE_DEAD))
         return (0);
 
@@ -584,7 +573,7 @@ __evict_review(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t evict_flags, bool
      * while checkpoint is operating on the HS file, we can end up in a situation where we exceed
      * the cache size limits.
      */
-    if (modified && conn->txn_global.checkpoint_running_hs && !WT_IS_HS(btree->dhandle) &&
+    if (conn->txn_global.checkpoint_running_hs && !WT_IS_HS(btree->dhandle) &&
       __wt_cache_hs_dirty(session) && __wt_cache_full(session)) {
         WT_STAT_CONN_INCR(session, cache_eviction_blocked_checkpoint_hs);
         return (__wt_set_return(session, EBUSY));

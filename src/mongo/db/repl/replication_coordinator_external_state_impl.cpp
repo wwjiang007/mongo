@@ -44,6 +44,7 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -63,7 +64,6 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/noop_writer.h"
 #include "mongo/db/repl/oplog.h"
@@ -83,7 +83,6 @@
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
-#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
@@ -271,6 +270,8 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
     auto oldOplogBuffer = std::move(_oplogBuffer);
     auto oldBgSync = std::move(_bgSync);
     auto oldApplier = std::move(_oplogApplier);
+    auto oldWriterPool = std::move(_writerPool);
+    auto oldApplierExecutor = std::move(_oplogApplierTaskExecutor);
     lock.unlock();
 
     // _syncSourceFeedbackThread should be joined before _bgSync's shutdown because it has
@@ -308,6 +309,20 @@ void ReplicationCoordinatorExternalStateImpl::_stopDataReplication_inlock(
 
     if (oldOplogBuffer) {
         oldOplogBuffer->shutdown(opCtx);
+    }
+
+    // Once the writer pool's shutdown() is called, scheduling new tasks will return error, so
+    // we shutdown writer pool after the applier exits to avoid new tasks being scheduled.
+    if (oldWriterPool) {
+        LOGV2(5698300, "Stopping replication applier writer pool");
+        oldWriterPool->shutdown();
+        oldWriterPool->join();
+    }
+
+    if (oldApplierExecutor) {
+        LOGV2(21307, "Stopping replication storage threads");
+        oldApplierExecutor->shutdown();
+        oldApplierExecutor->join();
     }
 
     lock.lock();
@@ -386,11 +401,7 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
 
     _stopDataReplication_inlock(opCtx, lk);
 
-    LOGV2(21307, "Stopping replication storage threads");
     _taskExecutor->shutdown();
-    _oplogApplierTaskExecutor->shutdown();
-
-    _oplogApplierTaskExecutor->join();
     lk.unlock();
 
     // Perform additional shutdown steps below that must be done outside _threadMutex.
@@ -905,8 +916,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // refreshes which should use the recovered configOpTime.
         migrationutil::resubmitRangeDeletionsOnStepUp(_service);
         migrationutil::resumeMigrationCoordinationsOnStepUp(opCtx);
-
-        sharding_ddl_util::retakeInMemoryRecoverableCriticalSections(opCtx);
 
         const bool scheduleAsyncRefresh = true;
         resharding::clearFilteringMetadata(opCtx, scheduleAsyncRefresh);

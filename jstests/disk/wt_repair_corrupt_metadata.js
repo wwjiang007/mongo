@@ -31,15 +31,6 @@ let runTest = function(mongodOptions) {
     const turtleFileWithoutCollection = dbpath + "WiredTiger.turtle.1";
 
     let mongod = startMongodOnExistingPath(dbpath, mongodOptions);
-    // Unfortunately using --nojournal triggers a WT_PANIC and aborts in debug builds, which the
-    // following test case can exercise.
-    // TODO: This return can be removed once WT-4310 is completed.
-    let isDebug = mongod.getDB(baseName).adminCommand('buildInfo').debug;
-    if (isDebug) {
-        jsTestLog("Skipping test case because this is a debug build");
-        MongoRunner.stopMongod(mongod);
-        return;
-    }
 
     // Force a checkpoint and make a copy of the turtle file.
     assert.commandWorked(mongod.getDB(baseName).adminCommand({fsync: 1}));
@@ -79,7 +70,6 @@ let runTest = function(mongodOptions) {
     // Corrupt the .turtle file in a very specific way such that the log sequence numbers are
     // invalid.
     if (mongodOptions.hasOwnProperty('journal')) {
-        // TODO: This return can be removed once WT-4459 is completed.
         if (_isAddressSanitizerActive()) {
             jsTestLog("Skipping log file corruption because the address sanitizer is active.");
             return;

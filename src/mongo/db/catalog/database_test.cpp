@@ -57,7 +57,6 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
 
@@ -117,8 +116,8 @@ void DatabaseTest::tearDown() {
 
 TEST_F(DatabaseTest, SetDropPendingThrowsExceptionIfDatabaseIsAlreadyInADropPendingState) {
     writeConflictRetry(_opCtx.get(), "testSetDropPending", _nss.ns(), [this] {
-        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         ASSERT_FALSE(db->isDropPending(_opCtx.get()));
@@ -140,8 +139,8 @@ TEST_F(DatabaseTest, SetDropPendingThrowsExceptionIfDatabaseIsAlreadyInADropPend
 TEST_F(DatabaseTest, CreateCollectionThrowsExceptionWhenDatabaseIsInADropPendingState) {
     writeConflictRetry(
         _opCtx.get(), "testÇreateCollectionWhenDatabaseIsInADropPendingState", _nss.ns(), [this] {
-            AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
-            auto db = autoDb.getDb();
+            AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+            auto db = autoDb.ensureDbExists();
             ASSERT_TRUE(db);
 
             db->setDropPending(_opCtx.get(), true);
@@ -172,8 +171,8 @@ void _testDropCollection(OperationContext* opCtx,
     if (createCollectionBeforeDrop) {
         writeConflictRetry(opCtx, "testDropCollection", nss.ns(), [=] {
             WriteUnitOfWork wuow(opCtx);
-            AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
-            auto db = autoDb.getDb();
+            AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+            auto db = autoDb.ensureDbExists();
             ASSERT_TRUE(db);
             ASSERT_TRUE(db->createCollection(opCtx, nss, collOpts));
             wuow.commit();
@@ -181,8 +180,8 @@ void _testDropCollection(OperationContext* opCtx,
     }
 
     writeConflictRetry(opCtx, "testDropCollection", nss.ns(), [=] {
-        AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         WriteUnitOfWork wuow(opCtx);
@@ -246,8 +245,8 @@ TEST_F(DatabaseTest, DropCollectionRejectsProvidedDropOpTimeIfWritesAreReplicate
 
     auto opCtx = _opCtx.get();
     auto nss = _nss;
-    AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
-    auto db = autoDb.getDb();
+    AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+    auto db = autoDb.ensureDbExists();
     writeConflictRetry(opCtx, "testDropOpTimeWithReplicated", nss.ns(), [&] {
         ASSERT_TRUE(db);
 
@@ -290,8 +289,8 @@ TEST_F(
 void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationContext* opCtx,
                                                                    const NamespaceString& nss) {
     writeConflictRetry(opCtx, "testDropCollectionWithIndexesInProgress", nss.ns(), [opCtx, nss] {
-        AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         Collection* collection = nullptr;
@@ -350,8 +349,8 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
     auto toNss = NamespaceString(fromNss.getSisterNS("bar"));
     ASSERT_NOT_EQUALS(fromNss, toNss);
 
-    AutoGetOrCreateDb autoDb(opCtx, fromNss.db(), MODE_X);
-    auto db = autoDb.getDb();
+    AutoGetDb autoDb(opCtx, fromNss.db(), MODE_X);
+    auto db = autoDb.ensureDbExists();
     ASSERT_TRUE(db);
 
     auto fromUuid = UUID::gen();
@@ -377,8 +376,7 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
         auto toCollection = catalog->lookupCollectionByNamespace(opCtx, toNss);
         ASSERT_TRUE(toCollection);
 
-        auto toCollectionOptions =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, toCollection->getCatalogId());
+        const auto& toCollectionOptions = toCollection->getCollectionOptions();
 
         auto toUuid = toCollectionOptions.uuid;
         ASSERT_TRUE(toUuid);
@@ -393,8 +391,8 @@ TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUu
 TEST_F(DatabaseTest,
        MakeUniqueCollectionNamespaceReturnsFailedToParseIfModelDoesNotContainPercentSign) {
     writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
-        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
         ASSERT_EQUALS(
             ErrorCodes::FailedToParse,
@@ -404,8 +402,8 @@ TEST_F(DatabaseTest,
 
 TEST_F(DatabaseTest, MakeUniqueCollectionNamespaceReplacesPercentSignsWithRandomCharacters) {
     writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
-        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         auto model = "tmp%%%%"_sd;
@@ -446,8 +444,8 @@ TEST_F(
     DatabaseTest,
     MakeUniqueCollectionNamespaceReturnsNamespaceExistsIfGeneratedNamesMatchExistingCollections) {
     writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
-        AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
-        auto db = autoDb.getDb();
+        AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+        auto db = autoDb.ensureDbExists();
         ASSERT_TRUE(db);
 
         auto model = "tmp%"_sd;
@@ -528,8 +526,8 @@ TEST_F(DatabaseTest, CreateCollectionProhibitsReplicatedCollectionsWithoutIdInde
                        "testÇreateCollectionProhibitsReplicatedCollectionsWithoutIdIndex",
                        _nss.ns(),
                        [this] {
-                           AutoGetOrCreateDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
-                           auto db = autoDb.getDb();
+                           AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+                           auto db = autoDb.ensureDbExists();
                            ASSERT_TRUE(db);
 
                            WriteUnitOfWork wuow(_opCtx.get());

@@ -3,10 +3,9 @@
  * time-series collections.
  *
  * @tags: [
- *     does_not_support_stepdowns,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   does_not_support_stepdowns,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -178,7 +177,7 @@ expectedStats.avgNumMeasurementsPerCommit =
 checkCollStats();
 
 const kIdleBucketExpiryMemoryUsageThreshold = 1024 * 1024 * 100;
-numDocs = 60;
+numDocs = 70;
 largeValue = 'a'.repeat(1024 * 1024);
 
 const testIdleBucketExpiry = function(docFn) {

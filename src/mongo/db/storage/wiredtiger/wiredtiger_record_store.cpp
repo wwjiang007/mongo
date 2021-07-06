@@ -548,18 +548,15 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
           "approximately {containsNumRecords} records totaling to {containsNumBytes} bytes",
           "Taking samples and assuming each oplog section contains",
           "numSamples"_attr = numSamples,
+          "minBytesPerStone"_attr = _minBytesPerStone,
           "containsNumRecords"_attr = estRecordsPerStone,
           "containsNumBytes"_attr = estBytesPerStone);
-
-    // Inform the random cursor of the number of samples we intend to take. This allows it to
-    // account for skew in the tree shape.
-    const std::string extraConfig = str::stream() << "next_random_sample_size=" << numSamples;
 
     // Divide the oplog into 'wholeStones' logical sections, with each section containing
     // approximately 'estRecordsPerStone'. Do so by oversampling the oplog, sorting the samples in
     // order of their RecordId, and then choosing the samples expected to be near the right edge of
     // each logical section.
-    auto cursor = _rs->getRandomCursorWithOptions(opCtx, extraConfig);
+    auto cursor = _rs->getRandomCursor(opCtx);
     std::vector<RecordIdAndWall> oplogEstimates;
     auto lastProgressLog = Date_t::now();
     for (int i = 0; i < numSamples; ++i) {
@@ -775,7 +772,15 @@ StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
         ss << "prefix_compression,";
     }
 
-    ss << "block_compressor=" << wiredTigerGlobalOptions.collectionBlockCompressor << ",";
+    ss << "block_compressor=";
+    if (options.timeseries) {
+        // Time-series collections use zstd compression by default.
+        ss << WiredTigerGlobalOptions::kDefaultTimeseriesCollectionCompressor;
+    } else {
+        // All other collections use the globally configured default.
+        ss << wiredTigerGlobalOptions.collectionBlockCompressor;
+    }
+    ss << ",";
 
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())->getTableCreateConfig(ns);
 
@@ -845,6 +850,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
                     getGlobalReplSettings().usingReplSets() ||
                         repl::ReplSettings::shouldRecoverFromOplogAsStandalone())),
       _isOplog(NamespaceString::oplog(params.ns)),
+      _forceUpdateWithFullDocument(params.forceUpdateWithFullDocument),
       _oplogMaxSize(params.oplogMaxSize),
       _cappedCallback(params.cappedCallback),
       _shuttingDown(false),
@@ -1176,16 +1182,29 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
             // It is necessary that there exists a record after the stone but before or including
             // the mayTruncateUpTo point.  Since the mayTruncateUpTo point may fall between
             // records, the stone check is not sufficient.
-            CursorKey key = makeCursorKey(stone->lastRecord, _keyFormat);
-            setKey(cursor, &key);
-            ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return cursor->search(cursor); });
+            CursorKey truncateUpToKey = makeCursorKey(stone->lastRecord, _keyFormat);
+            setKey(cursor, &truncateUpToKey);
+            int cmp;
+            ret = wiredTigerPrepareConflictRetry(opCtx,
+                                                 [&] { return cursor->search_near(cursor, &cmp); });
             invariantWTOK(ret);
-            ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return cursor->next(cursor); });
-            if (ret == WT_NOTFOUND) {
-                LOGV2_DEBUG(5140900, 0, "Will not truncate entire oplog");
-                return;
+
+            // Check 'cmp' to determine if we landed on the requested record. While it is often the
+            // case that stones represent a perfect partitioning of the oplog, it's not guaranteed.
+            // The truncation method is lenient to overlapping stones. See SERVER-56590 for details.
+            // If we landed land on a higher record (cmp > 0), we likely truncated a duplicate stone
+            // in a previous iteration. In this case we can skip the check for oplog entries after
+            // the stone we are truncating. If we landed on a prior record, then we have records
+            // that are not in truncation range of any stone. This will have been logged as a
+            // warning, above.
+            if (cmp <= 0) {
+                ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return cursor->next(cursor); });
+                if (ret == WT_NOTFOUND) {
+                    LOGV2_DEBUG(5140900, 0, "Will not truncate entire oplog");
+                    return;
+                }
+                invariantWTOK(ret);
             }
-            invariantWTOK(ret);
             RecordId nextRecord = getKey(cursor);
             if (static_cast<std::uint64_t>(nextRecord.getLong()) > mayTruncateUpTo.asULL()) {
                 LOGV2_DEBUG(5140901,
@@ -1196,8 +1215,11 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
                             "mayTruncateUpTo"_attr = mayTruncateUpTo);
                 return;
             }
+
+            // After checking whether or not we should truncate, reposition the cursor back to the
+            // current stone's lastRecord.
             invariantWTOK(cursor->reset(cursor));
-            setKey(cursor, &key);
+            setKey(cursor, &truncateUpToKey);
             invariantWTOK(session->truncate(session, nullptr, nullptr, cursor, nullptr));
             _changeNumRecords(opCtx, -stone->records);
             _increaseDataSize(opCtx, -stone->bytes);
@@ -1254,7 +1276,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
 
     if (_keyFormat == KeyFormat::Long) {
         // Non-clustered record stores will extract the RecordId key for the oplog and generate
-        // unique int64_t RecordId's for everything else.
+        // unique int64_t RecordIds if RecordIds are not set.
         for (size_t i = 0; i < nRecords; i++) {
             auto& record = records[i];
             if (_isOplog) {
@@ -1264,7 +1286,11 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                     return status.getStatus();
                 record.id = status.getValue();
             } else {
-                record.id = _nextId(opCtx);
+                // Some RecordStores, like TemporaryRecordStores, may want to set their own
+                // RecordIds.
+                if (record.id.isNull()) {
+                    record.id = _nextId(opCtx);
+                }
             }
             dassert(record.id > highestIdRecord.id);
             highestIdRecord = record;
@@ -1274,6 +1300,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
     for (size_t i = 0; i < nRecords; i++) {
         auto& record = records[i];
         invariant(!record.id.isNull());
+        invariant(!record_id_helpers::isReserved(record.id));
         Timestamp ts;
         if (timestamps[i].isNull() && _isOplog) {
             // If the timestamp is 0, that probably means someone inserted a document directly
@@ -1452,7 +1479,8 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
     const int kMaxDiffBytes = len / 10;
 
     bool skip_update = false;
-    if (!_isLogged && len > kMinLengthForDiff && len <= old_length + kMaxDiffBytes) {
+    if (!_forceUpdateWithFullDocument && !_isLogged && len > kMinLengthForDiff &&
+        len <= old_length + kMaxDiffBytes) {
         int nentries = kMaxEntries;
         std::vector<WT_MODIFY> entries(nentries);
 
@@ -1512,9 +1540,9 @@ StatusWith<RecordData> WiredTigerRecordStore::updateWithDamages(
     size_t modifiedDataSize = 0;
     for (u_int i = 0; where != end; ++i, ++where) {
         entries[i].data.data = damageSource + where->sourceOffset;
-        entries[i].data.size = where->size;
+        entries[i].data.size = where->sourceSize;
         entries[i].offset = where->targetOffset;
-        entries[i].size = where->size;
+        entries[i].size = where->targetSize;
         // Account for both the amount of old data we are overwriting (size) and new data we are
         // inserting (data.size).
         modifiedDataSize += entries[i].size;
@@ -1545,8 +1573,7 @@ StatusWith<RecordData> WiredTigerRecordStore::updateWithDamages(
 
 std::unique_ptr<RecordCursor> WiredTigerRecordStore::getRandomCursor(
     OperationContext* opCtx) const {
-    const char* extraConfig = "";
-    return getRandomCursorWithOptions(opCtx, extraConfig);
+    return std::make_unique<RandomCursor>(opCtx, *this, "");
 }
 
 Status WiredTigerRecordStore::truncate(OperationContext* opCtx) {
@@ -2271,11 +2298,6 @@ std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
     }
 
     return std::make_unique<WiredTigerRecordStoreStandardCursor>(opCtx, *this, forward);
-}
-
-std::unique_ptr<RecordCursor> StandardWiredTigerRecordStore::getRandomCursorWithOptions(
-    OperationContext* opCtx, StringData extraConfig) const {
-    return std::make_unique<RandomCursor>(opCtx, *this, extraConfig);
 }
 
 WiredTigerRecordStoreStandardCursor::WiredTigerRecordStoreStandardCursor(

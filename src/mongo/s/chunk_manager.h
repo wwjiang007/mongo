@@ -80,7 +80,7 @@ public:
     explicit ChunkMap(OID epoch,
                       const boost::optional<Timestamp>& timestamp,
                       size_t initialCapacity = 0)
-        : _collectionVersion(0, 0, epoch, timestamp) {
+        : _collectionVersion(0, 0, epoch, timestamp), _collTimestamp(timestamp) {
         _chunkMap.reserve(initialCapacity);
     }
 
@@ -134,6 +134,14 @@ private:
 
     // Max version across all chunks
     ChunkVersion _collectionVersion;
+
+    // Represents the timestamp present in config.collections for this ChunkMap.
+    //
+    // Note that due to the way Phase 1 of the FCV upgrade writes timestamps to chunks
+    // (non-atomically), it is possible that chunks exist with timestamps, but the corresponding
+    // config.collections entry doesn't. In this case, the chunks timestamp should be ignored when
+    // computing the collection version and we should use _collTimestamp instead.
+    boost::optional<Timestamp> _collTimestamp;
 };
 
 /**
@@ -398,14 +406,6 @@ public:
     static ComparableChunkVersion makeComparableChunkVersionForForcedRefresh();
 
     /**
-     * Creates a new instance which will artificially be greater than any
-     * previously created ComparableChunkVersion. Instances created afterwards
-     * will be compared as-if this object was a normal (i.e. non-forced) ComparableChunkVersion.
-     */
-    static ComparableChunkVersion makeComparableChunkVersionForForcedRefresh(
-        const ChunkVersion& version);
-
-    /**
      * Empty constructor needed by the ReadThroughCache.
      *
      * Instances created through this constructor will be always less then the ones created through
@@ -446,6 +446,8 @@ public:
     }
 
 private:
+    friend class CatalogCache;
+
     static AtomicWord<uint64_t> _epochDisambiguatingSequenceNumSource;
     static AtomicWord<uint64_t> _forcedRefreshSequenceNumSource;
 
@@ -455,6 +457,8 @@ private:
         : _forcedRefreshSequenceNum(forcedRefreshSequenceNum),
           _chunkVersion(std::move(version)),
           _epochDisambiguatingSequenceNum(epochDisambiguatingSequenceNum) {}
+
+    void setChunkVersion(const ChunkVersion& version);
 
     uint64_t _forcedRefreshSequenceNum{0};
 
@@ -609,7 +613,9 @@ public:
      * Throws a DBException with the ShardKeyNotFound code if unable to target a single shard due to
      * collation or due to the key not matching the shard key pattern.
      */
-    Chunk findIntersectingChunk(const BSONObj& shardKey, const BSONObj& collation) const;
+    Chunk findIntersectingChunk(const BSONObj& shardKey,
+                                const BSONObj& collation,
+                                bool bypassIsFieldHashedCheck = false) const;
 
     /**
      * Same as findIntersectingChunk, but assumes the simple collation.

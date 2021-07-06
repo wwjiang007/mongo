@@ -76,7 +76,8 @@ const HostAndPort kTestHosts[] = {
     HostAndPort("TestHost1:12345"), HostAndPort("TestHost2:12345"), HostAndPort("TestHost3:12345")};
 
 Status getMockDuplicateKeyError() {
-    return {DuplicateKeyErrorInfo(BSON("mock" << 1), BSON("" << 1)), "Mock duplicate key error"};
+    return {DuplicateKeyErrorInfo(BSON("mock" << 1), BSON("" << 1), BSONObj{}),
+            "Mock duplicate key error"};
 }
 
 TEST_F(InsertRetryTest, RetryOnInterruptedAndNetworkErrorSuccess) {
@@ -371,7 +372,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryErrorReturnedPersistently) {
         onCommand([](const RemoteCommandRequest& request) {
             BSONObjBuilder bb;
             CommandHelpers::appendCommandStatusNoThrow(
-                bb, {ErrorCodes::NotWritablePrimary, "not master"});
+                bb, {ErrorCodes::NotWritablePrimary, "not primary"});
             return bb.obj();
         });
     }
@@ -380,7 +381,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryErrorReturnedPersistently) {
 }
 
 TEST_F(UpdateRetryTest, NotWritablePrimaryReturnedFromTargeter) {
-    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotWritablePrimary, "not master"));
+    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotWritablePrimary, "not primary"));
 
     BSONObj objToUpdate = BSON("_id" << 1 << "Value"
                                      << "TestValue");
@@ -434,7 +435,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
 
         BSONObjBuilder bb;
         CommandHelpers::appendCommandStatusNoThrow(bb,
-                                                   {ErrorCodes::NotWritablePrimary, "not master"});
+                                                   {ErrorCodes::NotWritablePrimary, "not primary"});
         return bb.obj();
     });
 

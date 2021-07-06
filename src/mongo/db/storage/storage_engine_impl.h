@@ -39,7 +39,6 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/durable_catalog_feature_tracker.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_drop_pending_ident_reaper.h"
 #include "mongo/db/storage/record_store.h"
@@ -150,8 +149,6 @@ public:
     virtual Timestamp getAllDurableTimestamp() const override;
 
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
-
-    bool supportsClusteredIdIndex() const final;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -317,30 +314,24 @@ public:
     }
 
     void addDropPendingIdent(const Timestamp& dropTimestamp,
-                             const NamespaceString& nss,
                              std::shared_ptr<Ident> ident,
                              DropIdentCallback&& onDrop) override;
 
     void checkpoint() override;
 
-    DurableCatalog* getCatalog() override {
-        return _catalog.get();
-    }
-
-    const DurableCatalog* getCatalog() const override {
-        return _catalog.get();
-    }
-
     StatusWith<ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx,
-        InternalIdentReconcilePolicy internalIdentReconcilePolicy) override;
+        OperationContext* opCtx, LastShutdownState lastShutdownState) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;
+
+    DurableCatalog* getCatalog() override;
+
+    const DurableCatalog* getCatalog() const override;
 
     /**
      * When loading after an unclean shutdown, this performs cleanup on the DurableCatalogImpl.
      */
-    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final;
+    void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) final;
 
     void closeCatalog(OperationContext* opCtx) final;
 
@@ -350,11 +341,6 @@ public:
 
     std::set<std::string> getDropPendingIdents() const override {
         return _dropPendingIdentReaper.getAllIdentNames();
-    }
-
-    Status currentFilesCompatible(OperationContext* opCtx) const override {
-        // Delegate to the FeatureTracker as to whether the data files are compatible or not.
-        return _catalog->getFeatureTracker()->isCompatibleWithCurrentCode(opCtx);
     }
 
     int64_t sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) override;
@@ -369,6 +355,8 @@ public:
                                              bool roundUpIfTooOld) override;
 
     void unpinOldestTimestamp(const std::string& requestingServiceName) override;
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override;
 
 private:
     using CollIter = std::list<std::string>::iterator;
@@ -410,7 +398,7 @@ private:
      */
     bool _handleInternalIdent(OperationContext* opCtx,
                               const std::string& ident,
-                              InternalIdentReconcilePolicy internalIdentReconcilePolicy,
+                              LastShutdownState lastShutdownState,
                               ReconcileResult* reconcileResult,
                               std::set<std::string>* internalIdentsToDrop,
                               std::set<std::string>* allInternalIdents);

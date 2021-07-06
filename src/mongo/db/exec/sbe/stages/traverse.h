@@ -38,12 +38,30 @@ namespace mongo::sbe {
  * This is an array traversal operator. If the input value coming from the 'outer' side is an array
  * then we execute the 'inner' side exactly once for every element of the array. The results from
  * the 'inner' side are then collected into the output array value. The traversal is recursive and
- * the structure of nested arrays is preserved (up to optional depth). If the input value is not an
- * array then we execute the inner side just once and return the result.
+ * the structure of nested arrays is preserved (up to optional depth 'nestedArraysDepth'). If the
+ * input value is not an array then we execute the inner side just once and return the result.
  *
- * If an optional 'fold' expression is provided then instead of the output array we combine
- * individual results into a single output value. Another expression 'final' controls optional
+ * The 'inField' slot contains the value from the outer side which ie being traversed. When the
+ * traversal is complete, the resulting value is placed in the slot given by 'outField'. Note that
+ * it is legal for 'outField' and 'inField' to be the same slot when there are no fold or final
+ * expressions. The 'outFieldInner' slot is the slot that the traverse stage should read in order to
+ * get the resulting value whenever it executes the inner side. In other words, when the inner side
+ * is re-opened and executed once for a particular array element, the 'outFieldInner' slot holds the
+ * result of this operation (which may subsequently be passed to the fold/final expressions).
+ *
+ * The 'outerCorrelated' slots are slots from the outer side that are made visible to the inner
+ * side.
+ *
+ * If an optional 'foldExpr' expression is provided, then instead of the output array we combine
+ * individual results into a single output value. Another expression 'finalExpr' controls optional
  * short-circuiting (a.k.a. early out) logic.
+ *
+ * Debug string representation:
+ *
+ *  traverse outputSlot outputFromInnerBranchSlot inputSlot [<correlated slots>]
+ *          { foldExpr }? { finalExpr }?
+ *          from childStage
+ *          in childStage
  */
 class TraverseStage final : public PlanStage {
 public:
@@ -70,11 +88,21 @@ public:
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
 
+protected:
+    void doSaveState() final;
+    void doRestoreState() final;
+
 private:
     void openInner(value::TypeTags tag, value::Value val);
     bool traverse(value::SlotAccessor* inFieldAccessor,
                   value::OwnedValueAccessor* outFieldOutputAccessor,
                   size_t level);
+    PlanState getNextOuterSide() {
+        _isReadingLeftSide = true;
+        auto ret = _children[0]->getNext();
+        _isReadingLeftSide = false;
+        return ret;
+    }
 
     // The input slot holding value being traversed.
     const value::SlotId _inField;
@@ -105,10 +133,16 @@ private:
     std::unique_ptr<vm::CodeFragment> _foldCode;
     std::unique_ptr<vm::CodeFragment> _finalCode;
 
+    std::list<value::ArrayAccessor> _inArrayAccessors;
+
     vm::ByteCode _bytecode;
 
     bool _compiled{false};
     bool _reOpenInner{false};
     TraverseStats _specificStats;
+
+    // Tracks whether or not we're reading from the left child or the right child.
+    // This is necessary for yielding.
+    bool _isReadingLeftSide = false;
 };
 }  // namespace mongo::sbe

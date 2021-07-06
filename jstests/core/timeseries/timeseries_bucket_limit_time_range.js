@@ -1,12 +1,11 @@
 /**
  * Tests maximum time-range of measurements held in each bucket in a time-series buckets collection.
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -54,7 +53,7 @@ TimeseriesTest.run((insert) => {
         }
 
         // Check bucket collection.
-        const bucketDocs = bucketsColl.find().sort({_id: 1}).toArray();
+        const bucketDocs = bucketsColl.find().sort({'control.min._id': 1}).toArray();
         assert.eq(2, bucketDocs.length, bucketDocs);
 
         // Check both buckets.

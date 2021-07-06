@@ -84,6 +84,9 @@ public:
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
 
+protected:
+    void doSaveState() final;
+
 private:
     const CheckBoundsParams _params;
     IndexBoundsChecker _checker;
@@ -98,5 +101,8 @@ private:
 
     bool _isEOF{false};
     CheckBoundsStats _specificStats;
+
+    BufBuilder _keyBuffer;
+    IndexSeekPoint _seekPoint;
 };
 }  // namespace mongo::sbe

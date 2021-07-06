@@ -1,4 +1,13 @@
-test_kind: js_test
+config_variables:
+- &keyFile jstests/libs/authTestsKey
+- &keyFileData Thiskeyisonlyforrunningthesuitewithauthenticationdontuseitinanytestsdirectly
+- &authOptions
+  authenticationDatabase: admin
+  authenticationMechanism: SCRAM-SHA-1
+  password: *keyFileData
+  username: __system
+
+test_kind: multi_stmt_txn_passthrough
 # This suite starts two 3-node replica sets and uses the ContinuousTenantMigration hook to run
 # background tenant migrations. It also wraps all CRUD commands in transactions and asserts that
 # the transactions are committed/aborted correctly while tenant migrations are running.
@@ -14,6 +23,8 @@ selector:
 
   # These tests already run with transactions.
   - jstests/core/txns/**/*.js
+  # Skip any tests that run with auth explicitly.
+  - jstests/core/*[aA]uth*.js
   # These tests depend on hardcoded database name equality.
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/list_databases.js
@@ -56,9 +67,6 @@ selector:
   - jstests/core/user_management_helpers.js
   # These tests use legacy read mode which does not use runCommand.
   - jstests/core/comment_field.js
-  - jstests/core/invalidated_legacy_cursors.js
-  # TODO (SERVER-52866): Synchronize getLastError with tenant migrations.
-  - jstests/core/bulk_legacy_enforce_gle.js
   # This test contains assertions for the hostname that operations run on.
   - jstests/core/currentop_cursors.js
   # Server parameters are stored in-memory only so are not transferred onto the recipient. These
@@ -91,6 +99,32 @@ selector:
   - jstests/core/updatel.js
   - jstests/core/where_system_js.js
   - jstests/core/write_result.js
+  # These tests run applyOps which is not supported in serverless.
+  - jstests/core/apply_ops1.js
+  - jstests/core/apply_ops1.js
+  - jstests/core/apply_ops2.js
+  - jstests/core/apply_ops_dups.js
+  - jstests/core/apply_ops_index_collation.js
+  - jstests/core/apply_ops_invalid_index_spec.js
+  - jstests/core/apply_ops_missing_field.js
+  - jstests/core/apply_ops_system_dot_views.js
+  - jstests/core/apply_ops_without_ns.js
+  - jstests/core/bypass_doc_validation.js
+  - jstests/core/collation.js
+  - jstests/core/collmod_without_uuid.js
+  - jstests/core/txns/commands_banning_txnnumber_outside_transactions.js
+  - jstests/core/txns/commands_not_allowed_in_txn.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+  - jstests/core/txns/statement_ids_accepted.js
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/list_collections_no_views.js
+  - jstests/core/views/duplicate_ns.js
+  - jstests/core/views/view_with_invalid_dbname.js
+  - jstests/core/views/views_creation.js
+  - jstests/core/views/invalid_system_views.js
+  - jstests/core/views/views_all_commands.js
+  - jstests/core/rename_collection_staytemp.js
 
   #
   # Excluded from replica_sets_multi_stmt_txn_jscore_passthrough.yml
@@ -101,6 +135,7 @@ selector:
   ##
 
   # These tests expects some statements to error, which will cause txns to abort entirely.
+  - jstests/core/api_params_getmore.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
@@ -113,7 +148,6 @@ selector:
   - jstests/core/geo_allowedcomparisons.js
   - jstests/core/geo_big_polygon2.js
   - jstests/core/geonear_key.js
-  - jstests/core/get_more_cmd_refuses_api_params.js
   - jstests/core/in.js
   - jstests/core/index8.js # No explicit check for failed command.
   - jstests/core/index_decimal.js
@@ -285,9 +319,6 @@ selector:
   # Does not support tojson of command objects.
   - jstests/core/SERVER-23626.js
 
-  # TODO(SERVER-55882): Investigate why this test is failing.
-  - jstests/core/wildcard_index_multikey.js
-
   exclude_with_any_tags:
   - assumes_standalone_mongod
   # These tests run getMore commands which are not supported in the tenant migration passthrough.
@@ -313,8 +344,8 @@ selector:
   - inspects_whether_plan_cache_entry_is_active
   # $out is not supported in transactions
   - uses_$out
-  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
-  # cannot be run with transactions.
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
   - uses_api_parameters
   - does_not_support_transactions
 
@@ -332,26 +363,39 @@ executor:
         load('jstests/libs/override_methods/enable_sessions.js');
         load('jstests/libs/override_methods/txn_passthrough_cmd_massage.js');
         load('jstests/libs/override_methods/network_error_and_txn_override.js');
+        jsTest.authenticate(db.getMongo());
       global_vars:
         TestData: &TestData
           tenantId: "tenantMigrationTenantId"
+          auth: true
+          authMechanism: SCRAM-SHA-1
+          keyFile: *keyFile
+          keyFileData: *keyFileData
+          roleGraphInvalidationIsFatal: true
           networkErrorAndTxnOverrideConfig:
             wrapCRUDinTransactions: true
           sessionOptions:
             # Tests in this suite only read from primaries and only one node is electable, so causal
             # consistency is not required to read your own writes.
             causalConsistency: false
-      readMode: commands
   hooks:
   - class: ContinuousTenantMigration
     shell_options:
       global_vars:
-        TestData: *TestData
+        TestData:
+          <<: *TestData
+          authOptions: *authOptions
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
   - class: CheckReplOplogs
+    shell_options:
+      global_vars:
+        TestData: *TestData
   - class: CheckReplDBHash
+    shell_options:
+      global_vars:
+        TestData: *TestData
   - class: ValidateCollections
   - class: CleanEveryN
     n: 1
@@ -372,14 +416,14 @@ executor:
         # so. Therefore, the garbage collection delay doesn't need to be large.
         tenantMigrationGarbageCollectionDelayMS: 1
         ttlMonitorSleepSecs: 1
-        # The donor replica set may have active transactions while a migration is in progress. If
-        # the migration is committed, those transactions may never receive 'commitTransaction' or
-        # 'abortTransaction', since all writes are automatically rerouted to the recipient. We set
-        # a low 'transactionLifetimeLimitSeconds' value to ensure that they are cleaned up quickly.
-        transactionLifetimeLimitSeconds: 10
+        # Tenant migrations is not currently compatible with implicitly replicated retryable
+        # findAndModify images.
+        storeFindAndModifyImagesInSideCollection: false
       tlsMode: allowTLS
       tlsCAFile: jstests/libs/ca.pem
       tlsAllowInvalidHostnames: ''
+      auth: ''
+      keyFile: *keyFile
     per_mongod_options:
       # Each entry is for a different replica set's extra mongod options.
       - tlsCertificateKeyFile: jstests/libs/rs0.pem
@@ -387,3 +431,4 @@ executor:
     num_replica_sets: 2
     num_nodes_per_replica_set: 3
     use_replica_set_connection_string: true
+    auth_options: *authOptions

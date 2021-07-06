@@ -3,12 +3,10 @@
  * range scan using a combination of minRecord and maxRecord.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
- *     requires_wiredtiger,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -17,20 +15,20 @@
 load('jstests/libs/analyze_plan.js');
 load("jstests/core/timeseries/libs/timeseries.js");
 
-// Although this test is tagged with 'requires_wiredtiger', this is not sufficient for ensuring that
-// the parallel suite runs this test only on WT configurations.
-if (!TimeseriesTest.supportsClusteredIndexes(db.getMongo())) {
-    return;
-}
-
 TimeseriesTest.run((insert) => {
-    const now = new Date();
-    const dates = [];
-    for (let i = 0; i < 10; i++) {
-        let d = new Date();
-        d.setDate(now.getDate() + (i - 5));
-        dates.push(d);
-    }
+    // These dates will all be inserted into individual buckets.
+    const dates = [
+        ISODate("2021-04-01T00:00:00.000Z"),
+        ISODate("2021-04-02T00:00:00.000Z"),
+        ISODate("2021-04-03T00:00:00.000Z"),
+        ISODate("2021-04-04T00:00:00.000Z"),
+        ISODate("2021-04-05T00:00:00.000Z"),
+        ISODate("2021-04-06T00:00:00.000Z"),
+        ISODate("2021-04-07T00:00:00.000Z"),
+        ISODate("2021-04-08T00:00:00.000Z"),
+        ISODate("2021-04-09T00:00:00.000Z"),
+        ISODate("2021-04-10T00:00:00.000Z"),
+    ];
 
     const coll = db.timeseries_id_range;
     const timeFieldName = "time";

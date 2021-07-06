@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_build_entry_gen.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
@@ -43,7 +44,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
@@ -165,32 +165,30 @@ Status update(OperationContext* opCtx, const BSONObj& filter, const BSONObj& upd
 namespace indexbuildentryhelpers {
 
 void ensureIndexBuildEntriesNamespaceExists(OperationContext* opCtx) {
-    writeConflictRetry(opCtx,
-                       "createIndexBuildCollection",
-                       NamespaceString::kIndexBuildEntryNamespace.ns(),
-                       [&]() -> void {
-                           AutoGetOrCreateDb autoDb(
-                               opCtx, NamespaceString::kIndexBuildEntryNamespace.db(), MODE_X);
-                           Database* db = autoDb.getDb();
+    writeConflictRetry(
+        opCtx,
+        "createIndexBuildCollection",
+        NamespaceString::kIndexBuildEntryNamespace.ns(),
+        [&]() -> void {
+            AutoGetDb autoDb(opCtx, NamespaceString::kIndexBuildEntryNamespace.db(), MODE_X);
+            auto db = autoDb.ensureDbExists();
 
-                           // Ensure the database exists.
-                           invariant(db);
+            // Ensure the database exists.
+            invariant(db);
 
-                           // Create the collection if it doesn't exist.
-                           if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
-                                   opCtx, NamespaceString::kIndexBuildEntryNamespace)) {
-                               WriteUnitOfWork wuow(opCtx);
-                               CollectionOptions defaultCollectionOptions;
-                               CollectionPtr collection =
-                                   db->createCollection(opCtx,
-                                                        NamespaceString::kIndexBuildEntryNamespace,
-                                                        defaultCollectionOptions);
+            // Create the collection if it doesn't exist.
+            if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+                    opCtx, NamespaceString::kIndexBuildEntryNamespace)) {
+                WriteUnitOfWork wuow(opCtx);
+                CollectionOptions defaultCollectionOptions;
+                CollectionPtr collection = db->createCollection(
+                    opCtx, NamespaceString::kIndexBuildEntryNamespace, defaultCollectionOptions);
 
-                               // Ensure the collection exists.
-                               invariant(collection);
-                               wuow.commit();
-                           }
-                       });
+                // Ensure the collection exists.
+                invariant(collection);
+                wuow.commit();
+            }
+        });
 }
 
 Status persistCommitReadyMemberInfo(OperationContext* opCtx,
@@ -232,7 +230,7 @@ Status addIndexBuildEntry(OperationContext* opCtx, const IndexBuildEntry& indexB
 
             // Reserve a slot in the oplog as the storage engine is allowed to insert oplog
             // documents out-of-order into the oplog.
-            auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+            auto oplogInfo = LocalOplogInfo::get(opCtx);
             auto oplogSlot = oplogInfo->getNextOpTimes(opCtx, 1U)[0];
             Status status = collection->insertDocument(
                 opCtx,
@@ -247,24 +245,21 @@ Status addIndexBuildEntry(OperationContext* opCtx, const IndexBuildEntry& indexB
         });
 }
 
-Status removeIndexBuildEntry(OperationContext* opCtx, UUID indexBuildUUID) {
+Status removeIndexBuildEntry(OperationContext* opCtx,
+                             const CollectionPtr& collection,
+                             UUID indexBuildUUID) {
     return writeConflictRetry(
         opCtx,
         "removeIndexBuildEntry",
         NamespaceString::kIndexBuildEntryNamespace.ns(),
         [&]() -> Status {
-            AutoGetCollection collection(
-                opCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
             if (!collection) {
                 str::stream ss;
                 ss << "Collection not found: " << NamespaceString::kIndexBuildEntryNamespace.ns();
                 return Status(ErrorCodes::NamespaceNotFound, ss);
             }
 
-            RecordId rid = Helpers::findOne(opCtx,
-                                            collection.getCollection(),
-                                            BSON("_id" << indexBuildUUID),
-                                            /*requireIndex=*/true);
+            RecordId rid = Helpers::findById(opCtx, collection, BSON("_id" << indexBuildUUID));
             if (rid.isNull()) {
                 str::stream ss;
                 ss << "No matching IndexBuildEntry found with indexBuildUUID: " << indexBuildUUID;

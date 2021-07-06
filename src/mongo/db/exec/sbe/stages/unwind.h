@@ -32,6 +32,19 @@
 #include "mongo/db/exec/sbe/stages/stages.h"
 
 namespace mongo::sbe {
+/**
+ * Returns the elements of an array and the associated array index one-by-one. The array to unwind
+ * is read from the 'inField' slot. The resulting array elements are put into the 'outField' slot
+ * with the corresponding array indices available in 'outIndex'.
+ *
+ * Generally, if 'inField' contains a non-array value it is skipped. However, if
+ * 'preserveNullAndEmptyArrays' is true then, as the name implies, null or empty arrays are
+ * preserved (i.e. these values are put into the 'outField' slot and the stage returns 'ADVANCED').
+ *
+ * Debug string representation:
+ *
+ *   unwind inputSlot outputValueSlot outputIndexSlot preserveNullAndEmptyArrays childStage
+ */
 class UnwindStage final : public PlanStage {
 public:
     UnwindStage(std::unique_ptr<PlanStage> input,
@@ -53,6 +66,10 @@ public:
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
 
+protected:
+    void doSaveState() final;
+    void doRestoreState() final;
+
 private:
     const value::SlotId _inField;
     const value::SlotId _outField;
@@ -60,8 +77,8 @@ private:
     const bool _preserveNullAndEmptyArrays;
 
     value::SlotAccessor* _inFieldAccessor{nullptr};
-    std::unique_ptr<value::ViewOfValueAccessor> _outFieldOutputAccessor;
-    std::unique_ptr<value::ViewOfValueAccessor> _outIndexOutputAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _outFieldOutputAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _outIndexOutputAccessor;
 
     value::ArrayAccessor _inArrayAccessor;
 

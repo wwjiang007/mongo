@@ -170,7 +170,7 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
         return;
     }
 
-    _view = ViewCatalog::get(db)->lookup(opCtx, _resolvedNss.ns());
+    _view = ViewCatalog::get(db)->lookup(opCtx, _resolvedNss);
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "Namespace " << _resolvedNss.ns() << " is a timeseries collection",
             !_view || viewMode == AutoGetCollectionViewMode::kViewsPermitted ||
@@ -282,7 +282,7 @@ AutoGetCollectionLockFree::AutoGetCollectionLockFree(OperationContext* opCtx,
         return;
     }
 
-    _view = viewCatalog->lookup(opCtx, _resolvedNss.ns());
+    _view = viewCatalog->lookup(opCtx, _resolvedNss);
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "Namespace " << _resolvedNss.ns() << " is a timeseries collection",
             !_view || viewMode == AutoGetCollectionViewMode::kViewsPermitted ||
@@ -428,14 +428,6 @@ LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMod
     return nss.isSystemDotViews() ? MODE_X : mode;
 }
 
-AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
-                                     StringData dbName,
-                                     LockMode mode,
-                                     Date_t deadline)
-    : _autoDb(opCtx, dbName, mode, deadline), _db(_autoDb.ensureDbExists()) {
-    invariant(mode == MODE_IX || mode == MODE_X);
-}
-
 ReadSourceScope::ReadSourceScope(OperationContext* opCtx,
                                  RecoveryUnit::ReadSource readSource,
                                  boost::optional<Timestamp> provided)
@@ -468,7 +460,7 @@ AutoGetOplog::AutoGetOplog(OperationContext* opCtx, OplogAccessMode mode, Date_t
         _globalLock.emplace(opCtx, lockMode, deadline, Lock::InterruptBehavior::kThrow);
     }
 
-    _oplogInfo = repl::LocalOplogInfo::get(opCtx);
+    _oplogInfo = LocalOplogInfo::get(opCtx);
     _oplog = &_oplogInfo->getCollection();
 }
 

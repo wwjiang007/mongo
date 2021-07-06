@@ -51,7 +51,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/tenant_migration_conflict_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
@@ -67,7 +66,7 @@ constexpr StringData ApplyOps::kOplogApplicationModeFieldName;
 
 namespace {
 
-// If enabled, causes loop in _applyOpsWithCommandInfo() to hang after applying current operation.
+// If enabled, causes loop in _applyOps() to hang after applying current operation.
 MONGO_FAIL_POINT_DEFINE(applyOpsPauseBetweenOperations);
 
 /**
@@ -98,12 +97,12 @@ bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
     return true;
 }
 
-Status _applyOpsWithCommandInfo(OperationContext* opCtx,
-                                const ApplyOpsCommandInfo& info,
-                                repl::OplogApplication::Mode oplogApplicationMode,
-                                BSONObjBuilder* result,
-                                int* numApplied,
-                                BSONArrayBuilder* opsBuilder) {
+Status _applyOps(OperationContext* opCtx,
+                 const ApplyOpsCommandInfo& info,
+                 repl::OplogApplication::Mode oplogApplicationMode,
+                 BSONObjBuilder* result,
+                 int* numApplied,
+                 BSONArrayBuilder* opsBuilder) {
     const auto& ops = info.getOperations();
     // apply
     *numApplied = 0;
@@ -187,8 +186,9 @@ Status _applyOpsWithCommandInfo(OperationContext* opCtx,
             OldClientContext ctx(opCtx, nss.ns());
 
             const auto& op = entry.getValue();
+            const bool isDataConsistent = true;
             status = repl::applyOperation_inlock(
-                opCtx, ctx.db(), &op, alwaysUpsert, oplogApplicationMode);
+                opCtx, ctx.db(), &op, alwaysUpsert, oplogApplicationMode, isDataConsistent);
             if (!status.isOK())
                 return status;
 
@@ -252,8 +252,13 @@ Status _applyOpsWithCommandInfo(OperationContext* opCtx,
                         // ops doesn't stop the applyOps from trying to process the rest of the
                         // ops.  This is to leave the door open to parallelizing CRUD op
                         // application in the future.
-                        return repl::applyOperation_inlock(
-                            opCtx, ctx.db(), &entry, alwaysUpsert, oplogApplicationMode);
+                        const bool isDataConsistent = true;
+                        return repl::applyOperation_inlock(opCtx,
+                                                           ctx.db(),
+                                                           &entry,
+                                                           alwaysUpsert,
+                                                           oplogApplicationMode,
+                                                           isDataConsistent);
                     });
             } catch (const DBException& ex) {
                 ab.append(false);
@@ -384,11 +389,11 @@ Status applyApplyOpsOplogEntry(OperationContext* opCtx,
                     &resultWeDontCareAbout);
 }
 
-Status _applyOps(OperationContext* opCtx,
-                 const std::string& dbName,
-                 const BSONObj& applyOpCmd,
-                 repl::OplogApplication::Mode oplogApplicationMode,
-                 BSONObjBuilder* result) {
+Status applyOps(OperationContext* opCtx,
+                const std::string& dbName,
+                const BSONObj& applyOpCmd,
+                repl::OplogApplication::Mode oplogApplicationMode,
+                BSONObjBuilder* result) {
     auto info = ApplyOpsCommandInfo::parse(applyOpCmd);
 
     int numApplied = 0;
@@ -426,8 +431,7 @@ Status _applyOps(OperationContext* opCtx,
     }
 
     if (!info.isAtomic()) {
-        return _applyOpsWithCommandInfo(
-            opCtx, info, oplogApplicationMode, result, &numApplied, nullptr);
+        return _applyOps(opCtx, info, oplogApplicationMode, result, &numApplied, nullptr);
     }
 
     // Perform write ops atomically
@@ -445,12 +449,12 @@ Status _applyOps(OperationContext* opCtx,
             {
                 // Suppress replication for atomic operations until end of applyOps.
                 repl::UnreplicatedWritesBlock uwb(opCtx);
-                uassertStatusOK(_applyOpsWithCommandInfo(opCtx,
-                                                         info,
-                                                         oplogApplicationMode,
-                                                         &intermediateResult,
-                                                         &numApplied,
-                                                         opsBuilder.get()));
+                uassertStatusOK(_applyOps(opCtx,
+                                          info,
+                                          oplogApplicationMode,
+                                          &intermediateResult,
+                                          &numApplied,
+                                          opsBuilder.get()));
             }
             // Generate oplog entry for all atomic ops collectively.
             if (opCtx->writesAreReplicated()) {
@@ -485,8 +489,7 @@ Status _applyOps(OperationContext* opCtx,
     } catch (const DBException& ex) {
         if (ex.code() == ErrorCodes::AtomicityFailure) {
             // Retry in non-atomic mode.
-            return _applyOpsWithCommandInfo(
-                opCtx, info, oplogApplicationMode, result, &numApplied, nullptr);
+            return _applyOps(opCtx, info, oplogApplicationMode, result, &numApplied, nullptr);
         }
         BSONArrayBuilder ab;
         ++numApplied;
@@ -501,41 +504,6 @@ Status _applyOps(OperationContext* opCtx,
     }
 
     return Status::OK();
-}
-
-Status applyOps(OperationContext* opCtx,
-                const std::string& dbName,
-                const BSONObj& applyOpCmd,
-                repl::OplogApplication::Mode oplogApplicationMode,
-                BSONObjBuilder* result) {
-    auto status = _applyOps(opCtx, dbName, applyOpCmd, oplogApplicationMode, result);
-    if (status == ErrorCodes::TenantMigrationConflict) {
-        auto migrationConflictInfo = status.template extraInfo<TenantMigrationConflictInfo>();
-        auto mtab = migrationConflictInfo->getTenantMigrationAccessBlocker();
-        auto migrationStatus =
-            mtab->waitUntilCommittedOrAborted(opCtx, migrationConflictInfo->getOperationType());
-        mtab->recordTenantMigrationError(migrationStatus);
-
-        auto response = result->asTempObj();
-
-        auto numApplied = response.getIntField("applied");
-        BSONArrayBuilder resultsBuilder;
-        BSONObjIterator it(response.getObjectField("results"));
-        while (it.more()) {
-            BSONElement e = it.next();
-            resultsBuilder.append(e.Bool());
-        }
-
-        result->resetToEmpty();
-        result->append("applied", numApplied);
-        result->append("code", migrationStatus.code());
-        result->append("codeName", ErrorCodes::errorString(migrationStatus.code()));
-        result->append("errmsg", migrationStatus.reason());
-        result->append("results", resultsBuilder.arr());
-
-        return migrationStatus;
-    }
-    return status;
 }
 
 // static

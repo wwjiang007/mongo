@@ -59,10 +59,10 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/view_catalog.h"
@@ -120,6 +120,37 @@ bool isTimeseries(OperationContext* opCtx, const NamespaceString& ns) {
         .get();
 }
 
+template <typename OpEntry>
+bool isTimeseriesMetadataOnlyQuery(OperationContext* opCtx,
+                                   NamespaceString ns,
+                                   const std::vector<OpEntry>& opEntries) {
+
+    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForRead(
+        opCtx, ns.makeTimeseriesBucketsNamespace());
+    uassert(ErrorCodes::NamespaceNotFound,
+            "Could not find time-series buckets collection for write",
+            collection);
+    auto timeseriesOptions = collection->getTimeseriesOptions();
+    uassert(ErrorCodes::InvalidOptions,
+            "Time-series buckets collection is missing time-series options",
+            timeseriesOptions);
+
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, nullptr, ns));
+    std::vector<BSONObj> rawPipeline;
+    rawPipeline.reserve(opEntries.size());
+    for (auto&& opEntry : opEntries) {
+        rawPipeline.push_back(BSON("$match" << opEntry.getQ()));
+    }
+    DepsTracker dependencies = Pipeline::parse(rawPipeline, expCtx)->getDependencies({});
+    return std::all_of(dependencies.fields.begin(),
+                       dependencies.fields.end(),
+                       [&timeseriesOptions](const auto& dependency) {
+                           StringData queryField(dependency);
+                           return queryField.substr(0, queryField.find('.')) ==
+                               timeseriesOptions->getMetaField();
+                       });
+}  // namespace
+
 // Default for control.version in time-series bucket collection.
 const int kTimeseriesControlVersion = 1;
 
@@ -127,7 +158,9 @@ const int kTimeseriesControlVersion = 1;
  * Transforms a single time-series insert to an update request on an existing bucket.
  */
 write_ops::UpdateOpEntry makeTimeseriesUpdateOpEntry(
-    std::shared_ptr<BucketCatalog::WriteBatch> batch, const BSONObj& metadata) {
+    OperationContext* opCtx,
+    std::shared_ptr<BucketCatalog::WriteBatch> batch,
+    const BSONObj& metadata) {
     BSONObjBuilder updateBuilder;
     {
         if (!batch->min().isEmpty() || !batch->max().isEmpty()) {
@@ -183,7 +216,10 @@ write_ops::UpdateOpEntry makeTimeseriesUpdateOpEntry(
             }
         }
     }
-    write_ops::UpdateModification u(updateBuilder.obj(), write_ops::UpdateModification::DiffTag{});
+    write_ops::UpdateModification::DiffOptions options;
+    options.mustCheckExistenceForInsertOperations =
+        static_cast<bool>(repl::tenantMigrationRecipientInfo(opCtx));
+    write_ops::UpdateModification u(updateBuilder.obj(), options);
     write_ops::UpdateOpEntry update(BSON("_id" << batch->bucket()->id()), std::move(u));
     invariant(!update.getMulti(), batch->bucket()->id().toString());
     invariant(!update.getUpsert(), batch->bucket()->id().toString());
@@ -301,9 +337,8 @@ boost::optional<BSONObj> generateError(OperationContext* opCtx,
             BSONObjBuilder errInfo(error.subobjStart("errInfo"));
             staleInfo->serialize(&errInfo);
         }
-    } else if (ErrorCodes::DocumentValidationFailure == status.code() && status.extraInfo()) {
-        auto docValidationError =
-            status.extraInfo<doc_validation_error::DocumentValidationFailureInfo>();
+    } else if (auto docValidationError =
+                   status.extraInfo<doc_validation_error::DocumentValidationFailureInfo>()) {
         error.append("code", static_cast<int>(ErrorCodes::DocumentValidationFailure));
         error.append("errInfo", docValidationError->getDetails());
     } else if (ErrorCodes::isTenantMigrationError(status.code())) {
@@ -314,8 +349,7 @@ boost::optional<BSONObj> generateError(OperationContext* opCtx,
 
             auto mtab = migrationConflictInfo->getTenantMigrationAccessBlocker();
 
-            auto migrationStatus =
-                mtab->waitUntilCommittedOrAborted(opCtx, migrationConflictInfo->getOperationType());
+            auto migrationStatus = mtab->waitUntilCommittedOrAborted(opCtx);
             mtab->recordTenantMigrationError(migrationStatus);
             error.append("code", static_cast<int>(migrationStatus.code()));
 
@@ -582,11 +616,13 @@ public:
         }
 
         write_ops::UpdateCommandRequest _makeTimeseriesUpdateOp(
+            OperationContext* opCtx,
             std::shared_ptr<BucketCatalog::WriteBatch> batch,
             const BSONObj& metadata,
             std::vector<StmtId>&& stmtIds) const {
-            write_ops::UpdateCommandRequest op(ns().makeTimeseriesBucketsNamespace(),
-                                               {makeTimeseriesUpdateOpEntry(batch, metadata)});
+            write_ops::UpdateCommandRequest op(
+                ns().makeTimeseriesBucketsNamespace(),
+                {makeTimeseriesUpdateOpEntry(opCtx, batch, metadata)});
             op.setWriteCommandRequestBase(_makeTimeseriesWriteOpBase(std::move(stmtIds)));
             return op;
         }
@@ -617,7 +653,7 @@ public:
 
             return _getTimeseriesSingleWriteResult(write_ops_exec::performUpdates(
                 opCtx,
-                _makeTimeseriesUpdateOp(batch, metadata, std::move(stmtIds)),
+                _makeTimeseriesUpdateOp(opCtx, batch, metadata, std::move(stmtIds)),
                 OperationSource::kTimeseries));
         }
 
@@ -644,31 +680,46 @@ public:
                 docsToRetry->push_back(index);
                 return;
             }
+            // Now that the batch is prepared, make sure we clean up if we throw.
+            auto batchGuard = makeGuard([&] { bucketCatalog.abort(batch); });
 
             hangTimeseriesInsertBeforeWrite.pauseWhileSet();
 
-            auto result = batch->numPreviouslyCommittedMeasurements() == 0
-                ? _performTimeseriesInsert(opCtx, batch, metadata, std::move(stmtIds))
-                : _performTimeseriesUpdate(opCtx, batch, metadata, std::move(stmtIds));
+            const auto docId = batch->bucket()->id();
+            const bool performInsert = batch->numPreviouslyCommittedMeasurements() == 0;
+            if (performInsert) {
+                auto result = _performTimeseriesInsert(opCtx, batch, metadata, std::move(stmtIds));
 
-            if (auto error = generateError(opCtx, result, start + index, errors->size())) {
-                errors->push_back(*error);
-                bucketCatalog.abort(batch, result.getStatus());
-                return;
-            }
+                if (auto error = generateError(opCtx, result, start + index, errors->size())) {
+                    errors->push_back(*error);
+                    bucketCatalog.abort(batch, result.getStatus());
+                    batchGuard.dismiss();
+                    return;
+                }
 
-            if (batch->numPreviouslyCommittedMeasurements() != 0 &&
-                result.getValue().getNModified() == 0) {
-                // No document in the buckets collection was found to update, meaning that it was
-                // removed.
-                bucketCatalog.abort(batch);
-                docsToRetry->push_back(index);
-                return;
+                invariant(result.getValue().getN() == 1,
+                          str::stream() << "Expected 1 insertion of document with _id '" << docId
+                                        << "', but found " << result.getValue().getN() << ".");
+            } else {
+                auto result = _performTimeseriesUpdate(opCtx, batch, metadata, std::move(stmtIds));
+
+                if (auto error = generateError(opCtx, result, start + index, errors->size())) {
+                    errors->push_back(*error);
+                    bucketCatalog.abort(batch, result.getStatus());
+                    batchGuard.dismiss();
+                    return;
+                }
+
+                invariant(result.getValue().getNModified() == 1,
+                          str::stream()
+                              << "Expected 1 update of document with _id '" << docId
+                              << "', but found " << result.getValue().getNModified() << ".");
             }
 
             getOpTimeAndElectionId(opCtx, opTime, electionId);
 
             bucketCatalog.finish(batch, BucketCatalog::CommitInfo{*opTime, *electionId});
+            batchGuard.dismiss();
         }
 
         bool _commitTimeseriesBucketsAtomically(OperationContext* opCtx,
@@ -714,7 +765,7 @@ public:
                         batch, metadata, std::move(stmtIds[batch.get()->bucket()])));
                 } else {
                     updateOps.push_back(_makeTimeseriesUpdateOp(
-                        batch, metadata, std::move(stmtIds[batch.get()->bucket()])));
+                        opCtx, batch, metadata, std::move(stmtIds[batch.get()->bucket()])));
                 }
             }
 
@@ -1111,6 +1162,12 @@ public:
             transactionChecks(opCtx, ns());
 
             write_ops::UpdateCommandReply updateReply;
+
+            if (isTimeseries(opCtx, ns())) {
+                _performTimeseriesUpdates(opCtx, &updateReply);
+                return updateReply;
+            }
+
             long long nModified = 0;
 
             // Tracks the upserted information. The memory of this variable gets moved in the
@@ -1214,6 +1271,19 @@ public:
                                    &bodyBuilder);
         }
 
+        void _performTimeseriesUpdates(OperationContext* opCtx,
+                                       write_ops::UpdateCommandReply* updateReply) const {
+
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Cannot perform an update on a time-series collection "
+                                     "when querying on a field that is not the metaField: "
+                                  << ns(),
+                    isTimeseriesMetadataOnlyQuery(opCtx, ns(), request().getUpdates()));
+            uasserted(ErrorCodes::IllegalOperation,
+                      str::stream()
+                          << "Cannot perform an update on a time-series collection: " << ns());
+        }
+
         BSONObj _commandObj;
 
         // Holds a shared pointer to the first entry in `updates` array.
@@ -1271,8 +1341,12 @@ public:
 
         write_ops::DeleteCommandReply typedRun(OperationContext* opCtx) final try {
             transactionChecks(opCtx, ns());
-
             write_ops::DeleteCommandReply deleteReply;
+
+            if (isTimeseries(opCtx, ns())) {
+                _performTimeseriesDeletes(opCtx, &deleteReply);
+                return deleteReply;
+            }
 
             auto reply = write_ops_exec::performDeletes(opCtx, request());
             populateReply(opCtx,
@@ -1335,6 +1409,18 @@ public:
                                    BSONObj(),
                                    _commandObj,
                                    &bodyBuilder);
+        }
+
+        void _performTimeseriesDeletes(OperationContext* opCtx,
+                                       write_ops::DeleteCommandReply* deleteReply) const {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Cannot perform a delete on a time-series collection "
+                                     "when querying on a field that is not the metaField: "
+                                  << ns(),
+                    isTimeseriesMetadataOnlyQuery(opCtx, ns(), request().getDeletes()));
+            uasserted(ErrorCodes::IllegalOperation,
+                      str::stream()
+                          << "Cannot perform a delete on a time-series collection: " << ns());
         }
 
         const BSONObj& _commandObj;

@@ -14,6 +14,8 @@ selector:
   # command multiple times, which may observe the change to the "transactionLifetimeLimitSeconds"
   # server parameter.
   - jstests/core/set_param1.js
+  # Different explain format
+  - jstests/core/or_to_in.js
 
   exclude_with_any_tags:
   - assumes_standalone_mongod
@@ -29,7 +31,6 @@ executor:
   config:
     shell_options:
       eval: "testingReplication = true;"
-      readMode: commands
   hooks:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're

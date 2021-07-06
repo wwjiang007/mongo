@@ -408,39 +408,6 @@ public:
                           BSONObj* info = nullptr,
                           boost::optional<BSONObj> writeConcernObj = boost::none);
 
-    /** Get error result from the last write operation (insert/update/delete) on this connection.
-        db doesn't change the command's behavior - it is just for auth checks.
-        @return error message text, or empty std::string if no error.
-    */
-    std::string getLastError(
-        const std::string& db, bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
-    /**
-     * Same as the form of getLastError that takes a dbname, but just uses the admin DB.
-     */
-    std::string getLastError(bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
-
-    /** Get error result from the last write operation (insert/update/delete) on this connection.
-        db doesn't change the command's behavior - it is just for auth checks.
-        @return full error object.
-
-        If "w" is -1, wait for propagation to majority of nodes.
-        If "wtimeout" is 0, the operation will block indefinitely if needed.
-    */
-    virtual BSONObj getLastErrorDetailed(
-        const std::string& db, bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
-    /**
-     * Same as the form of getLastErrorDetailed that takes a dbname, but just uses the admin DB.
-     */
-    virtual BSONObj getLastErrorDetailed(bool fsync = false,
-                                         bool j = false,
-                                         int w = 0,
-                                         int wtimeout = 0);
-
-    /** Can be called with the returned value from getLastErrorDetailed to extract an error string.
-        If all you need is the string, just call getLastError() instead.
-    */
-    static std::string getLastErrorString(const BSONObj& res);
-
     /** Delete the specified collection.
      *  @param info An optional output parameter that receives the result object the database
      *  returns from the drop command.  May be null if the caller doesn't need that info.
@@ -687,7 +654,15 @@ public:
                                                     int options = 0);
 
     /**
-       insert an object into the database
+     * Executes an acknowledged command to insert a vector of documents.
+     */
+    virtual BSONObj insertAcknowledged(const std::string& ns,
+                                       const std::vector<BSONObj>& v,
+                                       int flags = 0,
+                                       boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to insert a single document.
      */
     virtual void insert(const std::string& ns,
                         BSONObj obj,
@@ -695,7 +670,7 @@ public:
                         boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
-       insert a vector of objects into the database
+     * Executes a fire-and-forget command to insert a vector of documents.
      */
     virtual void insert(const std::string& ns,
                         const std::vector<BSONObj>& v,
@@ -703,7 +678,17 @@ public:
                         boost::optional<BSONObj> writeConcernObj = boost::none);
 
     /**
-       updates objects matching query
+     * Executes an acknowledged command to update the objects that match the query.
+     */
+    virtual BSONObj updateAcknowledged(const std::string& ns,
+                                       Query query,
+                                       BSONObj obj,
+                                       bool upsert = false,
+                                       bool multi = false,
+                                       boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to update the objects that match the query.
      */
     virtual void update(const std::string& ns,
                         Query query,
@@ -718,6 +703,17 @@ public:
                         int flags,
                         boost::optional<BSONObj> writeConcernObj = boost::none);
 
+    /**
+     * Executes an acknowledged command to remove the objects that match the query.
+     */
+    virtual BSONObj removeAcknowledged(const std::string& ns,
+                                       Query query,
+                                       int flags = 0,
+                                       boost::optional<BSONObj> writeConcernObj = boost::none);
+
+    /**
+     * Executes a fire-and-forget command to remove the objects that match the query.
+     */
     virtual void remove(const std::string& ns,
                         Query query,
                         int flags = 0,
@@ -778,6 +774,12 @@ public:
      * false if this client was never connected.
      */
     virtual bool isUsingTransientSSLParams() const {
+        return false;
+    }
+
+    virtual bool isTLS() = 0;
+#else
+    virtual bool isTLS() {
         return false;
     }
 #endif

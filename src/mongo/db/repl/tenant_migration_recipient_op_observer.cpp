@@ -96,7 +96,7 @@ void TenantMigrationRecipientOpObserver::onUpdate(OperationContext* opCtx,
                 opCtx->getServiceContext(), recipientStateDoc.getTenantId());
 
             if (recipientStateDoc.getExpireAt() && mtab) {
-                if (mtab->getState() == TenantMigrationRecipientAccessBlocker::State::kReject) {
+                if (mtab->inStateReject()) {
                     // The TenantMigrationRecipientAccessBlocker entry needs to be removed to
                     // re-allow reads and future migrations with the same tenantId as this migration
                     // has already been aborted and forgotten.
@@ -153,8 +153,7 @@ void TenantMigrationRecipientOpObserver::onDelete(OperationContext* opCtx,
                                                   const NamespaceString& nss,
                                                   OptionalCollectionUUID uuid,
                                                   StmtId stmtId,
-                                                  bool fromMigrate,
-                                                  const boost::optional<BSONObj>& deletedDoc) {
+                                                  const OplogDeleteEntryArgs& args) {
     if (nss == NamespaceString::kTenantMigrationRecipientsNamespace &&
         tenantIdToDeleteDecoration(opCtx) &&
         !tenant_migration_access_blocker::inRecoveryMode(opCtx)) {
@@ -164,6 +163,21 @@ void TenantMigrationRecipientOpObserver::onDelete(OperationContext* opCtx,
                         TenantMigrationAccessBlocker::BlockerType::kRecipient);
         });
     }
+}
+
+repl::OpTime TenantMigrationRecipientOpObserver::onDropCollection(
+    OperationContext* opCtx,
+    const NamespaceString& collectionName,
+    OptionalCollectionUUID uuid,
+    std::uint64_t numRecords,
+    const CollectionDropType dropType) {
+    if (collectionName == NamespaceString::kTenantMigrationRecipientsNamespace) {
+        opCtx->recoveryUnit()->onCommit([opCtx](boost::optional<Timestamp>) {
+            TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                .removeAll(TenantMigrationAccessBlocker::BlockerType::kRecipient);
+        });
+    }
+    return {};
 }
 
 }  // namespace repl

@@ -36,6 +36,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/update/update_node_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -472,20 +473,6 @@ TEST_F(RenameNodeTest, RenameFromNonExistentPathIsNoOp) {
     ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
-TEST_F(RenameNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
-    auto update = fromjson("{$rename: {'a.$id': 'b'}}");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    RenameNode node;
-    ASSERT_OK(node.init(update["$rename"]["a.$id"], expCtx));
-
-    mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
-    setPathToCreate("b");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
-                                AssertionException,
-                                ErrorCodes::InvalidDBRef,
-                                "The DBRef $ref field must be followed by a $id field");
-}
-
 TEST_F(RenameNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFalse) {
     auto update = fromjson("{$rename: {'a.$id': 'b'}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -576,21 +563,6 @@ TEST_F(RenameNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
 
     assertOplogEntryIsNoop();
     ASSERT_EQUALS(getModifiedPaths(), "{a.b.c, d}");
-}
-
-TEST_F(RenameNodeTest, ApplyCannotCreateDollarPrefixedField) {
-    auto update = fromjson("{$rename: {a: '$bad'}}");
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    RenameNode node;
-    ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
-
-    mutablebson::Document doc(fromjson("{a: 0}"));
-    setPathToCreate("$bad");
-    ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams()),
-        AssertionException,
-        ErrorCodes::DollarPrefixedFieldName,
-        "The dollar ($) prefixed field '$bad' in '$bad' is not valid for storage.");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotOverwriteImmutablePath) {

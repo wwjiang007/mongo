@@ -2,12 +2,11 @@
  * Tests that time-series collections respect collations for metadata and min/max.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -72,7 +71,7 @@ TimeseriesTest.run((insert) => {
 
     // Now let's check that min and max appropriately ignore collation for field names, but not
     // values.
-    const buckets = bucketsColl.find().toArray();
+    const buckets = bucketsColl.find().sort({'control.min._id': 1}).toArray();
     jsTestLog('Checking buckets: ' + tojson(buckets));
     assert.eq(buckets.length, 3);
     assert.eq(buckets[0].control.min.x, '10');

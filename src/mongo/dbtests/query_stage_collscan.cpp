@@ -172,14 +172,16 @@ public:
     };
 
     ScopedCollectionDeleter makeCollectionClustered(const NamespaceString& ns) {
-        AutoGetOrCreateDb autoDb(&_opCtx, ns.db(), MODE_X);
+        AutoGetCollection autoColl(&_opCtx, ns, MODE_IX);
 
         {
+            auto db = autoColl.ensureDbExists();
+
             WriteUnitOfWork wuow(&_opCtx);
             CollectionOptions collOptions;
-            collOptions.clusteredIndex = ClusteredIndexOptions{};
+            collOptions.clusteredIndex = true;
             const bool createIdIndex = false;
-            autoDb.getDb()->createCollection(&_opCtx, ns, collOptions, createIdIndex);
+            db->createCollection(&_opCtx, ns, collOptions, createIdIndex);
             wuow.commit();
         }
 
@@ -488,9 +490,6 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanResumeAfterRecordIdSeekFai
 }
 
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredMinMax) {
-    if (!(&_opCtx)->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex()) {
-        return;
-    }
     auto ns = NamespaceString("a.b");
     auto collDeleter = makeCollectionClustered(ns);
     AutoGetCollectionForRead autoColl(&_opCtx, ns);
@@ -533,9 +532,6 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredMinMax) {
 }
 
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredReverse) {
-    if (!(&_opCtx)->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex()) {
-        return;
-    }
     auto ns = NamespaceString("a.b");
     auto collDeleter = makeCollectionClustered(ns);
     AutoGetCollectionForRead autoColl(&_opCtx, ns);
@@ -580,9 +576,6 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredReverse) {
 }
 
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredNonExistentRecordIds) {
-    if (!(&_opCtx)->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex()) {
-        return;
-    }
     auto ns = NamespaceString("a.b");
     auto collDeleter = makeCollectionClustered(ns);
     AutoGetCollectionForRead autoColl(&_opCtx, ns);
@@ -627,9 +620,6 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredNonExistentRecord
 }
 
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredInnerRange) {
-    if (!(&_opCtx)->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex()) {
-        return;
-    }
     auto ns = NamespaceString("a.b");
     auto collDeleter = makeCollectionClustered(ns);
     AutoGetCollectionForRead autoColl(&_opCtx, ns);
@@ -679,9 +669,6 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredInnerRange) {
 }
 
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredInnerRangeExclusive) {
-    if (!(&_opCtx)->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex()) {
-        return;
-    }
     auto ns = NamespaceString("a.b");
     auto collDeleter = makeCollectionClustered(ns);
     AutoGetCollectionForRead autoColl(&_opCtx, ns);
@@ -742,9 +729,6 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredInnerRangeExclusi
 }
 
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredInnerRangeExclusiveReverse) {
-    if (!(&_opCtx)->getServiceContext()->getStorageEngine()->supportsClusteredIdIndex()) {
-        return;
-    }
     auto ns = NamespaceString("a.b");
     auto collDeleter = makeCollectionClustered(ns);
     AutoGetCollectionForRead autoColl(&_opCtx, ns);

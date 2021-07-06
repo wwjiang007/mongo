@@ -113,6 +113,24 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
 
     setupCollection(fromNss, KeyPattern(BSON("x" << 1)), chunks);
 
+    // Initialize TO collection chunks
+    std::vector<ChunkType> originalToChunks;
+    const auto toEpoch = OID::gen();
+    const auto toUUID = UUID::gen();
+    for (int i = 0; i < nChunks; i++) {
+        ChunkVersion chunkVersion(1, i, toEpoch, Timestamp(2));
+        ChunkType chunk;
+        chunk.setName(OID::gen());
+        chunk.setCollectionUUID(toUUID);
+        chunk.setVersion(chunkVersion);
+        chunk.setShard(shard0.getName());
+        chunk.setHistory({ChunkHistory(Timestamp(1, i), shard0.getName())});
+        chunk.setMin(BSON("a" << i));
+        chunk.setMax(BSON("a" << i + 1));
+        originalToChunks.push_back(chunk);
+    }
+    setupCollection(kToNss, KeyPattern(BSON("x" << 1)), originalToChunks);
+
     // Get FROM collection document and chunks
     auto fromDoc = client.findOne(CollectionType::ConfigNS.ns(), fromCollQuery);
     CollectionType fromCollection(fromDoc);
@@ -122,9 +140,9 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     client.findN(fromChunks, ChunkType::ConfigNS.ns(), fromChunksQuery, nChunks);
 
     auto fromCollType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, fromNss);
-
     // Perform the metadata rename
-    sharding_ddl_util::shardedRenameMetadata(opCtx, fromCollType, kToNss);
+    sharding_ddl_util::shardedRenameMetadata(
+        opCtx, fromCollType, kToNss, ShardingCatalogClient::kMajorityWriteConcern);
 
     // Check that the FROM config.collections entry has been deleted
     ASSERT(client.findOne(CollectionType::ConfigNS.ns(), fromCollQuery).isEmpty());
@@ -137,12 +155,17 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     std::vector<BSONObj> toChunks;
     client.findN(toChunks, ChunkType::ConfigNS.ns(), toChunksQuery, nChunks);
 
-    // Check that the original epoch is preserved in config.collections entry
-    ASSERT(fromCollection.getEpoch() == toCollection.getEpoch());
+    // Check that original epoch/timestamp are changed in config.collections entry
+    ASSERT(fromCollection.getEpoch() != toCollection.getEpoch());
+    ASSERT(fromCollection.getTimestamp() != toCollection.getTimestamp());
 
     // Check that no other CollectionType field has been changed
-    auto fromUnchangedFields = fromDoc.removeField(CollectionType::kNssFieldName);
-    auto toUnchangedFields = toDoc.removeField(CollectionType::kNssFieldName);
+    auto fromUnchangedFields = fromDoc.removeField(CollectionType::kNssFieldName)
+                                   .removeField(CollectionType::kEpochFieldName)
+                                   .removeField(CollectionType::kTimestampFieldName);
+    auto toUnchangedFields = toDoc.removeField(CollectionType::kNssFieldName)
+                                 .removeField(CollectionType::kEpochFieldName)
+                                 .removeField(CollectionType::kTimestampFieldName);
     ASSERT_EQ(fromUnchangedFields.woCompare(toUnchangedFields), 0);
 
     // Check that chunk documents remain unchanged

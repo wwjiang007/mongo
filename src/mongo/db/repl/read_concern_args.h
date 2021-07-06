@@ -54,6 +54,8 @@ public:
     static constexpr StringData kAfterClusterTimeFieldName = "afterClusterTime"_sd;
     static constexpr StringData kAtClusterTimeFieldName = "atClusterTime"_sd;
     static constexpr StringData kLevelFieldName = "level"_sd;
+    static constexpr StringData kAllowTransactionTableSnapshot =
+        "$_allowTransactionTableSnapshot"_sd;
 
     static const BSONObj kImplicitDefault;
 
@@ -151,6 +153,11 @@ public:
     bool isSpecified() const;
 
     /**
+     * Returns true if this ReadConcernArgs represents an implicit default read concern.
+     */
+    bool isImplicitDefault() const;
+
+    /**
      *  Returns default kLocalReadConcern if _level is not set.
      */
     ReadConcernLevel getLevel() const;
@@ -213,6 +220,10 @@ public:
         return _atClusterTimeSelected;
     }
 
+    bool allowTransactionTableSnapshot() const {
+        return _allowTransactionTableSnapshot;
+    }
+
 private:
     /**
      * Appends level, afterOpTime, and the other "inner" fields of the read concern args.
@@ -249,6 +260,8 @@ private:
     ReadWriteConcernProvenance _provenance;
 
     bool _atClusterTimeSelected = false;
+
+    bool _allowTransactionTableSnapshot = false;
 };
 
 }  // namespace repl

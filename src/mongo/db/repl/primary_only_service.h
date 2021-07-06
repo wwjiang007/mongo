@@ -59,6 +59,7 @@ namespace repl {
 
 extern FailPoint PrimaryOnlyServiceHangBeforeRebuildingInstances;
 extern FailPoint PrimaryOnlyServiceFailRebuildingInstances;
+extern FailPoint PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic;
 
 /**
  * A PrimaryOnlyService is a group of tasks (represented in memory as Instances) that should only
@@ -242,16 +243,10 @@ public:
     void releaseAllInstances(Status status);
 
     /**
-     * Returns whether this service is currently running.  This is true only when the node is in
-     * state PRIMARY *and* this service has finished all asynchronous work associated with resuming
-     * after stepUp.
+     * Adds information of this service to the result 'BSONObjBuilder', containing the number of
+     * active instances and the state of this service.
      */
-    bool isRunning() const;
-
-    /**
-     * Returns the number of currently running Instances of this service.
-     */
-    size_t getNumberOfInstances();
+    void reportForServerStatus(BSONObjBuilder* result) noexcept;
 
     /**
      * Adds information about the Instances belonging to this service to 'ops', to show up in
@@ -330,6 +325,11 @@ protected:
      * like cleanup, even while the node is not primary. So, use the parent executor in that case.
      */
     std::shared_ptr<executor::TaskExecutor> getInstanceCleanupExecutor() const;
+
+    /**
+     * Returns shared pointers to all Instance objects that belong to this service.
+     */
+    std::vector<std::shared_ptr<Instance>> getAllInstances(OperationContext* opCtx);
 
 private:
     /**
@@ -429,6 +429,11 @@ private:
      */
     void _interruptInstances(WithLock, Status);
 
+    /**
+     * Returns a string representation of the current state.
+     */
+    StringData _getStateString(WithLock) const;
+
     ServiceContext* const _serviceContext;
 
     // All member variables are labeled with one of the following codes indicating the
@@ -525,11 +530,10 @@ public:
     PrimaryOnlyService* lookupServiceByNamespace(const NamespaceString& ns);
 
     /**
-     * Adds a 'primaryOnlyServices' sub-obj to the 'result' BSONObjBuilder containing a count of the
-     * number of active instances for each registered service.
+     * Adds a 'primaryOnlyServices' sub-obj to the 'result' BSONObjBuilder containing information
+     * (given by PrimaryService::reportForServerStatus) of each registered service.
      */
     void reportServiceInfoForServerStatus(BSONObjBuilder* result) noexcept;
-
 
     /**
      * Adds information about the Instances running in all registered services to 'ops', to show up

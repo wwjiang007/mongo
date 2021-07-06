@@ -30,6 +30,9 @@
  *   assumes_read_preference_unchanged,
  *   assumes_unsharded_collection,
  *   does_not_support_stepdowns,
+ *   # This test makes assertions about the types of plans produced by the query engine, which has
+ *   # changed from the classic engine starting in version 5.0.
+ *   requires_fcv_50,
  * ]
  */
 
@@ -37,6 +40,7 @@
 load("jstests/libs/analyze_plan.js");
 load("jstests/libs/fixture_helpers.js");      // For 'FixtureHelpers'.
 load("jstests/libs/sbe_explain_helpers.js");  // For 'assertIdHackPlan()'.
+load("jstests/libs/sbe_util.js");             // For checkSBEEnabled.
 
 const coll = db.jstests_index_filter_commands;
 
@@ -154,10 +158,7 @@ assert.commandWorked(coll.runCommand('planCacheSetFilter', {query: queryID, inde
 var explain = coll.explain("executionStats").find(queryID).finish();
 assert.commandWorked(explain);
 
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSBEEnabled = checkSBEEnabled(db);
 assertIdHackPlan(db, getWinningPlan(explain.queryPlanner), "FETCH", isSBEEnabled);
 
 // Clear filters

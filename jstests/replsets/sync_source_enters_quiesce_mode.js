@@ -20,6 +20,8 @@ rst.startSet();
 rst.initiateWithHighElectionTimeout();
 
 const primary = rst.getPrimary();
+const testDB = primary.getDB("testDB");
+const testCollName = "testColl";
 assert.eq(primary, rst.nodes[0]);
 
 const syncSource = rst.nodes[1];
@@ -27,15 +29,15 @@ const syncingNode = rst.nodes[2];
 
 jsTestLog("Ensure syncingNode is syncing from syncSource.");
 syncingNode.disconnect(primary);
-assert.commandWorked(primary.getDB("test").c.insert({a: 1}, {writeConcern: {w: 3}}));
+assert.commandWorked(
+    testDB.runCommand({insert: testCollName, documents: [{a: 1}], writeConcern: {w: 3}}));
 
 jsTestLog("Ensure syncingNode is behind syncSource.");
-// Do not use stopServerReplication(), since this can cause the node to change sync source.
-let hangOplogQueryFailPoint =
-    configureFailPoint(syncSource, "planExecutorHangBeforeShouldWaitForInserts");
-hangOplogQueryFailPoint.wait();
-assert.commandWorked(primary.getDB("test").c.insert([{a: 2}, {a: 3}, {a: 4}]),
-                     {writeConcern: {w: 2}});
+let hangSyncingNodeFailPoint =
+    configureFailPoint(syncingNode, "hangBeforeProcessingSuccessfulBatch");
+assert.commandWorked(testDB.runCommand(
+    {insert: testCollName, documents: [{b: 2}, {c: 3}, {d: 4}], writeConcern: {w: 2}}));
+hangSyncingNodeFailPoint.wait();
 
 jsTestLog("Transition syncSource to quiesce mode.");
 let quiesceModeFailPoint = configureFailPoint(syncSource, "hangDuringQuiesceMode");
@@ -44,7 +46,7 @@ rst.stop(syncSource, null /*signal*/, {skipValidation: true}, {forRestart: true,
 quiesceModeFailPoint.wait();
 
 jsTestLog("Check that syncing continues uninterrupted.");
-hangOplogQueryFailPoint.off();
+hangSyncingNodeFailPoint.off();
 rst.awaitReplication();
 
 jsTestLog("Finish test.");

@@ -39,6 +39,7 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/execution_context.h"
@@ -68,25 +69,23 @@ public:
     explicit ValidateBase(bool full, bool background, bool clustered)
         : _full(full), _background(background), _nss(_ns), _autoDb(nullptr), _db(nullptr) {
 
-        WriteUnitOfWork wuow(&_opCtx);
-        AutoGetOrCreateDb autoDb(&_opCtx, _nss.db(), MODE_X);
-        auto db = autoDb.getDb();
-        ASSERT_TRUE(db);
-
-        _supportsClusteredIdIndex =
-            _opCtx.getServiceContext()->getStorageEngine()->supportsClusteredIdIndex();
+        _supportsBackgroundValidation = storageGlobalParams.engine != "ephemeralForTest";
 
         CollectionOptions options;
-        if (clustered && _supportsClusteredIdIndex) {
-            options.clusteredIndex = ClusteredIndexOptions{};
+        if (clustered) {
+            options.clusteredIndex = true;
         }
 
         const bool createIdIndex = !clustered;
-        auto coll = db->createCollection(&_opCtx, _nss, options, createIdIndex);
-        ASSERT_TRUE(coll);
-        wuow.commit();
 
-        _supportsBackgroundValidation = storageGlobalParams.engine != "ephemeralForTest";
+        AutoGetCollection autoColl(&_opCtx, _nss, MODE_IX);
+        auto db = autoColl.ensureDbExists();
+        ASSERT_TRUE(db) << _nss;
+
+        WriteUnitOfWork wuow(&_opCtx);
+        auto coll = db->createCollection(&_opCtx, _nss, options, createIdIndex);
+        ASSERT_TRUE(coll) << _nss;
+        wuow.commit();
     }
 
     explicit ValidateBase(bool full, bool background)
@@ -191,7 +190,6 @@ protected:
     unique_ptr<AutoGetDb> _autoDb;
     Database* _db;
     bool _supportsBackgroundValidation;
-    bool _supportsClusteredIdIndex;
 };
 
 template <bool full, bool background>
@@ -862,7 +860,9 @@ public:
             options.logIfError = true;
 
             KeyStringSet keys;
-            iam->getKeys(executionCtx.pooledBufferBuilder(),
+            iam->getKeys(&_opCtx,
+                         coll,
+                         executionCtx.pooledBufferBuilder(),
                          actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                          IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -959,8 +959,8 @@ public:
 
         // Insert additional multikey path metadata index keys.
         lockDb(MODE_X);
-        const RecordId recordId(
-            RecordIdReservations::reservedIdFor(ReservationId::kWildcardMultikeyMetadataId));
+        const RecordId recordId(record_id_helpers::reservedIdFor(
+            record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long));
         const IndexCatalog* indexCatalog = coll->getIndexCatalog();
         auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
         auto accessMethod =
@@ -1088,8 +1088,8 @@ public:
         lockDb(MODE_X);
         {
             WriteUnitOfWork wunit(&_opCtx);
-            RecordId recordId(
-                RecordIdReservations::reservedIdFor(ReservationId::kWildcardMultikeyMetadataId));
+            RecordId recordId(record_id_helpers::reservedIdFor(
+                record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long));
             const KeyString::Value indexKey =
                 KeyString::HeapBuilder(sortedDataInterface->getKeyStringVersion(),
                                        BSON("" << 1 << ""
@@ -1264,7 +1264,9 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(executionCtx.pooledBufferBuilder(),
+            iam->getKeys(&_opCtx,
+                         coll,
+                         executionCtx.pooledBufferBuilder(),
                          actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                          IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -1646,7 +1648,9 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(executionCtx.pooledBufferBuilder(),
+            iam->getKeys(&_opCtx,
+                         coll,
+                         executionCtx.pooledBufferBuilder(),
                          actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                          IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -1991,7 +1995,9 @@ public:
                 auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
 
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              dupObj,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraints,
                              IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -2047,7 +2053,9 @@ public:
                 const BSONObj actualKey = BSON("a" << 1);
 
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              actualKey,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                              IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -2184,7 +2192,9 @@ public:
             {
                 WriteUnitOfWork wunit(&_opCtx);
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              doc,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                              IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -2387,7 +2397,9 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(executionCtx.pooledBufferBuilder(),
+            iam->getKeys(&_opCtx,
+                         coll,
+                         executionCtx.pooledBufferBuilder(),
                          actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                          IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -2424,7 +2436,9 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(executionCtx.pooledBufferBuilder(),
+            iam->getKeys(&_opCtx,
+                         coll,
+                         executionCtx.pooledBufferBuilder(),
                          actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                          IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -2537,7 +2551,9 @@ public:
                 auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
 
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              dupObj,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraints,
                              IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -2589,7 +2605,9 @@ public:
                 auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
 
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              dupObj,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraints,
                              IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -2940,7 +2958,9 @@ public:
             {
                 WriteUnitOfWork wunit(&_opCtx);
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              doc,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                              IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -2974,7 +2994,9 @@ public:
                 WriteUnitOfWork wunit(&_opCtx);
                 KeyStringSet keys;
                 MultikeyPaths multikeyPaths;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              mkDoc,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                              IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -3165,7 +3187,9 @@ public:
             {
                 WriteUnitOfWork wunit(&_opCtx);
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              doc1,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                              IndexAccessMethod::GetKeysContext::kRemovingKeys,
@@ -3184,7 +3208,7 @@ public:
                 wunit.commit();
             }
 
-            // Update multikey document with a different multikey documents (not coverd by multikey
+            // Update multikey document with a different multikey documents (not covered by multikey
             // paths).   {a: [1, 2], b: 1}   ->   {a: 1, b: [4, 5]}
             BSONObj doc2 = BSON("_id" << 1 << "a" << 1 << "b" << BSON_ARRAY(4 << 5));
             {
@@ -3200,7 +3224,9 @@ public:
             {
                 WriteUnitOfWork wunit(&_opCtx);
                 KeyStringSet keys;
-                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                iam->getKeys(&_opCtx,
+                             coll,
+                             executionCtx.pooledBufferBuilder(),
                              doc2,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
                              IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -3329,6 +3355,7 @@ public:
             coll = _db->createCollection(&_opCtx, _nss);
             wunit.commit();
         }
+        auto writableCollection = const_cast<Collection*>(coll.get());
 
         const auto indexName = "mk_index";
         auto status = dbtests::createIndexFromSpec(&_opCtx,
@@ -3344,12 +3371,13 @@ public:
             WriteUnitOfWork wunit(&_opCtx);
             auto collMetadata =
                 DurableCatalog::get(&_opCtx)->getMetaData(&_opCtx, coll->getCatalogId());
-            int offset = collMetadata.findIndexOffset(indexName);
+            int offset = collMetadata->findIndexOffset(indexName);
             ASSERT_GTE(offset, 0);
 
-            auto& indexMetadata = collMetadata.indexes[offset];
+            auto& indexMetadata = collMetadata->indexes[offset];
             indexMetadata.multikeyPaths = {};
-            DurableCatalog::get(&_opCtx)->putMetaData(&_opCtx, coll->getCatalogId(), collMetadata);
+            auto writableCollection = const_cast<Collection*>(coll.get());
+            writableCollection->replaceMetadata(&_opCtx, std::move(collMetadata));
             wunit.commit();
         }
 
@@ -3359,7 +3387,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto writableCatalog = const_cast<IndexCatalog*>(indexCatalog);
-            descriptor = writableCatalog->refreshEntry(&_opCtx, descriptor);
+            descriptor = writableCatalog->refreshEntry(&_opCtx, writableCollection, descriptor);
             wunit.commit();
         }
 
@@ -3377,8 +3405,8 @@ public:
 
         auto catalogEntry = indexCatalog->getEntry(descriptor);
         auto expectedPathsBefore = MultikeyPaths{};
-        ASSERT(catalogEntry->isMultikey());
-        ASSERT(catalogEntry->getMultikeyPaths(&_opCtx) == expectedPathsBefore);
+        ASSERT(catalogEntry->isMultikey(&_opCtx, coll));
+        ASSERT(catalogEntry->getMultikeyPaths(&_opCtx, coll) == expectedPathsBefore);
 
         releaseDb();
         ensureValidateWorked();
@@ -3413,8 +3441,8 @@ public:
         }
 
         auto expectedPathsAfter = MultikeyPaths{{0}, {}};
-        ASSERT(catalogEntry->isMultikey());
-        ASSERT(catalogEntry->getMultikeyPaths(&_opCtx) == expectedPathsAfter);
+        ASSERT(catalogEntry->isMultikey(&_opCtx, coll));
+        ASSERT(catalogEntry->getMultikeyPaths(&_opCtx, coll) == expectedPathsAfter);
 
         // Confirm validate does not make changes when run a second time.
         {
@@ -3445,8 +3473,8 @@ public:
             dumpOnErrorGuard.dismiss();
         }
 
-        ASSERT(catalogEntry->isMultikey());
-        ASSERT(catalogEntry->getMultikeyPaths(&_opCtx) == expectedPathsAfter);
+        ASSERT(catalogEntry->isMultikey(&_opCtx, coll));
+        ASSERT(catalogEntry->getMultikeyPaths(&_opCtx, coll) == expectedPathsAfter);
     }
 };
 
@@ -3457,10 +3485,6 @@ public:
         : ValidateBase(/*full=*/false, background, /*clustered=*/true) {}
 
     void run() {
-        if (!_supportsClusteredIdIndex) {
-            return;
-        }
-
         if (_background && !_supportsBackgroundValidation) {
             return;
         }
@@ -3523,10 +3547,6 @@ public:
         : ValidateBase(/*full=*/false, background, /*clustered=*/true) {}
 
     void run() {
-        if (!_supportsClusteredIdIndex) {
-            return;
-        }
-
         if (_background && !_supportsBackgroundValidation) {
             return;
         }
@@ -3624,10 +3644,6 @@ public:
         : ValidateBase(/*full=*/false, /*background=*/false, /*clustered=*/true) {}
 
     void run() {
-        if (!_supportsClusteredIdIndex) {
-            return;
-        }
-
         if (_background && !_supportsBackgroundValidation) {
             return;
         }

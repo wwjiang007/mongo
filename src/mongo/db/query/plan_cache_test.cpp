@@ -31,6 +31,8 @@
  * This file contains tests for mongo/db/query/plan_cache.h
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/db/query/plan_cache.h"
 
 #include <algorithm>
@@ -50,6 +52,8 @@
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
@@ -199,14 +203,38 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
 }
 
 /**
- * Check that the stable keys of 'a' and 'b' are equal, but the unstable parts are not.
+ * Check that the stable keys of 'a' and 'b' are equal, but the index discriminators are not.
  */
 void assertPlanCacheKeysUnequalDueToDiscriminators(const PlanCacheKey& a, const PlanCacheKey& b) {
     ASSERT_EQ(a.getStableKeyStringData(), b.getStableKeyStringData());
-    ASSERT_EQ(a.getUnstablePart().size(), b.getUnstablePart().size());
+    ASSERT_EQ(a.getIndexabilityDiscriminators().size(), b.getIndexabilityDiscriminators().size());
+    ASSERT_NE(a.getIndexabilityDiscriminators(), b.getIndexabilityDiscriminators());
+
     // Should always have the begin and end delimiters.
-    ASSERT_NE(a.getUnstablePart(), b.getUnstablePart());
-    ASSERT_GTE(a.getUnstablePart().size(), 2u);
+    ASSERT_GTE(a.getIndexabilityDiscriminators().size(), 2u);
+}
+
+/**
+ * Check that the stable keys of 'a' and 'b' are equal, but the 'enableSlotBasedExecutionEngine'
+ * values are not.
+ */
+void assertPlanCacheKeysUnequalDueToEnableSlotBasedExecutionEngineValue(const PlanCacheKey& a,
+                                                                        const PlanCacheKey& b) {
+    ASSERT_EQ(a.getStableKeyStringData(), b.getStableKeyStringData());
+    auto aUnstablePart = a.getUnstablePart();
+    auto bUnstablePart = b.getUnstablePart();
+
+    ASSERT_EQ(aUnstablePart.size(), aUnstablePart.size());
+
+    // Should have at least 1 byte to represent whether we must use the classic engine.
+    ASSERT_GTE(aUnstablePart.size(), 1);
+
+    // The indexability discriminators should match.
+    ASSERT_EQ(a.getIndexabilityDiscriminators(), b.getIndexabilityDiscriminators());
+
+    // The unstable parts should not match because of the last character.
+    ASSERT_NE(aUnstablePart, bUnstablePart);
+    ASSERT_NE(aUnstablePart[aUnstablePart.size() - 1], bUnstablePart[bUnstablePart.size() - 1]);
 }
 
 /**
@@ -289,7 +317,7 @@ std::pair<CoreIndexInfo, std::unique_ptr<WildcardProjection>> makeWildcardUpdate
  */
 struct GenerateQuerySolution {
     QuerySolution* operator()() const {
-        unique_ptr<QuerySolution> qs(new QuerySolution(QueryPlannerParams::Options::DEFAULT));
+        auto qs = std::make_unique<QuerySolution>();
         qs->cacheData.reset(new SolutionCacheData());
         qs->cacheData->solnType = SolutionCacheData::COLLSCAN_SOLN;
         qs->cacheData->tree.reset(new PlanCacheIndexTree());
@@ -352,8 +380,7 @@ void assertShouldNotCacheQuery(const char* queryStr) {
 }
 
 std::unique_ptr<QuerySolution> getQuerySolutionForCaching() {
-    std::unique_ptr<QuerySolution> qs =
-        std::make_unique<QuerySolution>(QueryPlannerParams::Options::DEFAULT);
+    std::unique_ptr<QuerySolution> qs = std::make_unique<QuerySolution>();
     qs->cacheData = std::make_unique<SolutionCacheData>();
     qs->cacheData->tree = std::make_unique<PlanCacheIndexTree>();
     return qs;
@@ -1086,8 +1113,14 @@ protected:
         BSONObj testSoln = fromjson(solnJson);
         size_t matches = 0;
         for (auto&& soln : solns) {
-            if (QueryPlannerTestLib::solutionMatches(testSoln, soln->root())) {
+            auto matchStatus = QueryPlannerTestLib::solutionMatches(testSoln, soln->root());
+            if (matchStatus.isOK()) {
                 ++matches;
+            } else {
+                LOGV2_DEBUG(5619204,
+                            2,
+                            "Mismatching solution: {reason}",
+                            "reason"_attr = matchStatus.reason());
             }
         }
         return matches;
@@ -1143,7 +1176,7 @@ protected:
 
         // Create a CachedSolution the long way..
         // QuerySolution -> PlanCacheEntry -> CachedSolution
-        QuerySolution qs{QueryPlannerParams::Options::DEFAULT};
+        QuerySolution qs{};
         qs.cacheData = soln.cacheData->clone();
         std::vector<QuerySolution*> solutions;
         solutions.push_back(&qs);
@@ -1168,8 +1201,14 @@ protected:
     QuerySolution* firstMatchingSolution(const string& solnJson) const {
         BSONObj testSoln = fromjson(solnJson);
         for (auto&& soln : solns) {
-            if (QueryPlannerTestLib::solutionMatches(testSoln, soln->root())) {
+            auto matchStatus = QueryPlannerTestLib::solutionMatches(testSoln, soln->root());
+            if (matchStatus.isOK()) {
                 return soln.get();
+            } else {
+                LOGV2_DEBUG(5619205,
+                            2,
+                            "Mismatching solution: {reason}",
+                            "reason"_attr = matchStatus.reason());
             }
         }
 
@@ -1190,10 +1229,12 @@ protected:
      */
     void assertSolutionMatches(QuerySolution* trueSoln, const string& solnJson) const {
         BSONObj testSoln = fromjson(solnJson);
-        if (!QueryPlannerTestLib::solutionMatches(testSoln, trueSoln->root())) {
+        auto matchStatus = QueryPlannerTestLib::solutionMatches(testSoln, trueSoln->root());
+        if (!matchStatus.isOK()) {
             str::stream ss;
             ss << "Expected solution " << solnJson
-               << " did not match true solution: " << trueSoln->toString() << '\n';
+               << " did not match true solution: " << trueSoln->toString()
+               << ". Reason: " << matchStatus.reason() << '\n';
             FAIL(ss);
         }
     }
@@ -1246,7 +1287,9 @@ protected:
 };
 
 const std::string mockKey("mock_cache_key");
-const PlanCacheKey CachePlanSelectionTest::ck(mockKey, "");
+const PlanCacheKey CachePlanSelectionTest::ck(mockKey,
+                                              "",
+                                              internalQueryEnableSlotBasedExecutionEngine.load());
 
 //
 // Equality
@@ -1901,8 +1944,8 @@ TEST(PlanCacheTest, ComputeKeyCollationIndex) {
     // 'noStrings' gets a different key since it is compatible with the index.
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*containsString),
                                                   planCache.computeKey(*noStrings));
-    ASSERT_EQ(planCache.computeKey(*containsString).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*noStrings).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*containsString).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*noStrings).getIndexabilityDiscriminators(), "<1>");
 
     // 'noStrings' and 'containsStringHasCollation' get different keys, since the collation
     // specified in the query is considered part of its shape. However, they have the same index
@@ -1929,8 +1972,8 @@ TEST(PlanCacheTest, ComputeKeyCollationIndex) {
     // 'inNoStrings' gets a different key since it is compatible with the index.
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*inContainsString),
                                                   planCache.computeKey(*inNoStrings));
-    ASSERT_EQ(planCache.computeKey(*inContainsString).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*inNoStrings).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*inContainsString).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*inNoStrings).getIndexabilityDiscriminators(), "<1>");
 
     // 'inNoStrings' and 'inContainsStringHasCollation' get the same key since they compatible with
     // the index.
@@ -1970,8 +2013,8 @@ TEST(PlanCacheTest, ComputeKeyWildcardIndex) {
               planCacheWithNoIndexes.computeKey(*usesPathWithObject));
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*usesPathWithScalar),
                                                   planCache.computeKey(*usesPathWithObject));
-    ASSERT_EQ(planCache.computeKey(*usesPathWithScalar).getUnstablePart(), "<1>");
-    ASSERT_EQ(planCache.computeKey(*usesPathWithObject).getUnstablePart(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*usesPathWithScalar).getIndexabilityDiscriminators(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*usesPathWithObject).getIndexabilityDiscriminators(), "<0>");
 
     ASSERT_EQ(planCache.computeKey(*usesPathWithObject), planCache.computeKey(*usesPathWithArray));
     ASSERT_EQ(planCache.computeKey(*usesPathWithObject),
@@ -1999,8 +2042,10 @@ TEST(PlanCacheTest, ComputeKeyWildcardIndex) {
     assertPlanCacheKeysUnequalDueToDiscriminators(
         planCache.computeKey(*orQueryWithOneBranchAllowed),
         planCache.computeKey(*orQueryWithNoBranchesAllowed));
-    ASSERT_EQ(planCache.computeKey(*orQueryWithOneBranchAllowed).getUnstablePart(), "<1><0>");
-    ASSERT_EQ(planCache.computeKey(*orQueryWithNoBranchesAllowed).getUnstablePart(), "<0><0>");
+    ASSERT_EQ(planCache.computeKey(*orQueryWithOneBranchAllowed).getIndexabilityDiscriminators(),
+              "<1><0>");
+    ASSERT_EQ(planCache.computeKey(*orQueryWithNoBranchesAllowed).getIndexabilityDiscriminators(),
+              "<0><0>");
 }
 
 TEST(PlanCacheTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyObj) {
@@ -2014,16 +2059,16 @@ TEST(PlanCacheTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyObj) {
     std::unique_ptr<CanonicalQuery> equalsNonEmptyObj(canonicalize("{a: {b: 1}}"));
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*equalsEmptyObj),
                                                   planCache.computeKey(*equalsNonEmptyObj));
-    ASSERT_EQ(planCache.computeKey(*equalsNonEmptyObj).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*equalsEmptyObj).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*equalsNonEmptyObj).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*equalsEmptyObj).getIndexabilityDiscriminators(), "<1>");
 
     // $in with empty obj and $in with non-empty obj have different plan cache keys.
     std::unique_ptr<CanonicalQuery> inWithEmptyObj(canonicalize("{a: {$in: [{}]}}"));
     std::unique_ptr<CanonicalQuery> inWithNonEmptyObj(canonicalize("{a: {$in: [{b: 1}]}}"));
     assertPlanCacheKeysUnequalDueToDiscriminators(planCache.computeKey(*inWithEmptyObj),
                                                   planCache.computeKey(*inWithNonEmptyObj));
-    ASSERT_EQ(planCache.computeKey(*inWithNonEmptyObj).getUnstablePart(), "<0>");
-    ASSERT_EQ(planCache.computeKey(*inWithEmptyObj).getUnstablePart(), "<1>");
+    ASSERT_EQ(planCache.computeKey(*inWithNonEmptyObj).getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(planCache.computeKey(*inWithEmptyObj).getIndexabilityDiscriminators(), "<1>");
 }
 
 TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilterExpression) {
@@ -2049,8 +2094,8 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilter
         // The discriminator strings have the format "<xx>". That is, there are two discriminator
         // bits for the "x" predicate, the first pertaining to the partialFilterExpression and the
         // second around applicability to the wildcard index.
-        ASSERT_EQ(compatibleKey.getUnstablePart(), "<11>");
-        ASSERT_EQ(incompatibleKey.getUnstablePart(), "<01>");
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<01>");
     }
 
     // The partialFilterExpression should lead to a discriminator over field 'x', but not over 'y'.
@@ -2065,8 +2110,8 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilter
         // The discriminator strings have the format "<xx><y>". That is, there are two discriminator
         // bits for the "x" predicate (the first pertaining to the partialFilterExpression, the
         // second around applicability to the wildcard index) and one discriminator bit for "y".
-        ASSERT_EQ(compatibleKey.getUnstablePart(), "<11><1>");
-        ASSERT_EQ(incompatibleKey.getUnstablePart(), "<01><1>");
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11><1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<01><1>");
     }
 
     // $eq:null predicates cannot be assigned to a wildcard index. Make sure that this is
@@ -2081,8 +2126,8 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilter
         // The discriminator strings have the format "<xx><y>". That is, there are two discriminator
         // bits for the "x" predicate (the first pertaining to the partialFilterExpression, the
         // second around applicability to the wildcard index) and one discriminator bit for "y".
-        ASSERT_EQ(compatibleKey.getUnstablePart(), "<11><1>");
-        ASSERT_EQ(incompatibleKey.getUnstablePart(), "<11><0>");
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11><1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<11><0>");
     }
 
     // Test that the discriminators are correct for an $eq:null predicate on 'x'. This predicate is
@@ -2091,7 +2136,7 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilter
     // result in two "0" bits inside the discriminator string.
     {
         auto key = planCache.computeKey(*canonicalize("{x: {$eq: null}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<00>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<00>");
     }
 }
 
@@ -2112,7 +2157,7 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterAnd
         // discriminator because it is not referenced in the partial filter expression.  All
         // predicates are compatible.
         auto key = planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, z: {$eq: 3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<11><11><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<11><11><1>");
     }
 
     {
@@ -2120,7 +2165,7 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterAnd
         // compatible with the partial filter expression, leading to one of the 'y' bits being set
         // to zero.
         auto key = planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: -2}, z: {$eq: 3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<11><01><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<11><01><1>");
     }
 }
 
@@ -2139,14 +2184,14 @@ TEST(PlanCacheTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterOnN
         // The discriminators have the format <x><(x.y)(x.y)<y>. All predicates are compatible
         auto key =
             planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, 'x.y': {$eq: 3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<1><11><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><11><1>");
     }
 
     {
         // Here, the predicate on "x.y" is not compatible with the partial filter expression.
         auto key =
             planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, 'x.y': {$eq: -3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<1><01><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><01><1>");
     }
 }
 
@@ -2166,21 +2211,21 @@ TEST(PlanCacheTest, ComputeKeyDiscriminatesCorrectlyWithPartialFilterAndWildcard
         // the predicate is compatible with the partial filter expression, whereas the disciminator
         // for 'y' is about compatibility with the wildcard index.
         auto key = planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, z: {$eq: 3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<1><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><1>");
     }
 
     {
         // Similar to the previous case, except with an 'x' predicate that is incompatible with the
         // partial filter expression.
         auto key = planCache.computeKey(*canonicalize("{x: {$eq: -1}, y: {$eq: 2}, z: {$eq: 3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<0><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<0><1>");
     }
 
     {
         // Case where the 'y' predicate is not compatible with the wildcard index.
         auto key =
             planCache.computeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: null}, z: {$eq: 3}}"));
-        ASSERT_EQ(key.getUnstablePart(), "<1><0>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><0>");
     }
 }
 
@@ -2189,7 +2234,7 @@ TEST(PlanCacheTest, StableKeyDoesNotChangeAcrossIndexCreation) {
     unique_ptr<CanonicalQuery> cq(canonicalize("{a: 0}}"));
     const PlanCacheKey preIndexKey = planCache.computeKey(*cq);
     const auto preIndexStableKey = preIndexKey.getStableKey();
-    ASSERT_EQ(preIndexKey.getUnstablePart(), "");
+    ASSERT_EQ(preIndexKey.getIndexabilityDiscriminators(), "");
 
     const auto keyPattern = BSON("a" << 1);
     // Create a sparse index (which requires a discriminator).
@@ -2203,7 +2248,7 @@ TEST(PlanCacheTest, StableKeyDoesNotChangeAcrossIndexCreation) {
     const auto postIndexStableKey = postIndexKey.getStableKey();
     ASSERT_NE(preIndexKey, postIndexKey);
     ASSERT_EQ(preIndexStableKey, postIndexStableKey);
-    ASSERT_EQ(postIndexKey.getUnstablePart(), "<1>");
+    ASSERT_EQ(postIndexKey.getIndexabilityDiscriminators(), "<1>");
 }
 
 TEST(PlanCacheTest, ComputeKeyNotEqualsArray) {
@@ -2213,8 +2258,8 @@ TEST(PlanCacheTest, ComputeKeyNotEqualsArray) {
 
     const PlanCacheKey noIndexNeArrayKey = planCache.computeKey(*cqNeArray);
     const PlanCacheKey noIndexNeScalarKey = planCache.computeKey(*cqNeScalar);
-    ASSERT_EQ(noIndexNeArrayKey.getUnstablePart(), "<0>");
-    ASSERT_EQ(noIndexNeScalarKey.getUnstablePart(), "<1>");
+    ASSERT_EQ(noIndexNeArrayKey.getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(noIndexNeScalarKey.getIndexabilityDiscriminators(), "<1>");
     ASSERT_EQ(noIndexNeScalarKey.getStableKey(), noIndexNeArrayKey.getStableKey());
 
     const auto keyPattern = BSON("a" << 1);
@@ -2233,11 +2278,11 @@ TEST(PlanCacheTest, ComputeKeyNotEqualsArray) {
 
     ASSERT_EQ(noIndexNeScalarKey.getStableKey(), withIndexNeScalarKey.getStableKey());
     // There will be one discriminator for the $not and another for the leaf node ({$eq: 123}).
-    ASSERT_EQ(withIndexNeScalarKey.getUnstablePart(), "<1><1>");
+    ASSERT_EQ(withIndexNeScalarKey.getIndexabilityDiscriminators(), "<1><1>");
     // There will be one discriminator for the $not and another for the leaf node ({$eq: [1]}).
     // Since the index can support equality to an array, the second discriminator will have a value
     // of '1'.
-    ASSERT_EQ(withIndexNeArrayKey.getUnstablePart(), "<0><1>");
+    ASSERT_EQ(withIndexNeArrayKey.getIndexabilityDiscriminators(), "<0><1>");
 }
 
 TEST(PlanCacheTest, ComputeKeyNinArray) {
@@ -2247,8 +2292,8 @@ TEST(PlanCacheTest, ComputeKeyNinArray) {
 
     const PlanCacheKey noIndexNinArrayKey = planCache.computeKey(*cqNinArray);
     const PlanCacheKey noIndexNinScalarKey = planCache.computeKey(*cqNinScalar);
-    ASSERT_EQ(noIndexNinArrayKey.getUnstablePart(), "<0>");
-    ASSERT_EQ(noIndexNinScalarKey.getUnstablePart(), "<1>");
+    ASSERT_EQ(noIndexNinArrayKey.getIndexabilityDiscriminators(), "<0>");
+    ASSERT_EQ(noIndexNinScalarKey.getIndexabilityDiscriminators(), "<1>");
     ASSERT_EQ(noIndexNinScalarKey.getStableKey(), noIndexNinArrayKey.getStableKey());
 
     const auto keyPattern = BSON("a" << 1);
@@ -2268,8 +2313,8 @@ TEST(PlanCacheTest, ComputeKeyNinArray) {
     ASSERT_NE(noIndexNinArrayKey.getUnstablePart(), withIndexNinArrayKey.getUnstablePart());
 
     ASSERT_EQ(noIndexNinScalarKey.getStableKey(), withIndexNinScalarKey.getStableKey());
-    ASSERT_EQ(withIndexNinArrayKey.getUnstablePart(), "<0><1>");
-    ASSERT_EQ(withIndexNinScalarKey.getUnstablePart(), "<1><1>");
+    ASSERT_EQ(withIndexNinArrayKey.getIndexabilityDiscriminators(), "<0><1>");
+    ASSERT_EQ(withIndexNinScalarKey.getIndexabilityDiscriminators(), "<1><1>");
 }
 
 // Test for a bug which would be easy to introduce. If we only inserted discriminators for some
@@ -2484,5 +2529,35 @@ TEST(PlanCacheTest, PlanCacheSizeWithMultiplePlanCaches) {
 
     // Verify that size is reset to the original size after removing all entries.
     ASSERT_EQ(PlanCacheEntry::planCacheTotalSizeEstimateBytes.get(), originalSize);
+}
+
+TEST(PlanCacheTest, DifferentQueryEngines) {
+    // Helper to construct a plan cache key given the 'enableSlotBasedExecutionEngine' flag.
+    auto constructPlanCacheKey = [](const PlanCache& pc,
+                                    bool enableSlotBasedExecutionEngine) -> PlanCacheKey {
+        RAIIServerParameterControllerForTest controller{
+            "internalQueryEnableSlotBasedExecutionEngine", enableSlotBasedExecutionEngine};
+        const auto queryStr = "{a: 0}";
+        unique_ptr<CanonicalQuery> cq(canonicalize(queryStr));
+        return pc.computeKey(*cq);
+    };
+
+    PlanCache planCache;
+    const auto keyPattern = BSON("a" << 1);
+
+    // Create a normal btree index. It will have a discriminator.
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       false,                          // sparse
+                       IndexEntry::Identifier{""})});  // name
+
+    const auto classicEngineKey = constructPlanCacheKey(planCache, false);
+    const auto slotBasedExecutionEngineKey = constructPlanCacheKey(planCache, true);
+
+    // Check that the two plan cache keys are not equal because the plans were created under
+    // different engines.
+    assertPlanCacheKeysUnequalDueToEnableSlotBasedExecutionEngineValue(classicEngineKey,
+                                                                       slotBasedExecutionEngineKey);
 }
 }  // namespace

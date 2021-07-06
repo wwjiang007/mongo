@@ -14,7 +14,7 @@ load("jstests/sharding/libs/find_chunks_util.js");
 
 // Intentionally use a config server with 1 node so that the step down and promotion to primary
 // are guaranteed to happen on the same host
-var st = new ShardingTest({config: 1, shards: 2, other: {chunkSize: 1}});
+var st = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 var mongos = st.s0;
 
 assert.commandWorked(mongos.adminCommand({enableSharding: 'TestDB'}));
@@ -27,7 +27,7 @@ var coll = mongos.getDB('TestDB').TestColl;
 var staticMongod = MongoRunner.runMongod({});
 
 function interruptMoveChunkAndRecover(fromShard, toShard, isJumbo) {
-    pauseMigrateAtStep(toShard, migrateStepNames.deletedPriorDataInRange);
+    pauseMigrateAtStep(toShard, migrateStepNames.rangeDeletionTaskScheduled);
 
     var joinMoveChunk = moveChunkParallel(staticMongod,
                                           mongos.host,
@@ -37,7 +37,7 @@ function interruptMoveChunkAndRecover(fromShard, toShard, isJumbo) {
                                           toShard.shardName,
                                           true /* expectSuccess */,
                                           isJumbo);
-    waitForMigrateStep(toShard, migrateStepNames.deletedPriorDataInRange);
+    waitForMigrateStep(toShard, migrateStepNames.rangeDeletionTaskScheduled);
 
     // Stepdown the primary in order to force the balancer to stop. Use a timeout of 5 seconds for
     // both step down operations, because mongos will retry to find the CSRS primary for up to 20
@@ -65,7 +65,7 @@ function interruptMoveChunkAndRecover(fromShard, toShard, isJumbo) {
     // Ensure a new primary is found promptly
     st.configRS.getPrimary(30000);
 
-    unpauseMigrateAtStep(toShard, migrateStepNames.deletedPriorDataInRange);
+    unpauseMigrateAtStep(toShard, migrateStepNames.rangeDeletionTaskScheduled);
 
     // Ensure that migration succeeded
     joinMoveChunk();

@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include <boost/optional/optional_io.hpp>
 #include <memory>
 
 #include "mongo/db/client.h"
@@ -46,6 +47,7 @@
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_util.h"
 
 using namespace mongo;
 using namespace mongo::repl;
@@ -89,6 +91,10 @@ public:
         return std::make_shared<TestService::Instance>(this, std::move(initialState));
     }
 
+    // Make this public since it's protected in the base class but it needs to be public if we want
+    // to test it here.
+    using PrimaryOnlyService::getAllInstances;
+
     class Instance final : public PrimaryOnlyService::TypedInstance<Instance> {
     public:
         explicit Instance(const TestService* service, BSONObj stateDoc)
@@ -105,59 +111,66 @@ public:
                 TestServiceHangDuringInitialization.pauseWhileSet();
             }
 
-            token.onCancel()
-                .thenRunOn(_service->getInstanceCleanupExecutor())
-                .then([this, self = shared_from_this()] {
-                    stdx::lock_guard lk(_mutex);
+            auto cancelLogicFinishedRunning =
+                token.onCancel()
+                    .thenRunOn(_service->getInstanceCleanupExecutor())
+                    .then([this, self = shared_from_this()] {
+                        stdx::lock_guard lk(_mutex);
 
-                    if (_completionPromise.getFuture().isReady()) {
-                        // We already completed
-                        return;
-                    }
-                    _completionPromise.setError(Status(ErrorCodes::Interrupted, "Interrupted"));
-                })
-                .getAsync([](auto) {});
+                        if (_completionPromise.getFuture().isReady()) {
+                            // We already completed
+                            return;
+                        }
+                        _completionPromise.setError(Status(ErrorCodes::Interrupted, "Interrupted"));
+                    });
 
-            return SemiFuture<void>::makeReady()
-                .thenRunOn(**executor)
-                .then([self = shared_from_this()] {
-                    self->_runOnce(State::kInitializing, State::kOne);
+            auto testLogicFinishedRunning =
+                SemiFuture<void>::makeReady()
+                    .thenRunOn(**executor)
+                    .then([self = shared_from_this()] {
+                        self->_runOnce(State::kInitializing, State::kOne);
 
-                    if (MONGO_unlikely(TestServiceHangDuringStateOne.shouldFail())) {
-                        TestServiceHangDuringStateOne.pauseWhileSet();
-                    }
-                })
-                .then([self = shared_from_this()] {
-                    self->_runOnce(State::kOne, State::kTwo);
+                        if (MONGO_unlikely(TestServiceHangDuringStateOne.shouldFail())) {
+                            TestServiceHangDuringStateOne.pauseWhileSet();
+                        }
+                    })
+                    .then([self = shared_from_this()] {
+                        self->_runOnce(State::kOne, State::kTwo);
 
-                    if (MONGO_unlikely(TestServiceHangDuringStateTwo.shouldFail())) {
-                        TestServiceHangDuringStateTwo.pauseWhileSet();
-                    }
-                })
-                .then([self = shared_from_this()] {
-                    // After this line the shared_ptr maintaining the Instance object is deleted
-                    // from the PrimaryOnlyService's map.  Thus keeping the self reference is
-                    // critical to extend the instance lifetime until all the callbacks using it
-                    // have completed.
-                    self->_runOnce(State::kTwo, State::kDone);
+                        if (MONGO_unlikely(TestServiceHangDuringStateTwo.shouldFail())) {
+                            TestServiceHangDuringStateTwo.pauseWhileSet();
+                        }
+                    })
+                    .then([self = shared_from_this()] {
+                        // After this line the shared_ptr maintaining the Instance object is deleted
+                        // from the PrimaryOnlyService's map.  Thus keeping the self reference is
+                        // critical to extend the instance lifetime until all the callbacks using it
+                        // have completed.
+                        self->_runOnce(State::kTwo, State::kDone);
 
-                    if (MONGO_unlikely(TestServiceHangDuringCompletion.shouldFail())) {
-                        TestServiceHangDuringCompletion.pauseWhileSet();
-                    }
-                })
-                .onCompletion([self = shared_from_this()](Status status) {
-                    stdx::lock_guard lk(self->_mutex);
-                    if (self->_completionPromise.getFuture().isReady()) {
-                        // We were already interrupted
-                        return;
-                    }
+                        if (MONGO_unlikely(TestServiceHangDuringCompletion.shouldFail())) {
+                            TestServiceHangDuringCompletion.pauseWhileSet();
+                        }
+                    })
+                    .onCompletion([self = shared_from_this()](Status status) {
+                        stdx::lock_guard lk(self->_mutex);
+                        if (self->_completionPromise.getFuture().isReady()) {
+                            // We were already interrupted
+                            return;
+                        }
 
-                    if (status.isOK()) {
-                        self->_completionPromise.emplaceValue();
-                    } else {
-                        self->_completionPromise.setError(status);
-                    }
-                })
+                        if (status.isOK()) {
+                            self->_completionPromise.emplaceValue();
+                        } else {
+                            self->_completionPromise.setError(status);
+                        }
+                    });
+
+            // This instance is considered complete when both cancellation logic and test logic have
+            // finished running.
+            return whenAll(std::move(cancelLogicFinishedRunning),
+                           std::move(testLogicFinishedRunning))
+                .ignoreValue()
                 .semi();
         }
 
@@ -269,7 +282,6 @@ private:
         auto opCtxHolder = cc().makeOperationContext();
         auto opCtx = opCtxHolder.get();
         DBDirectClient client(opCtx);
-
         BSONObj result;
         client.runCommand(nss.db().toString(),
                           BSON("createIndexes"
@@ -279,7 +291,6 @@ private:
                                                         << "expireAfterSeconds" << 100000))),
                           result);
         uassertStatusOK(getStatusFromCommandResult(result));
-
         return ExecutorFuture<void>(**executor, Status::OK());
     };
 };
@@ -454,6 +465,25 @@ TEST_F(PrimaryOnlyServiceTest, StepUpAfterShutdown) {
     stepUp();
 }
 
+TEST_F(PrimaryOnlyServiceTest, ShutdownDuringStepUp) {
+    stepDown();
+
+    // Make the instance rebuild on stepUp hang
+    auto stepUpTimesEntered =
+        PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic.setMode(FailPoint::alwaysOn);
+
+    // Start an async task to step up, which will block on the fail point.
+    auto stepUpFuture = ExecutorFuture<void>(_testExecutor).then([this]() { stepUp(); });
+    PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic.waitForTimesEntered(++stepUpTimesEntered);
+    ASSERT_FALSE(stepUpFuture.isReady());
+
+    // Shutdown, interrupting the thread waiting for the step up.
+    shutdown();
+
+    // Let the previous stepUp attempt continue and realize that the node has since shutdown.
+    PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic.setMode(FailPoint::off);
+}
+
 TEST_F(PrimaryOnlyServiceTest, BasicCreateInstance) {
     auto opCtx = makeOperationContext();
     auto instance =
@@ -580,6 +610,99 @@ DEATH_TEST_F(PrimaryOnlyServiceTest,
     }
 }
 
+TEST_F(PrimaryOnlyServiceTest, LookupInstanceAfterStepDownReturnsNone) {
+    // Make sure the instance doesn't complete before we try to look it up.
+    auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+
+    auto opCtx = makeOperationContext();
+    auto instance =
+        TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
+
+    // Wait for Instance::run() to be called before calling stepDown so that the _completionPromise
+    // will eventually be set.
+    TestServiceHangDuringInitialization.waitForTimesEntered(timesEntered + 1);
+
+    stepDown();
+
+    auto instance2 = TestService::Instance::lookup(opCtx.get(), _service, BSON("_id" << 0));
+
+    ASSERT_EQ(instance2, boost::none);
+
+    TestServiceHangDuringInitialization.setMode(FailPoint::off);
+    ASSERT_EQ(ErrorCodes::Interrupted, instance->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(PrimaryOnlyServiceTest, LookupInstanceAfterShutDownReturnsNone) {
+    // Make sure the instance doesn't complete before we try to look it up.
+    auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+
+    auto opCtx = makeOperationContext();
+    auto instance =
+        TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
+    // Make sure we enter the run function before shutting down.
+    TestServiceHangDuringInitialization.waitForTimesEntered(timesEntered + 1);
+    TestServiceHangDuringInitialization.setMode(FailPoint::off);
+
+    shutdown();
+
+    auto instance2 = TestService::Instance::lookup(opCtx.get(), _service, BSON("_id" << 0));
+
+    ASSERT_EQ(instance2, boost::none);
+
+    ASSERT_EQ(ErrorCodes::Interrupted, instance->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(PrimaryOnlyServiceTest, GetAllInstancesAfterStepDownReturnsEmptyVector) {
+    // Make sure the instance doesn't complete before we try to look it up.
+    auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+
+    auto opCtx = makeOperationContext();
+    auto instance =
+        TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
+
+    // Wait for Instance::run() to be called before calling stepDown so that the _completionPromise
+    // will eventually be set.
+    TestServiceHangDuringInitialization.waitForTimesEntered(timesEntered + 1);
+
+    stepDown();
+
+    auto instances = static_cast<TestService*>(_service)->getAllInstances(opCtx.get());
+
+    ASSERT_EQ(instances.size(), 0);
+
+    TestServiceHangDuringInitialization.setMode(FailPoint::off);
+    ASSERT_EQ(ErrorCodes::Interrupted, instance->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(PrimaryOnlyServiceTest, GetAllInstancesAfterShutDownReturnsEmptyVector) {
+    // Make sure the instance doesn't complete before we try to look it up.
+    auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+
+    auto opCtx = makeOperationContext();
+    auto instance =
+        TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
+
+    // Make sure we enter the run function before shutting down.
+    TestServiceHangDuringInitialization.waitForTimesEntered(timesEntered + 1);
+    TestServiceHangDuringInitialization.setMode(FailPoint::off);
+
+    shutdown();
+
+    auto instances = static_cast<TestService*>(_service)->getAllInstances(opCtx.get());
+
+    ASSERT_EQ(instances.size(), 0);
+
+    ASSERT_EQ(ErrorCodes::Interrupted, instance->getCompletionFuture().getNoThrow());
+}
+
 TEST_F(PrimaryOnlyServiceTest, GetOrCreateInstanceInterruptible) {
     stepDown();
     // Make sure the service stays in state kRebuilding so that getOrCreate() has to try to wait on
@@ -614,16 +737,30 @@ TEST_F(PrimaryOnlyServiceTest, DoubleCreateInstance) {
 }
 
 TEST_F(PrimaryOnlyServiceTest, ReportServerStatusInfo) {
+    stepDown();
+    // Make the instance rebuild on stepUp hang.
+    auto rebuildingFPTimesEntered =
+        PrimaryOnlyServiceHangBeforeRebuildingInstances.setMode(FailPoint::alwaysOn);
+    stepUp();
+
     {
+        PrimaryOnlyServiceHangBeforeRebuildingInstances.waitForTimesEntered(
+            ++rebuildingFPTimesEntered);
+
         BSONObjBuilder resultBuilder;
         _registry->reportServiceInfoForServerStatus(&resultBuilder);
 
-        ASSERT_BSONOBJ_EQ(BSON("primaryOnlyServices" << BSON("TestService" << 0)),
-                          resultBuilder.obj());
+        ASSERT_BSONOBJ_EQ(
+            BSON("primaryOnlyServices" << BSON("TestService" << BSON("state"
+                                                                     << "rebuilding"
+                                                                     << "numInstances" << 0))),
+            resultBuilder.obj());
     }
 
     // Make sure the instance doesn't complete.
     TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+    PrimaryOnlyServiceHangBeforeRebuildingInstances.setMode(FailPoint::off);
+
     auto opCtx = makeOperationContext();
     auto instance =
         TestService::Instance::getOrCreate(opCtx.get(), _service, BSON("_id" << 0 << "state" << 0));
@@ -632,8 +769,11 @@ TEST_F(PrimaryOnlyServiceTest, ReportServerStatusInfo) {
         BSONObjBuilder resultBuilder;
         _registry->reportServiceInfoForServerStatus(&resultBuilder);
 
-        ASSERT_BSONOBJ_EQ(BSON("primaryOnlyServices" << BSON("TestService" << 1)),
-                          resultBuilder.obj());
+        ASSERT_BSONOBJ_EQ(
+            BSON("primaryOnlyServices" << BSON("TestService" << BSON("state"
+                                                                     << "running"
+                                                                     << "numInstances" << 1))),
+            resultBuilder.obj());
     }
 
     auto instance2 =
@@ -643,8 +783,11 @@ TEST_F(PrimaryOnlyServiceTest, ReportServerStatusInfo) {
         BSONObjBuilder resultBuilder;
         _registry->reportServiceInfoForServerStatus(&resultBuilder);
 
-        ASSERT_BSONOBJ_EQ(BSON("primaryOnlyServices" << BSON("TestService" << 2)),
-                          resultBuilder.obj());
+        ASSERT_BSONOBJ_EQ(
+            BSON("primaryOnlyServices" << BSON("TestService" << BSON("state"
+                                                                     << "running"
+                                                                     << "numInstances" << 2))),
+            resultBuilder.obj());
     }
 
     TestServiceHangDuringInitialization.setMode(FailPoint::off);

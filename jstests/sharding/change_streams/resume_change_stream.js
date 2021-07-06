@@ -1,9 +1,7 @@
 // Tests resuming change streams on sharded collections.
-// We need to use a readConcern in this test, which requires read commands.
+//
 // @tags: [
-//   requires_find_command,
 //   requires_majority_read_concern,
-//   sbe_incompatible,
 //   uses_change_streams,
 // ]
 (function() {

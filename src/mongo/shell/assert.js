@@ -580,6 +580,18 @@ assert = (function() {
         return error;
     };
 
+    assert.throwsWithCode = function(func, code, params, msg) {
+        if (arguments.length < 2) {
+            throw new Error("assert.throwsWithCode expects at least 2 arguments");
+        }
+        // Remove the 'code' parameter, and any undefined parameters, from the list of arguments.
+        // Use .apply() to preserve the length of the 'arguments' object.
+        const newArgs = [func, params, msg].filter(element => element !== undefined);
+        const error = assert.throws.apply(null, newArgs);
+
+        assert.eq(error.code, code);
+    };
+
     assert.doesNotThrow = function(func, params, msg) {
         _validateAssertionMessage(msg);
 
@@ -1065,65 +1077,6 @@ assert = (function() {
         const msgPrefix = "" + a + " is not equal to " + b + " within " + deltaMS + " millis, " +
             "actual delta: " + actualDelta + " millis";
         doassert(_buildAssertionMessage(msg, msgPrefix));
-    };
-
-    assert.gleOK = function(res, msg) {
-        var errMsg = null;
-
-        if (!res) {
-            errMsg = "missing first argument, no response to check";
-        } else if (!res.ok) {
-            errMsg = "getLastError failed: " + tojson(res);
-        } else if ('code' in res || 'errmsg' in res || ('err' in res && res['err'] != null)) {
-            errMsg = "write or write concern failed: " + tojson(res);
-        }
-
-        if (errMsg) {
-            doassert(_buildAssertionMessage(msg, errMsg), res);
-        }
-
-        return res;
-    };
-
-    assert.gleSuccess = function(dbOrGLEDoc, msg) {
-        var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
-        if (gle.err) {
-            if (typeof (msg) == "function")
-                msg = msg(gle);
-            doassert(_buildAssertionMessage(msg, "getLastError not null: " + tojson(gle)), gle);
-        }
-        return gle;
-    };
-
-    assert.gleError = function(dbOrGLEDoc, msg) {
-        var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
-        if (!gle.err) {
-            if (typeof (msg) == "function")
-                msg = msg(gle);
-            doassert(_buildAssertionMessage(msg, "getLastError is null: " + tojson(gle)));
-        }
-    };
-
-    assert.gleErrorCode = function(dbOrGLEDoc, code, msg) {
-        var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
-        if (!gle.err || gle.code != code) {
-            if (typeof (msg) == "function")
-                msg = msg(gle);
-            doassert(_buildAssertionMessage(
-                msg,
-                "getLastError is null or has code other than \"" + code + "\": " + tojson(gle)));
-        }
-    };
-
-    assert.gleErrorRegex = function(dbOrGLEDoc, regex, msg) {
-        var gle = dbOrGLEDoc instanceof DB ? dbOrGLEDoc.getLastErrorObj() : dbOrGLEDoc;
-        if (!gle.err || !regex.test(gle.err)) {
-            if (typeof (msg) == "function")
-                msg = msg(gle);
-            doassert(_buildAssertionMessage(
-                msg,
-                "getLastError is null or doesn't match regex (" + regex + "): " + tojson(gle)));
-        }
     };
 
     assert.includes = function(haystack, needle, msg) {

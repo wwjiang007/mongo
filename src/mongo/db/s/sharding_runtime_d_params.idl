@@ -52,6 +52,17 @@ server_parameters:
           gte: 0
         default: 20
 
+    receiveChunkWaitForRangeDeleterTimeoutMS:
+        description: >-
+          Amount of time in milliseconds an incoming migration will wait for an intersecting range 
+          with data in it to be cleared up before failing.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: receiveChunkWaitForRangeDeleterTimeoutMS
+        validator:
+          gte: 0
+        default: 10000
+
     migrateCloneInsertionBatchSize:
         description: >-
           The maximum number of documents to insert in a single batch during the cloning step of
@@ -83,6 +94,19 @@ server_parameters:
         cpp_vartype: AtomicWord<int>
         cpp_varname: migrationLockAcquisitionMaxWaitMS
         default: 500
+
+    maxCatchUpPercentageBeforeBlockingWrites:
+        description: >-
+          The maximum percentage of untrasferred chunk mods at the end of a catch up iteration
+          that may be deferred to the next phase of the migration protocol
+          (where new writes get blocked).
+        set_at: [startup]
+        cpp_vartype: int
+        cpp_varname: maxCatchUpPercentageBeforeBlockingWrites
+        validator:
+          gte: 0
+          lte: 100
+        default: 10
 
     orphanCleanupDelaySecs:
         description: 'How long to wait before starting cleanup of an emigrated chunk range.'

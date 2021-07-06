@@ -43,9 +43,6 @@ namespace mongo {
  */
 class BSONCollectionCatalogEntry {
 public:
-    static const StringData kIndexBuildScanning;
-    static const StringData kIndexBuildDraining;
-
     /**
      * Incremented when breaking changes are made to the index build procedure so that other servers
      * know whether or not to resume or discard unfinished index builds.
@@ -61,17 +58,51 @@ public:
     struct IndexMetaData {
         IndexMetaData() {}
 
+        IndexMetaData(const IndexMetaData& other)
+            : spec(other.spec),
+              ready(other.ready),
+              isBackgroundSecondaryBuild(other.isBackgroundSecondaryBuild),
+              buildUUID(other.buildUUID) {
+            // We need to hold the multikey mutex when copying, someone else might be modifying this
+            stdx::lock_guard lock(other.multikeyMutex);
+            multikey = other.multikey;
+            multikeyPaths = other.multikeyPaths;
+        }
+
+        /**
+         * An index is considered present if it has a non-empty 'spec'.
+         * Invalid indexes by this definition include default constructed instances and
+         * and structs zeroed out due to index drops.
+         */
+        bool isPresent() const {
+            return !spec.isEmpty();
+        }
+
+        IndexMetaData& operator=(IndexMetaData&& rhs) {
+            if (&rhs != this) {
+                spec = std::move(rhs.spec);
+                ready = std::move(rhs.ready);
+                isBackgroundSecondaryBuild = std::move(rhs.isBackgroundSecondaryBuild);
+                buildUUID = std::move(rhs.buildUUID);
+
+                // No need to hold mutex on move, there are no concurrent readers while we're moving
+                // the instance.
+                multikey = std::move(rhs.multikey);
+                multikeyPaths = std::move(rhs.multikeyPaths);
+            }
+            return *this;
+        }
+
         void updateTTLSetting(long long newExpireSeconds);
 
         void updateHiddenSetting(bool hidden);
 
-        std::string name() const {
-            return spec["name"].String();
+        StringData nameStringData() const {
+            return spec["name"].valueStringDataSafe();
         }
 
         BSONObj spec;
         bool ready = false;
-        bool multikey = false;
         bool isBackgroundSecondaryBuild = false;
 
         // If initialized, a two-phase index build is in progress.
@@ -81,14 +112,32 @@ public:
         // the index key pattern. Each element in the vector is an ordered set of positions
         // (starting at 0) into the corresponding indexed field that represent what prefixes of the
         // indexed field cause the index to be multikey.
-        MultikeyPaths multikeyPaths;
+        // multikeyMutex must be held when accessing multikey or multikeyPaths
+        mutable Mutex multikeyMutex;
+        mutable bool multikey = false;
+        mutable MultikeyPaths multikeyPaths;
     };
 
     struct MetaData {
         void parse(const BSONObj& obj);
-        BSONObj toBSON() const;
+
+        /**
+         * If we have exclusive access to this MetaData (holding a unique copy). We don't need to
+         * hold mutexes when reading internal data.
+         */
+        BSONObj toBSON(bool hasExclusiveAccess = false) const;
+
+        /**
+         * Returns number of valid indexes.
+         */
+        int getTotalIndexCount() const;
 
         int findIndexOffset(StringData name) const;
+
+        /**
+         * Inserts information about an index into the MetaData.
+         */
+        void insertIndex(IndexMetaData indexMetaData);
 
         /**
          * Removes information about an index from the MetaData. Returns true if an index

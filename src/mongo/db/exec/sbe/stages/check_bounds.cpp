@@ -82,6 +82,9 @@ PlanState CheckBoundsStage::getNext() {
         return trackPlanState(PlanState::IS_EOF);
     }
 
+    // We are about to call getNext() on our child so do not bother saving our internal state in
+    // case it yields as the state will be completely overwritten after the getNext() call.
+    disableSlotAccess();
     auto state = _children[0]->getNext();
 
     if (state == PlanState::ADVANCED) {
@@ -92,10 +95,14 @@ PlanState CheckBoundsStage::getNext() {
                 keyTag == value::TypeTags::ksValue);
 
         auto key = value::getKeyStringView(keyVal);
-        auto bsonKey = KeyString::toBson(*key, _params.ord);
-        IndexSeekPoint seekPoint;
 
-        switch (_checker.checkKey(bsonKey, &seekPoint)) {
+        _keyBuffer.reset();
+        BSONObjBuilder keyBuilder(_keyBuffer);
+        KeyString::toBsonSafe(
+            key->getBuffer(), key->getSize(), _params.ord, key->getTypeBits(), keyBuilder);
+        auto bsonKey = keyBuilder.done();
+
+        switch (_checker.checkKey(bsonKey, &_seekPoint)) {
             case IndexBoundsChecker::VALID: {
                 auto [tag, val] = _inRecordIdAccessor->getViewOfValue();
                 _outAccessor.reset(false, tag, val);
@@ -109,7 +116,7 @@ PlanState CheckBoundsStage::getNext() {
             case IndexBoundsChecker::MUST_ADVANCE: {
                 auto seekKey = std::make_unique<KeyString::Value>(
                     IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
-                        seekPoint, _params.version, _params.ord, _params.direction == 1));
+                        _seekPoint, _params.version, _params.ord, _params.direction == 1));
                 _outAccessor.reset(true,
                                    value::TypeTags::ksValue,
                                    value::bitcastFrom<KeyString::Value*>(seekKey.release()));
@@ -130,7 +137,7 @@ PlanState CheckBoundsStage::getNext() {
 void CheckBoundsStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _children[0]->close();
 }
 
@@ -165,5 +172,13 @@ std::vector<DebugPrinter::Block> CheckBoundsStage::debugPrint() const {
     DebugPrinter::addNewLine(ret);
     DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
     return ret;
+}
+
+void CheckBoundsStage::doSaveState() {
+    if (!slotsAccessible()) {
+        return;
+    }
+
+    _outAccessor.makeOwned();
 }
 }  // namespace mongo::sbe

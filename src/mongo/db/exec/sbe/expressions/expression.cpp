@@ -372,6 +372,8 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"replaceOne", BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::replaceOne, false}},
     {"dropFields", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::dropFields, false}},
     {"newArray", BuiltinFn{kAnyNumberOfArgs, vm::Builtin::newArray, false}},
+    {"newArrayFromRange",
+     BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::newArrayFromRange, false}},
     {"newObj", BuiltinFn{[](size_t n) { return n % 2 == 0; }, vm::Builtin::newObj, false}},
     {"ksToString", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ksToString, false}},
     {"ks", BuiltinFn{[](size_t n) { return n > 2; }, vm::Builtin::newKs, false}},
@@ -414,6 +416,7 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"sinh", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::sinh, false}},
     {"tan", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tan, false}},
     {"tanh", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tanh, false}},
+    {"round", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::round, false}},
     {"concat", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::concat, false}},
     {"isMember", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::isMember, false}},
     {"collIsMember", BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::collIsMember, false}},
@@ -802,8 +805,8 @@ std::vector<DebugPrinter::Block> ETypeMatch::debugPrint() const {
 
 RuntimeEnvironment::RuntimeEnvironment(const RuntimeEnvironment& other)
     : _state{other._state}, _isSmp{other._isSmp} {
-    for (auto&& [name, slot] : _state->slots) {
-        emplaceAccessor(slot.first, slot.second);
+    for (auto&& [slotId, index] : _state->slots) {
+        emplaceAccessor(slotId, index);
     }
 }
 
@@ -822,28 +825,31 @@ value::SlotId RuntimeEnvironment::registerSlot(StringData name,
                                                value::Value val,
                                                bool owned,
                                                value::SlotIdGenerator* slotIdGenerator) {
-    if (auto it = _state->slots.find(name); it == _state->slots.end()) {
-        invariant(slotIdGenerator);
-        auto slot = slotIdGenerator->generate();
-        emplaceAccessor(slot, _state->pushSlot(name, slot));
-        _accessors.at(slot).reset(owned, tag, val);
-        return slot;
-    }
+    auto slot = registerSlot(tag, val, owned, slotIdGenerator);
+    _state->nameSlot(name, slot);
+    return slot;
+}
 
-    uasserted(4946303, str::stream() << "slot already registered:" << name);
+value::SlotId RuntimeEnvironment::registerSlot(value::TypeTags tag,
+                                               value::Value val,
+                                               bool owned,
+                                               value::SlotIdGenerator* slotIdGenerator) {
+    tassert(5645903, "Slot Id generator is null", slotIdGenerator);
+    auto slot = slotIdGenerator->generate();
+    emplaceAccessor(slot, _state->pushSlot(slot));
+    _accessors.at(slot).reset(owned, tag, val);
+    return slot;
 }
 
 value::SlotId RuntimeEnvironment::getSlot(StringData name) {
-    if (auto it = _state->slots.find(name); it != _state->slots.end()) {
-        return it->second.first;
-    }
-
-    uasserted(4946305, str::stream() << "environment slot is not registered: " << name);
+    auto slot = getSlotIfExists(name);
+    uassert(4946305, str::stream() << "environment slot is not registered: " << name, slot);
+    return *slot;
 }
 
 boost::optional<value::SlotId> RuntimeEnvironment::getSlotIfExists(StringData name) {
-    if (auto it = _state->slots.find(name); it != _state->slots.end()) {
-        return it->second.first;
+    if (auto it = _state->namedSlots.find(name); it != _state->namedSlots.end()) {
+        return it->second;
     }
 
     return boost::none;
@@ -864,7 +870,7 @@ void RuntimeEnvironment::resetSlot(value::SlotId slot,
     uasserted(4946300, str::stream() << "undefined slot accessor:" << slot);
 }
 
-value::SlotAccessor* RuntimeEnvironment::getAccessor(value::SlotId slot) {
+RuntimeEnvironment::Accessor* RuntimeEnvironment::getAccessor(value::SlotId slot) {
     if (auto it = _accessors.find(slot); it != _accessors.end()) {
         return &it->second;
     }
@@ -885,20 +891,28 @@ std::unique_ptr<RuntimeEnvironment> RuntimeEnvironment::makeCopy(bool isSmp) {
 void RuntimeEnvironment::debugString(StringBuilder* builder) {
     using namespace std::literals;
 
+    value::SlotMap<StringData> slotName;
+    for (const auto& [name, slot] : _state->namedSlots) {
+        slotName[slot] = name;
+    }
+
     *builder << "env: { ";
     bool first = true;
-    for (auto&& [name, slot] : _state->slots) {
+    for (auto&& [slot, _] : _state->slots) {
         if (first) {
             first = false;
         } else {
             *builder << ", ";
         }
 
-        *builder << name << " = s" << slot.first;
-
         std::stringstream ss;
-        ss << std::make_pair(_state->typeTags[slot.second], _state->vals[slot.second]);
-        *builder << " (" << ss.str() << ")";
+        ss << _accessors.at(slot).getViewOfValue();
+
+        *builder << "s" << slot << " = " << ss.str();
+
+        if (auto it = slotName.find(slot); it != slotName.end()) {
+            *builder << " (" << it->second << ")";
+        }
     }
     *builder << " }";
 }

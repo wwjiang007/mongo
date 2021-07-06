@@ -37,6 +37,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -49,7 +50,7 @@ DocumentSourceLimit::DocumentSourceLimit(const intrusive_ptr<ExpressionContext>&
 REGISTER_DOCUMENT_SOURCE(limit,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceLimit::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 constexpr StringData DocumentSourceLimit::kStageName;
 
@@ -100,9 +101,10 @@ intrusive_ptr<DocumentSourceLimit> DocumentSourceLimit::create(
 
 intrusive_ptr<DocumentSource> DocumentSourceLimit::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(15957, "the limit must be specified as a number", elem.isNumber());
-
-    long long limit = elem.safeNumberLong();
-    return DocumentSourceLimit::create(pExpCtx, limit);
+    const auto limit = elem.parseIntegerElementToNonNegativeLong();
+    uassert(5107201,
+            str::stream() << "invalid argument to $limit stage: " << limit.getStatus().reason(),
+            limit.isOK());
+    return DocumentSourceLimit::create(pExpCtx, limit.getValue());
 }
 }  // namespace mongo

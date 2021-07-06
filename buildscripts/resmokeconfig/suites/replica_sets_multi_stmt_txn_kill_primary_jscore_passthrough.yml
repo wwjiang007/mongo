@@ -14,7 +14,6 @@ selector:
   # These tests expects some statements to error, which will cause txns to abort entirely.
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
-  - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
@@ -101,7 +100,6 @@ selector:
   # to test run without multi statement transactions).
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
-  - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
   - jstests/core/field_name_validation.js
@@ -301,8 +299,8 @@ selector:
   # operation and cluster times aren't shared between shells.
   # "Cowardly refusing to run test with network retries enabled when it uses startParallelShell()"
   - uses_parallel_shell
-  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
-  # cannot be run with transactions.
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
   - uses_api_parameters
 
 executor:
@@ -336,7 +334,6 @@ executor:
       # We specify nodb so the shell used by each test will attempt to connect after loading the
       # retry logic in auto_retry_on_network_error.js.
       nodb: ""
-      readMode: commands
   hooks:
   # We use a stepdown interval of 15 seconds because we will retry all commands in a transaction
   # so we need to allow time for at most 10 operations to be re-run and then re-committed. If

@@ -33,6 +33,8 @@
 
 #include "mongo/s/query/cluster_find.h"
 
+#include <fmt/format.h>
+
 #include <memory>
 #include <set>
 #include <vector>
@@ -45,9 +47,10 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
@@ -70,6 +73,8 @@
 namespace mongo {
 
 namespace {
+
+using namespace fmt::literals;
 
 static const BSONObj kSortKeyMetaProjection = BSON("$meta"
                                                    << "sortKey");
@@ -449,7 +454,12 @@ Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
         ReadConcernArgs::get(opCtx) = *readConcern;
     }
 
-    APIParameters::get(opCtx) = cursor->getAPIParameters();
+    auto apiParamsFromClient = APIParameters::get(opCtx);
+    uassert(ErrorCodes::APIMismatchError,
+            "API parameter mismatch: getMore used params {}, the cursor-creating command "
+            "used {}"_format(apiParamsFromClient.toBSON().toString(),
+                             cursor->getAPIParameters().toBSON().toString()),
+            apiParamsFromClient == cursor->getAPIParameters());
 
     // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
     // that if the 'getMore' command itself has a 'comment' field, we give precedence to it.
@@ -782,12 +792,21 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         StatusWith<ClusterQueryResult> next =
             Status{ErrorCodes::InternalError, "uninitialized cluster query result"};
         try {
-            IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
             next = pinnedCursor.getValue()->next(context);
         } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
             // This exception is thrown when a $changeStream stage encounters an event
             // that invalidates the cursor. We should close the cursor and return without
             // error.
+            cursorState = ClusterCursorManager::CursorState::Exhausted;
+            break;
+        } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+            // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+            // to the resume token of the invalidating event, and mark the cursor response as
+            // invalidated. We always expect to have ExtraInfo for this error code.
+            const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+            tassert(5493707, "Missing ChangeStreamInvalidationInfo on exception", extraInfo);
+
+            postBatchResumeToken = extraInfo->getInvalidateResumeToken();
             cursorState = ClusterCursorManager::CursorState::Exhausted;
             break;
         }

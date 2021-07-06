@@ -1,7 +1,9 @@
 /**
  * This test is meant to test that a migration will correctly wait for the majority commit point
  * when there are no transfer mod writes (SERVER-42783).
- * @tags: [requires_find_command, requires_majority_read_concern]
+ * @tags: [
+ *   requires_majority_read_concern,
+ * ]
  */
 
 (function() {
@@ -11,7 +13,7 @@ load('./jstests/libs/chunk_manipulation_util.js');
 load("jstests/libs/write_concern_util.js");
 
 // Set up a sharded cluster with two shards, two chunks, and one document in one of the chunks.
-const st = new ShardingTest({shards: 2, rs: {nodes: 2}, config: 1});
+const st = new ShardingTest({shards: 2, rs: {nodes: 2}});
 const testDB = st.s.getDB("test");
 
 assert.commandWorked(testDB.foo.insert({_id: 1}, {writeConcern: {w: "majority"}}));
@@ -20,12 +22,15 @@ st.ensurePrimaryShard("test", st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({enableSharding: "test"}));
 assert.commandWorked(st.s.adminCommand({shardCollection: "test.foo", key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: "test.foo", middle: {_id: 0}}));
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // The document is in the majority committed snapshot.
 assert.eq(1, testDB.foo.find().readConcern("majority").itcount());
 
 // Advance a migration to the beginning of the cloning phase.
-pauseMigrateAtStep(st.rs1.getPrimary(), 2);
+pauseMigrateAtStep(st.rs1.getPrimary(), migrateStepNames.rangeDeletionTaskScheduled);
 
 // For startParallelOps to write its state
 let staticMongod = MongoRunner.runMongod({});
@@ -40,7 +45,7 @@ let awaitMigration = moveChunkParallel(staticMongod,
 
 // Wait for the migration to reach the failpoint and allow any writes to become majority committed
 // before pausing replication.
-waitForMigrateStep(st.rs1.getPrimary(), 2);
+waitForMigrateStep(st.rs1.getPrimary(), migrateStepNames.rangeDeletionTaskScheduled);
 st.rs1.awaitLastOpCommitted();
 
 // Disable replication on the recipient shard's secondary node, so the recipient shard's majority
@@ -49,7 +54,7 @@ const destinationSec = st.rs1.getSecondary();
 stopServerReplication(destinationSec);
 
 // Allow the migration to begin cloning.
-unpauseMigrateAtStep(st.rs1.getPrimary(), 2);
+unpauseMigrateAtStep(st.rs1.getPrimary(), migrateStepNames.rangeDeletionTaskScheduled);
 
 // Check the migration coordinator document, because the moveChunk command itself
 // will hang on trying to remove the recipient's range deletion entry with majority writeConcern

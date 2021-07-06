@@ -50,6 +50,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/future_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -187,8 +188,8 @@ std::vector<repl::OplogEntry> ReshardingDonorOplogIterator::_fillBatch(Pipeline&
         }
 
         numBytes += obj.objsize();
-    } while (numBytes < resharding::gReshardingBatchLimitBytes &&
-             batch.size() < std::size_t(resharding::gReshardingBatchLimitOperations));
+    } while (numBytes < resharding::gReshardingOplogBatchLimitBytes.load() &&
+             batch.size() < std::size_t(resharding::gReshardingOplogBatchLimitOperations.load()));
 
     return batch;
 }
@@ -204,6 +205,8 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
 
     auto batch = [&] {
         auto opCtx = factory.makeOperationContext(&cc());
+        auto guard = makeGuard([&] { dispose(opCtx.get()); });
+
         if (_pipeline) {
             _pipeline->reattachToOperationContext(opCtx.get());
         } else {
@@ -211,13 +214,12 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
             _pipeline = pipeline->getContext()
                             ->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
                                 pipeline.release());
+            _pipeline.get_deleter().dismissDisposal();
         }
 
         auto batch = _fillBatch(*_pipeline);
 
-        if (batch.empty()) {
-            _pipeline.reset();
-        } else {
+        if (!batch.empty()) {
             const auto& lastEntryInBatch = batch.back();
             _resumeToken = getId(lastEntryInBatch);
 
@@ -225,9 +227,9 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
                 _hasSeenFinalOplogEntry = true;
                 // Skip returning the final oplog entry because it is known to be a no-op.
                 batch.pop_back();
-                _pipeline.reset();
             } else {
                 _pipeline->detachFromOperationContext();
+                guard.dismiss();
             }
         }
 
@@ -246,6 +248,13 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
     }
 
     return ExecutorFuture(std::move(executor), std::move(batch));
+}
+
+void ReshardingDonorOplogIterator::dispose(OperationContext* opCtx) {
+    if (_pipeline) {
+        _pipeline->dispose(opCtx);
+        _pipeline.reset();
+    }
 }
 
 }  // namespace mongo

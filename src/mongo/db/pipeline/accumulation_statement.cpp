@@ -115,15 +115,11 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
 
     auto&& parser =
         AccumulationStatement::getParser(accName, expCtx->maxFeatureCompatibilityVersion);
-    auto [initializer, argument, factory] = parser(expCtx, specElem, vps);
+    auto accExpr = parser(expCtx, specElem, vps);
 
-    return AccumulationStatement(fieldName.toString(),
-                                 AccumulationExpression(initializer, argument, factory));
+    return AccumulationStatement(fieldName.toString(), std::move(accExpr));
 }
 
-MONGO_INITIALIZER(accumulatorParserMap)(InitializerContext*) {
-    // Nothing to do. This initializer exists to tie together all the individual initializers
-    // defined by REGISTER_ACCUMULATOR / REGISTER_ACCUMULATOR_WITH_MIN_VERSION.
-}
-
+MONGO_INITIALIZER_GROUP(BeginAccumulatorRegistration, ("default"), ("EndAccumulatorRegistration"))
+MONGO_INITIALIZER_GROUP(EndAccumulatorRegistration, ("BeginAccumulatorRegistration"), ())
 }  // namespace mongo

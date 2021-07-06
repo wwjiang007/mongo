@@ -103,7 +103,7 @@ should always return at least 1 document due to the greater than or equal predic
 not, that means that A’s oplog is behind B's and thus A should not be B’s sync source. If it does
 return a non-empty batch, but the first document returned does not match the last entry in B’s
 oplog, there are two possibilities. If the oldest entry in A's oplog is newer than B's latest
-entry, that means that B is too stale to sync from A. As a result, B blacklists A as a sync source
+entry, that means that B is too stale to sync from A. As a result, B denylists A as a sync source
 candidate. Otherwise, B's oplog has diverged from A's and it should go into
 [**ROLLBACK**](https://docs.mongodb.com/manual/core/replica-set-rollbacks/).
 
@@ -188,10 +188,10 @@ Otherwise, it iterates through all of the nodes and sees which one is the best.
 After choosing a sync source candidate, the `SyncSourceResolver` probes the sync source candidate to
 make sure it actually is able to fetch from the sync source candidate’s oplog.
 
-* If the sync source candidate has no oplog or there is an error, the secondary blacklists that sync
+* If the sync source candidate has no oplog or there is an error, the secondary denylists that sync
   source for some time and then tries to find a new sync source candidate.
 * If the oldest entry in the sync source candidate's oplog is newer than the node's newest entry,
-  then the node blacklists that sync source candidate as well because the candidate is too far
+  then the node denylists that sync source candidate as well because the candidate is too far
   ahead.
 * During initial sync, rollback, or recovery from unclean shutdown, nodes will set a specific
   OpTime, [**`minValid`**](#replication-timestamp-glossary), that they must reach before it is safe
@@ -530,6 +530,7 @@ by reading from the storage engine's most recent snapshot. On a secondary, it pe
 read at the lastApplied, so that it does not see writes from the batch that is currently being
 applied. For information on how local read concern works within a multi-document transaction, see
 the [Read Concern Behavior Within Transactions](#read-concern-behavior-within-transactions) section.
+Local read concern is the default read concern.
 
 **Majority** does a timestamped read at the stable timestamp (also called the last committed
 snapshot in the code, for legacy reasons). The data read only reflects the oplog entries that have
@@ -568,6 +569,21 @@ Linearizable read concern is not allowed within a multi-document transaction.
 **Snapshot** read concern can only be run within a multi-document transaction. See the
 [Read Concern Behavior Within Transactions](#read-concern-behavior-within-transactions) section for
 more information.
+
+**Available** read concern behaves identically to local read concern in most cases. The exception is
+reads for sharded collections from secondary shard nodes. Local read concern will wait to refresh
+the routing table cache when the node realizes its
+[metadata is stale](../s/README.md#when-the-routing-table-cache-will-refresh), which requires
+contacting the shard's primary or config servers before being able to serve the read. Available read
+concern does not provide consistency guarantees because it does not wait for routing table cache
+refreshes. As a result, available read concern potentially serves reads faster and is more tolerant
+to network partitions than any other read concern, since the node does not need to communicate with
+another node in the cluster to serve the read. However, this also means that if the node's metadata
+was stale, available read concern could potentially return
+[orphan documents](../s/README.md#orphan-filtering) or even a stale view of a chunk that has been
+moved a long time ago and modified on another shard.
+
+Available read concern is not allowed to be used with causally consistent sessions or transactions.
 
 **afterOpTime** is another read concern option, only used internally, only for config servers as
 replica sets. **Read after optime** means that the read will block until the node has replicated
@@ -1383,6 +1399,33 @@ last `stable_timestamp`. This does not, however, revert the oplog. In order to r
 rollback must remove all oplog entries after the `common point`. This is called the truncate point
 and is written into the `oplogTruncateAfterPoint` document. Now, the recovery process knows where to
 truncate the oplog on the rollback node.
+
+Before truncating the oplog, the rollback procedure will also make sure that session information in
+`config.transactions` table is consistent with the `stableTimestamp`. As part of [vectored inserts](https://github.com/mongodb/mongo/blob/1182fa8c9889c88c22a5eb934d99e098456d0cbc/src/mongo/db/catalog/README.md#vectored-inserts)
+and secondary oplog application of retryable writes, updates to the same session entry in the
+`config.transactions` table will be coalesced as a single update when applied in the same batch. In
+other words, we will only apply the last update to a session entry in a batch. However, if
+the `stableTimestamp` refers to a point in time that is before the last update, it is possible to
+lose the session information that was never applied as part of the coalescing.
+
+As an example, consider the following:
+1.  During a single batch of secondary oplog application:
+    i).  User data write for stmtId=0 at t=10.
+    ii).  User data write for stmtId=1 at t=11.
+    iii).  User data write for stmtId=2 at t=12.
+    iv).  Session txn record write at t=12 with stmtId=2 as lastWriteOpTime. In particular, no
+    session txn record write for t=10 with stmtId=0 as lastWriteOpTime or for t=11 with stmtId=1 as lastWriteOpTime because they were coalseced by the [SessionUpdateTracker](https://github.com/mongodb/mongo/blob/9d601c939bca2a4304dca2d3c8abd195c1f070af/src/mongo/db/repl/session_update_tracker.cpp#L217-L221).
+2.  Rollback to stable timestamp t=10.
+3.  The session txn record won't exist with stmtId=0 as lastWriteOpTime (because the write was
+entirely skipped by oplog application) despite the user data write for stmtId=0 being reflected
+on-disk. Without any fix, this allows stmtId=0 to be re-executed by this node if it became primary.
+
+As a solution, we traverse the oplog to find the last completed retryable write statements that occur before or at the `stableTimestamp`, and use this information to restore the `config.transactions`
+table. More specifically, we perform a forward scan of the oplog starting from the first entry
+greater than the `stableTimestamp`. For any entries with a non-null `prevWriteOpTime` value less
+than or equal to the `stableTimestamp`, we create a `SessionTxnRecord` and perform an untimestamped
+write to the `config.transactions` table. We must do an untimestamped write so that it will not be
+rolled back on recovering to the `stableTimestamp` if we were to crash. Finally, we take a stable checkpoint so that these restoration writes are persisted to disk before truncating the oplog.
 
 During the last few steps of the data modification section, we clear the state of the
 `DropPendingCollectionReaper`, which manages collections that are marked as drop-pending by the Two

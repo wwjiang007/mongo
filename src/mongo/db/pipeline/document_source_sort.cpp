@@ -74,7 +74,7 @@ DocumentSourceSort::DocumentSourceSort(const boost::intrusive_ptr<ExpressionCont
 REGISTER_DOCUMENT_SOURCE(sort,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceSort::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
     if (!_populated) {
@@ -122,7 +122,8 @@ void DocumentSourceSort::serializeToArray(
 
         mutDoc["totalDataSizeSortedBytesEstimate"] =
             Value(static_cast<long long>(stats.totalDataSizeBytes));
-        mutDoc["usedDisk"] = Value(stats.spills > 0 ? true : false);
+        mutDoc["usedDisk"] = Value(stats.spills > 0);
+        mutDoc["spills"] = Value(static_cast<long long>(stats.spills));
     }
 
     array.push_back(Value(mutDoc.freeze()));
@@ -172,13 +173,8 @@ Pipeline::SourceContainer::iterator DocumentSourceSort::doOptimizeAt(
 }
 
 DepsTracker::State DocumentSourceSort::getDependencies(DepsTracker* deps) const {
-    for (auto&& keyPart : _sortExecutor->sortPattern()) {
-        if (keyPart.expression) {
-            keyPart.expression->addDependencies(deps);
-        } else {
-            deps->fields.insert(keyPart.fieldPath->fullPath());
-        }
-    }
+    _sortExecutor->sortPattern().addDependencies(deps);
+
     if (pExpCtx->needsMerge) {
         // Include the sort key if we will merge several sorted streams later.
         deps->setNeedsMetadata(DocumentMetadataFields::kSortKey, true);

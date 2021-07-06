@@ -54,12 +54,6 @@ server_parameters:
         cpp_varname: "gTimeseriesIdleBucketExpiryMemoryUsageThreshold"
         default:  104857600 # 100MB
         validator: { gte: 1 }
-    "timeseriesBucketsCollectionClusterById":
-        description: "When true, newly-created time-series buckets collections are clustered by _id"
-        set_at: [ startup ]
-        cpp_vartype: bool
-        cpp_varname: gTimeseriesBucketsCollectionClusterById
-        default: true
 
 enums:
     BucketGranularity:
@@ -87,11 +81,6 @@ structs:
                               be \"_id\" or the same as 'timeField'."
                 type: string
                 optional: true
-            expireAfterSeconds:
-                description: "The number of seconds after which old time-series data should be
-                              deleted."
-                type: safeInt64
-                optional: true
             granularity:
                 description: "Describes the expected interval between subsequent measurements"
                 type: BucketGranularity
@@ -99,5 +88,5 @@ structs:
             bucketMaxSpanSeconds:
                 description: "The maximum range of time values for a bucket, in seconds"
                 type: safeInt
-                default: 3600
+                optional: true
                 validator: { gte: 1 }

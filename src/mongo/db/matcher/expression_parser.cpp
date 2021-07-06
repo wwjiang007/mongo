@@ -67,6 +67,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/dbref.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
@@ -93,16 +94,27 @@ bool hasNode(const MatchExpression* root, MatchExpression::MatchType type) {
 // TODO SERVER-49852: Currently SBE cannot handle match expressions with numeric path
 // components due to some of the complexity around how arrays are handled.
 void disableSBEForNumericPathComponent(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       const FieldRef* fieldRef) {
+                                       const MatchExpression* node) {
+    auto fieldRef = node->fieldRef();
     if (fieldRef && fieldRef->hasNumericPathComponents()) {
         expCtx->sbeCompatible = false;
+        return;
+    }
+    for (size_t i = 0; i < node->numChildren(); ++i) {
+        // For some match expressions trees, there could be a path associated with a node deeper in
+        // the tree. This is true in particular for negations. For example, {a: {$not: {$gt: 0}}}
+        // will be converted to a NOT => GT tree, but it is the GT node that carries the path,
+        // rather than the NOT node.
+        disableSBEForNumericPathComponent(expCtx, node->getChild(i));
+        if (!expCtx->sbeCompatible)
+            return;
     }
 }
 
 void addExpressionToRoot(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                          AndMatchExpression* root,
                          std::unique_ptr<MatchExpression> newNode) {
-    disableSBEForNumericPathComponent(expCtx, newNode->fieldRef());
+    disableSBEForNumericPathComponent(expCtx, newNode.get());
     root->add(std::move(newNode));
 }
 }  // namespace
@@ -211,15 +223,15 @@ bool isDBRefDocument(const BSONObj& obj, bool allowIncompleteDBRef) {
         auto element = i.next();
         auto fieldName = element.fieldNameStringData();
         // $ref
-        if (!hasRef && "$ref"_sd == fieldName) {
+        if (!hasRef && dbref::kRefFieldName == fieldName) {
             hasRef = true;
         }
         // $id
-        else if (!hasID && "$id"_sd == fieldName) {
+        else if (!hasID && dbref::kIdFieldName == fieldName) {
             hasID = true;
         }
         // $db
-        else if (!hasDB && "$db"_sd == fieldName) {
+        else if (!hasDB && dbref::kDbFieldName == fieldName) {
             hasDB = true;
         }
     }
@@ -281,9 +293,16 @@ StatusWithMatchExpression parse(const BSONObj& obj,
             auto parseExpressionMatchFunction = retrievePathlessParser(name);
 
             if (!parseExpressionMatchFunction) {
+                const auto dotsAndDollarsHint =
+                    serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                            FeatureCompatibilityParams::Version::kVersion50)
+                    ? ". If you have a field name that starts with a '$' symbol, consider using "
+                      "$getField or $setField."
+                    : "";
                 return {Status(ErrorCodes::BadValue,
-                               str::stream()
-                                   << "unknown top level operator: " << e.fieldNameStringData())};
+                               str::stream() << "unknown top level operator: "
+                                             << e.fieldNameStringData() << dotsAndDollarsHint)};
             }
 
             auto parsedExpression = parseExpressionMatchFunction(
@@ -1158,7 +1177,7 @@ StatusWithMatchExpression parseGeo(StringData name,
         invariant(PathAcceptingKeyword::GEO_NEAR == type);
 
         if ((allowedFeatures & MatchExpressionParser::AllowedFeatures::kGeoNear) == 0u) {
-            return {Status(ErrorCodes::BadValue,
+            return {Status(ErrorCodes::Error(5626500),
                            "$geoNear, $near, and $nearSphere are not allowed in this context")};
         }
 
@@ -1576,10 +1595,6 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                 expCtx,
                 allowedFeatures);
 
-            // The NotMatchExpression below does not have a path, so 's' must be checked for a
-            // numeric path component instead.
-            disableSBEForNumericPathComponent(expCtx, s.getValue()->fieldRef());
-
             return {std::make_unique<NotMatchExpression>(
                 s.getValue().release(),
                 doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnoreButDescend))};
@@ -1624,9 +1639,6 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                 return parseStatus;
             }
 
-            // The NotMatchExpression below does not have a path, so 's' must be checked for a
-            // numeric path component instead.
-            disableSBEForNumericPathComponent(expCtx, temp->fieldRef());
             return {std::make_unique<NotMatchExpression>(
                 temp.release(),
                 doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnoreButDescend))};

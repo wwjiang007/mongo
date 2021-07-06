@@ -2,12 +2,11 @@
  * Tests that a time-series collection created with the 'expireAfterSeconds' option will remove
  * buckets older than 'expireAfterSeconds' based on the bucket creation time.
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -25,7 +24,7 @@ TimeseriesTest.run((insert) => {
     const expireAfterSeconds = NumberLong(5);
     assert.commandWorked(db.createCollection(
         coll.getName(),
-        {timeseries: {timeField: timeFieldName, expireAfterSeconds: expireAfterSeconds}}));
+        {timeseries: {timeField: timeFieldName}, expireAfterSeconds: expireAfterSeconds}));
     assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
     // Inserts a measurement with a time in the past to ensure the measurement will be removed
@@ -46,7 +45,7 @@ TimeseriesTest.run((insert) => {
     jsTestLog('Removal took ' + ((new Date()).getTime() - start.getTime()) + ' ms.');
 
     // Check bucket collection.
-    const bucketDocs = bucketsColl.find().sort({_id: 1}).toArray();
+    const bucketDocs = bucketsColl.find().sort({'control.min._id': 1}).toArray();
     assert.eq(0, bucketDocs.length, bucketDocs);
 });
 })();

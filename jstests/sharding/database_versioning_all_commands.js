@@ -232,6 +232,7 @@ function testCommandAfterDropRecreateDatabase(testCase, st) {
 }
 
 let testCases = {
+    _getAuditConfigGeneration: {skip: "not on a user database", conditional: true},
     _hashBSONElement: {skip: "executes locally on mongos (not sent to any remote node)"},
     _isSelf: {skip: "executes locally on mongos (not sent to any remote node)"},
     _killOperations: {skip: "executes locally on mongos (not sent to any remote node)"},
@@ -285,6 +286,7 @@ let testCases = {
             },
         }
     },
+    commitReshardCollection: {skip: "always targets the config server"},
     commitTransaction: {skip: "unversioned and uses special targetting rules"},
     compact: {skip: "not allowed through mongos"},
     configureFailPoint: {skip: "executes locally on mongos (not sent to any remote node)"},
@@ -440,6 +442,7 @@ let testCases = {
     },
     flushRouterConfig: {skip: "executes locally on mongos (not sent to any remote node)"},
     fsync: {skip: "broadcast to all shards"},
+    getAuditConfig: {skip: "not on a user database", conditional: true},
     getCmdLineOpts: {skip: "executes locally on mongos (not sent to any remote node)"},
     getDefaultRWConcern: {skip: "executes locally on mongos (not sent to any remote node)"},
     getDiagnosticData: {skip: "executes locally on mongos (not sent to any remote node)"},

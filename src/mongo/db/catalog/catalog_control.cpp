@@ -117,25 +117,22 @@ void openCatalog(OperationContext* opCtx,
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     // Ignore orphaned idents because this function is used during rollback and not at
     // startup recovery, when we may try to recover orphaned idents.
-    auto loadingFromUncleanShutdown = false;
-    storageEngine->loadCatalog(opCtx, loadingFromUncleanShutdown);
+    storageEngine->loadCatalog(opCtx, StorageEngine::LastShutdownState::kClean);
 
     LOGV2(20274, "openCatalog: reconciling catalog and idents");
-    // Retain unknown internal idents because this function is used during rollback and not at
-    // startup recovery, when we may drop unknown internal idents.
-    auto internalIdentReconcilePolicy = StorageEngine::InternalIdentReconcilePolicy::kRetain;
     auto reconcileResult = fassert(
-        40688, storageEngine->reconcileCatalogAndIdents(opCtx, internalIdentReconcilePolicy));
+        40688,
+        storageEngine->reconcileCatalogAndIdents(opCtx, StorageEngine::LastShutdownState::kClean));
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
     // indexes on that collection are done at once, so we use a map to group them together.
     StringMap<IndexNameObjs> nsToIndexNameObjMap;
+    auto catalog = CollectionCatalog::get(opCtx);
     for (StorageEngine::IndexIdentifier indexIdentifier : reconcileResult.indexesToRebuild) {
         auto indexName = indexIdentifier.indexName;
-        auto indexSpecs =
-            getIndexNameObjs(opCtx,
-                             indexIdentifier.catalogId,
-                             [&indexName](const std::string& name) { return name == indexName; });
+        auto coll = catalog->lookupCollectionByNamespace(opCtx, indexIdentifier.nss);
+        auto indexSpecs = getIndexNameObjs(
+            coll, [&indexName](const std::string& name) { return name == indexName; });
         if (!indexSpecs.isOK() || indexSpecs.getValue().first.empty()) {
             fassert(40689,
                     {ErrorCodes::InternalError,
@@ -157,7 +154,6 @@ void openCatalog(OperationContext* opCtx,
         ino.second.emplace_back(std::move(indexesToRebuild.second.back()));
     }
 
-    auto catalog = CollectionCatalog::get(opCtx);
     for (const auto& entry : nsToIndexNameObjMap) {
         NamespaceString collNss(entry.first);
 

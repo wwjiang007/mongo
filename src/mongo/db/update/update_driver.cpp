@@ -145,7 +145,8 @@ void UpdateDriver::parse(
                 arrayFilters.empty());
 
         _updateType = UpdateType::kDelta;
-        _updateExecutor = std::make_unique<DeltaExecutor>(updateMod.getDiff());
+        _updateExecutor = std::make_unique<DeltaExecutor>(
+            updateMod.getDiff(), updateMod.mustCheckExistenceForInsertOperations());
         return;
     }
 
@@ -299,6 +300,9 @@ Status UpdateDriver::update(OperationContext* opCtx,
     if (_logOp && logOpRec && !applyResult.noop) {
         *logOpRec = applyResult.oplogEntry;
     }
+
+    _containsDotsAndDollarsField =
+        (_containsDotsAndDollarsField || applyResult.containsDotsAndDollarsField);
 
     return Status::OK();
 }

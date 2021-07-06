@@ -49,6 +49,7 @@
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/write_error_detail.h"
+#include "mongo/util/exit.h"
 
 namespace mongo {
 namespace {
@@ -83,15 +84,19 @@ void noteStaleShardResponses(const std::vector<ShardError>& staleErrors, NSTarge
 }
 
 // Helper to note several stale db errors from a response
-void noteStaleDbResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+void noteStaleDbResponses(OperationContext* opCtx,
+                          const std::vector<ShardError>& staleErrors,
+                          NSTargeter* targeter) {
     for (const auto& error : staleErrors) {
         LOGV2_DEBUG(22903,
                     4,
-                    "Noting stale database response from {shardId}: errorInfo",
+                    "Noting stale database response",
                     "shardId"_attr = error.endpoint.shardName,
-                    "errorInfo"_attr = error.error.toBSON());
+                    "errorInfo"_attr = error.error);
         targeter->noteStaleDbResponse(
-            error.endpoint, StaleDbRoutingVersion::parseFromCommandError(error.error.toBSON()));
+            opCtx,
+            error.endpoint,
+            StaleDbRoutingVersion::parseFromCommandError(error.error.toBSON()));
     }
 }
 
@@ -340,7 +345,7 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
 
                     if (!staleDbErrors.empty()) {
                         invariant(staleShardErrors.empty());
-                        noteStaleDbResponses(staleDbErrors, &targeter);
+                        noteStaleDbResponses(opCtx, staleDbErrors, &targeter);
                         ++stats->numStaleDbBatches;
                     }
 
@@ -357,6 +362,14 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                                                : OID());
                     }
                 } else {
+                    if ((ErrorCodes::isShutdownError(responseStatus) ||
+                         responseStatus == ErrorCodes::CallbackCanceled) &&
+                        globalInShutdownDeprecated()) {
+                        // Throw an error since the mongos itself is shutting down so this should
+                        // be a top level error instead of a write error.
+                        uassertStatusOK(responseStatus);
+                    }
+
                     // Error occurred dispatching, note it
                     const Status status = responseStatus.withContext(
                         str::stream() << "Write results unavailable "

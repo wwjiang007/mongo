@@ -88,7 +88,6 @@
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/initialize_server_global_state.h"
-#include "mongo/db/initialize_server_security_state.h"
 #include "mongo/db/initialize_snmp.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
@@ -139,10 +138,12 @@
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include "mongo/db/s/rename_collection_participant_service.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 #include "mongo/db/s/resharding/resharding_op_observer.h"
 #include "mongo/db/s/resharding/resharding_recipient_service.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
@@ -262,8 +263,8 @@ void logStartup(OperationContext* opCtx) {
     BSONObj o = toLog.obj();
 
     Lock::GlobalWrite lk(opCtx);
-    AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
-    Database* db = autoDb.getDb();
+    AutoGetDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
+    auto db = autoDb.ensureDbExists();
     CollectionPtr collection =
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
@@ -317,6 +318,7 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
     } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        services.push_back(std::make_unique<RenameCollectionParticipantService>(serviceContext));
         services.push_back(std::make_unique<ShardingDDLCoordinatorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingDonorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingRecipientService>(serviceContext));
@@ -403,8 +405,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // initialized, a noop recovery unit is used until the initialization is complete.
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
-    auto lastStorageEngineShutdownState =
-        initializeStorageEngine(startupOpCtx.get(), StorageEngineInitFlags::kNone);
+    auto lastShutdownState = initializeStorageEngine(startupOpCtx.get(), StorageEngineInitFlags{});
     StorageControl::startStorageControls(serviceContext);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -480,8 +481,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     }
 
     try {
-        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get(),
-                                                    lastStorageEngineShutdownState);
+        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get(), lastShutdownState);
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
         LOGV2_FATAL_OPTIONS(
             20573,
@@ -632,13 +632,17 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             str::stream()
                 << "Cannot take an unstable checkpoint on shutdown while using queryableBackupMode",
             !gTakeUnstableCheckpointOnShutdown);
+        uassert(5576603,
+                str::stream() << "Cannot specify both queryableBackupMode and "
+                              << "startupRecoveryForRestore at the same time",
+                !repl::startupRecoveryForRestore);
 
         auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
         invariant(replCoord);
         uassert(ErrorCodes::BadValue,
                 str::stream() << "Cannot use queryableBackupMode in a replica set",
                 !replCoord->isReplEnabled());
-        replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
+        replCoord->startup(startupOpCtx.get(), lastShutdownState);
     }
 
     startMongoDFTDC();
@@ -688,7 +692,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(serviceContext)->startup();
         }
 
-        replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
+        replCoord->startup(startupOpCtx.get(), lastShutdownState);
         if (getReplSetMemberInStandaloneMode(serviceContext)) {
             LOGV2_WARNING_OPTIONS(
                 20547,
@@ -705,6 +709,12 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
         if (replSettings.usingReplSets() || !gInternalValidateFeaturesAsPrimary) {
             serverGlobalParams.validateFeaturesAsPrimary.store(false);
+        }
+
+        if (replSettings.usingReplSets()) {
+            Lock::GlobalWrite lk(startupOpCtx.get());
+            OldClientContext ctx(startupOpCtx.get(), NamespaceString::kRsOplogNamespace.ns());
+            tenant_migration_util::createOplogViewForTenantMigrations(startupOpCtx.get(), ctx.db());
         }
     }
 
@@ -829,6 +839,63 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
     mongo::forkServerOrDie();
 }
 
+#ifdef __linux__
+/**
+ * Read the pid file from the dbpath for the process ID used by this instance of the server.
+ * Use that process number to kill the running server.
+ *
+ * Equivalent to: `kill -SIGTERM $(cat $DBPATH/mongod.lock)`
+ *
+ * Performs additional checks to make sure the PID as read is reasonable (>= 1)
+ * and can be found in the /proc filesystem.
+ */
+Status shutdownProcessByDBPathPidFile(const std::string& dbpath) {
+    auto pidfile = (boost::filesystem::path(dbpath) / kLockFileBasename.toString()).string();
+    if (!boost::filesystem::exists(pidfile)) {
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "There doesn't seem to be a server running with dbpath: "
+                              << dbpath};
+    }
+
+    pid_t pid;
+    try {
+        std::ifstream f(pidfile.c_str());
+        f >> pid;
+    } catch (const std::exception& ex) {
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "Error reading pid from lock file [" << pidfile
+                              << "]: " << ex.what()};
+    }
+
+    if (pid <= 0) {
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "Invalid process ID '" << pid
+                              << "' read from pidfile: " << pidfile};
+    }
+
+    std::string procPath = str::stream() << "/proc/" << pid;
+    if (!boost::filesystem::exists(procPath)) {
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "Process ID '" << pid << "' read from pidfile '" << pidfile
+                              << "' does not appear to be running"};
+    }
+
+    std::cout << "Killing process with pid: " << pid << std::endl;
+    int ret = kill(pid, SIGTERM);
+    if (ret) {
+        int e = errno;
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "Failed to kill process: " << errnoWithDescription(e)};
+    }
+
+    while (boost::filesystem::exists(pidfile)) {
+        sleepsecs(1);
+    }
+
+    return Status::OK();
+}
+#endif  // __linux__
+
 /*
  * This function should contain the startup "actions" that we take based on the startup config.
  * It is intended to separate the actions from "storage" and "validation" of our startup
@@ -870,46 +937,10 @@ void startupConfigActions(const std::vector<std::string>& args) {
 #ifdef __linux__
     if (moe::startupOptionsParsed.count("shutdown") &&
         moe::startupOptionsParsed["shutdown"].as<bool>() == true) {
-        bool failed = false;
-
-        std::string name =
-            (boost::filesystem::path(storageGlobalParams.dbpath) / kLockFileBasename.toString())
-                .string();
-        if (!boost::filesystem::exists(name) || boost::filesystem::file_size(name) == 0)
-            failed = true;
-
-        pid_t pid;
-        std::string procPath;
-        if (!failed) {
-            try {
-                std::ifstream f(name.c_str());
-                f >> pid;
-                procPath = (str::stream() << "/proc/" << pid);
-                if (!boost::filesystem::exists(procPath))
-                    failed = true;
-            } catch (const std::exception& e) {
-                std::cerr << "Error reading pid from lock file [" << name << "]: " << e.what()
-                          << endl;
-                failed = true;
-            }
-        }
-
-        if (failed) {
-            std::cerr << "There doesn't seem to be a server running with dbpath: "
-                      << storageGlobalParams.dbpath << std::endl;
+        auto status = shutdownProcessByDBPathPidFile(storageGlobalParams.dbpath);
+        if (!status.isOK()) {
+            std::cerr << status.reason() << std::endl;
             quickExit(EXIT_FAILURE);
-        }
-
-        std::cout << "killing process with pid: " << pid << endl;
-        int ret = kill(pid, SIGTERM);
-        if (ret) {
-            int e = errno;
-            std::cerr << "failed to kill process: " << errnoWithDescription(e) << endl;
-            quickExit(EXIT_FAILURE);
-        }
-
-        while (boost::filesystem::exists(procPath)) {
-            sleepsecs(1);
         }
 
         quickExit(EXIT_SUCCESS);
@@ -1196,11 +1227,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             4784909, {LogComponent::kReplication}, "Shutting down the ReplicationCoordinator");
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
-        LOGV2_OPTIONS(5093807,
-                      {LogComponent::kTenantMigration},
-                      "Shutting down all TenantMigrationAccessBlockers on global shutdown");
-        TenantMigrationAccessBlockerRegistry::get(serviceContext).shutDown();
-
         // Terminate the index consistency check.
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             LOGV2_OPTIONS(4784904,
@@ -1229,6 +1255,14 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         LOGV2_OPTIONS(4784912, {LogComponent::kDefault}, "Killing all operations for shutdown");
         const std::set<std::string> excludedClients = {std::string(kFTDCThreadName)};
         serviceContext->setKillAllOperations(excludedClients);
+
+        // Clear tenant migration access blockers after killing all operation contexts to ensure
+        // that no operation context cancellation token continuation holds the last reference to the
+        // TenantMigrationAccessBlockerExecutor.
+        LOGV2_OPTIONS(5093807,
+                      {LogComponent::kTenantMigration},
+                      "Shutting down all TenantMigrationAccessBlockers on global shutdown");
+        TenantMigrationAccessBlockerRegistry::get(serviceContext).shutDown();
 
         if (MONGO_unlikely(pauseWhileKillingOperationsAtShutdown.shouldFail())) {
             LOGV2_OPTIONS(4701700,
@@ -1292,7 +1326,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // The migrationutil executor must be shut down before shutting down the CatalogCacheLoader.
     // Otherwise, it may try to schedule work on the CatalogCacheLoader and fail.
     LOGV2_OPTIONS(4784921, {LogComponent::kSharding}, "Shutting down the MigrationUtilExecutor");
-    auto migrationUtilExecutor = migrationutil::getMigrationUtilExecutor();
+    auto migrationUtilExecutor = migrationutil::getMigrationUtilExecutor(serviceContext);
     migrationUtilExecutor->shutdown();
     migrationUtilExecutor->join();
 
@@ -1430,9 +1464,6 @@ int mongod_main(int argc, char* argv[]) {
     cmdline_utils::censorArgvArray(argc, argv);
 
     if (!initializeServerGlobalState(service))
-        quickExit(EXIT_FAILURE);
-
-    if (!initializeServerSecurityGlobalState(service))
         quickExit(EXIT_FAILURE);
 
     // There is no single-threaded guarantee beyond this point.

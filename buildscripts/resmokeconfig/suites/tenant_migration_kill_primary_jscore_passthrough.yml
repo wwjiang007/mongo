@@ -1,3 +1,12 @@
+config_variables:
+- &keyFile jstests/libs/authTestsKey
+- &keyFileData Thiskeyisonlyforrunningthesuitewithauthenticationdontuseitinanytestsdirectly
+- &authOptions
+  authenticationDatabase: admin
+  authenticationMechanism: SCRAM-SHA-1
+  password: *keyFileData
+  username: __system
+
 test_kind: js_test
 # This suite starts two 3-node replica sets and uses the ContinuousTenantMigration hook and the
 # ContinuousStepdown hook to run background tenant migrations and periodically kill the primary
@@ -8,6 +17,10 @@ selector:
   - jstests/core/**/*.js
   exclude_files:
   - jstests/core/txns/**/*.js
+  # Skip any tests that run with auth explicitly.
+  - jstests/core/*[aA]uth*.js
+  # Commands using UUIDs are not compatible with name-based auth.
+  - jstests/core/commands_with_uuid.js
   # These tests depend on hardcoded database name equality.
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/list_databases.js
@@ -50,9 +63,6 @@ selector:
   - jstests/core/user_management_helpers.js
   # These tests use legacy read mode which does not use runCommand.
   - jstests/core/comment_field.js
-  - jstests/core/invalidated_legacy_cursors.js
-  # TODO (SERVER-52866): Synchronize getLastError with tenant migrations.
-  - jstests/core/bulk_legacy_enforce_gle.js
   # This test contains assertions for the hostname that operations run on.
   - jstests/core/currentop_cursors.js
   # Server parameters are stored in-memory only so are not transferred onto the recipient. These
@@ -60,6 +70,32 @@ selector:
   # require a collection scan and return an error.
   - jstests/core/notablescan.js
   - jstests/core/notablescan_capped.js
+  # These tests run applyOps which is not supported in serverless.
+  - jstests/core/apply_ops1.js
+  - jstests/core/apply_ops1.js
+  - jstests/core/apply_ops2.js
+  - jstests/core/apply_ops_dups.js
+  - jstests/core/apply_ops_index_collation.js
+  - jstests/core/apply_ops_invalid_index_spec.js
+  - jstests/core/apply_ops_missing_field.js
+  - jstests/core/apply_ops_system_dot_views.js
+  - jstests/core/apply_ops_without_ns.js
+  - jstests/core/bypass_doc_validation.js
+  - jstests/core/collation.js
+  - jstests/core/collmod_without_uuid.js
+  - jstests/core/txns/commands_banning_txnnumber_outside_transactions.js
+  - jstests/core/txns/commands_not_allowed_in_txn.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+  - jstests/core/txns/statement_ids_accepted.js
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/list_collections_no_views.js
+  - jstests/core/views/duplicate_ns.js
+  - jstests/core/views/view_with_invalid_dbname.js
+  - jstests/core/views/views_creation.js
+  - jstests/core/views/invalid_system_views.js
+  - jstests/core/views/views_all_commands.js
+  - jstests/core/rename_collection_staytemp.js
 
   #
   # From retryable writes jscore stepdown passthrough
@@ -72,8 +108,6 @@ selector:
   - jstests/core/profile_findandmodify.js
   - jstests/core/top.js
   - jstests/core/views/views_stats.js
-
-  - jstests/core/bulk_legacy_enforce_gle.js
 
   # TODO SERVER-31242: findAndModify no-op retry should respect the fields option.
   - jstests/core/crud_api.js
@@ -113,7 +147,7 @@ selector:
   - jstests/core/validate_cmd_ns.js # Calls _exec() directly, not retryable.
 
   #
-  # Blacklists specific to this suite
+  # Denylists specific to this suite
   #
 
   - jstests/core/api_version_parameters.js
@@ -134,6 +168,7 @@ selector:
   - jstests/core/field_name_validation.js
   - jstests/core/index_partial_read_ops.js
   - jstests/core/index_stats.js
+  - jstests/core/insert1.js
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/noop_writes.js
   - jstests/core/operation_latency_histogram.js
@@ -153,6 +188,12 @@ selector:
   - requires_getmore
   # fastcount can product inaccurate counts after unclean shutdowns.
   - requires_fastcount
+  # "Cowardly fail if dbStats is run with a mongod that had an unclean shutdown: ..."
+  - requires_dbstats
+  # "Cowardly fail if collStats is run with a mongod that had an unclean shutdown: ..."
+  - requires_collstats
+  # "Cowardly fail if unbounded dataSize is run with a mongod that had an unclean shutdown: ..."
+  - requires_datasize
   # Due to background tenant migrations, operations in the main test shell are not guaranteed to
   # be causally consistent with operations in a parallel shell. The reason is that
   # TenantMigrationCommitted error is only thrown when the client does a write or a atClusterTime/
@@ -189,11 +230,17 @@ executor:
         load('jstests/libs/override_methods/inject_tenant_prefix.js');
         load("jstests/libs/override_methods/enable_sessions.js");
         load("jstests/libs/override_methods/set_read_and_write_concerns.js");
-        # TODO SERVER-52713: Add libraries to automatically fail commands incompatible with
-        # unclean shutdowns.
+        load("jstests/libs/override_methods/fail_unclean_shutdown_incompatible_commands.js");
+        load("jstests/libs/override_methods/fail_unclean_shutdown_start_parallel_shell.js");
+        jsTest.authenticate(db.getMongo());
       global_vars:
         TestData: &TestData
           tenantId: "tenantMigrationTenantId"
+          auth: true
+          authMechanism: SCRAM-SHA-1
+          keyFile: *keyFile
+          keyFileData: *keyFileData
+          roleGraphInvalidationIsFatal: true
           alwaysInjectTransactionNumber: true
           defaultReadConcernLevel: "majority"
           logRetryAttempts: true
@@ -207,22 +254,31 @@ executor:
             readPreference:
               mode: "primary"
             retryWrites: true
+          skipTenantMigrationDBHash: false
       # We specify nodb so the shell used by each test will attempt to connect after loading the
       # retry logic in auto_retry_on_network_error.js.
       nodb: ""
-      readMode: commands
   hooks:
   - class: ContinuousStepdown
     kill: true
+    auth_options: *authOptions
   - class: ContinuousTenantMigration
     shell_options:
       global_vars:
-        TestData: *TestData
+        TestData:
+          <<: *TestData
+          authOptions: *authOptions
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
   - class: CheckReplOplogs
+    shell_options:
+      global_vars:
+        TestData: *TestData
   - class: CheckReplDBHash
+    shell_options:
+      global_vars:
+        TestData: *TestData
   - class: ValidateCollections
   - class: CleanEveryN
     n: 1
@@ -234,9 +290,7 @@ executor:
         enableElectionHandoff: 0
         failpoint.abortTenantMigrationBeforeLeavingBlockingState:
             mode:
-              # TODO (SERVER-52713): Allow tenant migration stepdown/kill/terminate suites to commit
-              # migrations and interrupt all replica sets.
-              activationProbability: 1
+              activationProbability: .5
         failpoint.pauseTenantMigrationBeforeLeavingBlockingState:
             mode: alwaysOn
             data:
@@ -246,9 +300,14 @@ executor:
         # so. Therefore, the garbage collection delay doesn't need to be large.
         tenantMigrationGarbageCollectionDelayMS: 1
         ttlMonitorSleepSecs: 1
+        # Tenant migrations is not currently compatible with implicitly replicated retryable
+        # findAndModify images.
+        storeFindAndModifyImagesInSideCollection: false
       tlsMode: allowTLS
       tlsCAFile: jstests/libs/ca.pem
       tlsAllowInvalidHostnames: ''
+      auth: ''
+      keyFile: *keyFile
     per_mongod_options:
       # Each entry is for a different replica set's extra mongod options.
       - tlsCertificateKeyFile: jstests/libs/rs0.pem
@@ -260,3 +319,4 @@ executor:
     replset_config_options:
       settings:
         catchUpTimeoutMillis: 0
+    auth_options: *authOptions

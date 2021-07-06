@@ -31,7 +31,11 @@
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/memory_usage_tracker.h"
+#include "mongo/db/pipeline/partition_key_comparator.h"
+#include "mongo/db/pipeline/window_function/spillable_cache.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/sort_pattern.h"
 
 namespace mongo {
@@ -45,11 +49,13 @@ namespace mongo {
  * current partition exists.
  *
  * The 'sortPattern' is used for resolving range-based and time-based bounds, in 'getEndpoints()'.
+ *
  */
 class PartitionIterator {
 public:
     PartitionIterator(ExpressionContext* expCtx,
                       DocumentSource* source,
+                      MemoryUsageTracker* tracker,
                       boost::optional<boost::intrusive_ptr<Expression>> partitionExpr,
                       const boost::optional<SortPattern>& sortPattern);
 
@@ -89,7 +95,7 @@ public:
      * operator[] overload.
      */
     auto getCurrentPartitionIndex() const {
-        return _currentPartitionIndex;
+        return _indexOfCurrentInPartition;
     }
 
     /**
@@ -105,7 +111,27 @@ public:
      * structures.
      */
     auto getApproximateSize() const {
-        return _memUsageBytes;
+        return _cache->getApproximateSize() + getNextPartitionStateSize();
+    }
+
+    /**
+     * Spill whatever's in the cache to disk. Caller is responsible for checking whether this is
+     * allowed.
+     */
+    void spillToDisk() {
+        _cache->spillToDisk();
+    }
+
+    bool usedDisk() const {
+        return _cache->usedDisk();
+    }
+
+    /**
+     * Clean up all memory associated with the partition iterator. All calls requesting documents
+     * are invalid after calling this.
+     */
+    void finalize() {
+        _cache->finalize();
     }
 
 private:
@@ -147,7 +173,7 @@ private:
      * This value is negative or zero, because the current document is always in '_cache'.
      */
     auto getMinCachedOffset() const {
-        return -_currentCacheIndex;
+        return -_indexOfCurrentInPartition + _cache->getLowestIndex();
     }
 
     /**
@@ -160,15 +186,21 @@ private:
      * This value is positive or zero, because the current document is always in '_cache'.
      */
     auto getMaxCachedOffset() const {
-        return getMinCachedOffset() + _cache.size() - 1;
+        return _cache->getHighestIndex() - _indexOfCurrentInPartition;
     }
 
+    /**
+     * Performs the actual work of the 'advance()' call. This is wrapped by 'advance()' so that
+     * regardless of how it returns 'advance()' will also free documents that can be expired as a
+     * result.
+     */
+    AdvanceResult advanceInternal();
     /**
      * Loads documents into '_cache' until we reach a partition boundary.
      */
     void cacheWholePartition() {
-        // Start from one past the end of the _cache.
-        int i = getMinCachedOffset() + _cache.size();
+        // Start from one past the end of _cache.
+        int i = getMaxCachedOffset() + 1;
         // If we have already loaded everything into '_cache' then this condition will be false
         // immediately.
         while ((*this)[i]) {
@@ -183,7 +215,7 @@ private:
     void expireUpTo(SlotId id, int index) {
         // 'index' is relevant to the current document, adjust it to figure out what index it refers
         // to in the cache.
-        _slots[id] = std::max(_slots[id], _currentCacheIndex + index);
+        _slots[id] = std::max(_slots[id], _indexOfCurrentInPartition + index);
     }
 
     /**
@@ -197,12 +229,9 @@ private:
     void getNextDocument();
 
     void resetCache() {
-        _cache.clear();
-        // Everything should be empty at this point.
-        _memUsageBytes = 0;
-        _currentCacheIndex = 0;
-        _currentPartitionIndex = 0;
-        for (size_t slot = 0; slot < _slots.size(); slot++) {
+        _cache->clear();
+        _indexOfCurrentInPartition = 0;
+        for (int slot = 0; slot < (int)_slots.size(); slot++) {
             _slots[slot] = -1;
         }
     }
@@ -213,13 +242,15 @@ private:
     void advanceToNextPartition() {
         tassert(5340101,
                 "Invalid call to PartitionIterator::advanceToNextPartition",
-                _nextPartition != boost::none);
+                _nextPartitionDoc != boost::none);
         resetCache();
-        // Cache is cleared, and we are moving the _nextPartition value to different positions.
-        _memUsageBytes = getNextPartitionStateSize();
-        _cache.emplace_back(std::move(_nextPartition->_doc));
-        _partitionKey = std::move(_nextPartition->_partitionKey);
-        _nextPartition.reset();
+        // The memory accounted for in the _nextPartitionDoc will be moved to the spillable cache,
+        // so subtract it out here.
+        _tracker->update(-1 * getNextPartitionStateSize());
+
+        // Cache is cleared, and we are moving the _nextPartitionDoc value to different positions.
+        _cache->addDocument(std::move(*_nextPartitionDoc));
+        _nextPartitionDoc.reset();
         _state = IteratorState::kIntraPartition;
     }
 
@@ -239,31 +270,19 @@ private:
     // the value of the "$ts" field. This _sortExpr is used in getEndpoints().
     boost::optional<boost::intrusive_ptr<ExpressionFieldPath>> _sortExpr;
 
-    std::deque<Document> _cache;
-    // '_cache[_currentCacheIndex]' is the current document, which '(*this)[0]' returns.
-    int _currentCacheIndex = 0;
-    int _currentPartitionIndex = 0;
-    Value _partitionKey;
+    std::unique_ptr<PartitionKeyComparator> _partitionComparator = nullptr;
     std::vector<int> _slots;
 
     // When encountering the first document of the next partition, we stash it away until the
     // iterator has advanced to it. This document is not accessible until then.
-    struct NextPartitionState {
-        Document _doc;
-        Value _partitionKey;
-    };
-    boost::optional<NextPartitionState> _nextPartition;
-    size_t getNextPartitionStateSize() {
-        if (_nextPartition) {
-            return _nextPartition->_doc.getApproximateSize() +
-                _nextPartition->_partitionKey.getApproximateSize();
+    boost::optional<Document> _nextPartitionDoc;
+    size_t getNextPartitionStateSize() const {
+        if (_nextPartitionDoc) {
+            return _nextPartitionDoc->getApproximateSize() +
+                _partitionComparator->getApproximateSize();
         }
         return 0;
     }
-
-    // The value in bytes of the data being held. Does not include the size of the constant size
-    // data members or overhead of data structures.
-    size_t _memUsageBytes = 0;
 
     enum class IteratorState {
         // Default state, no documents have been pulled into the cache.
@@ -280,6 +299,15 @@ private:
         // The iterator has exhausted the input documents. Any access should be disallowed.
         kAdvancedToEOF,
     } _state;
+
+    // '_indexOfCurrentInPartition' is the current document, which '(*this)[0]' returns.
+    int _indexOfCurrentInPartition = 0;
+
+    // The actual cache of the PartitionIterator. Holds documents and spills documents that exceed
+    // the memory limit given to PartitionIterator to disk. Behaves like a deque.
+    std::unique_ptr<SpillableCache> _cache = nullptr;
+
+    MemoryUsageTracker* _tracker;
 };
 
 /**

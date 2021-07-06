@@ -1,4 +1,4 @@
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd)"
 . "$DIR/prelude.sh"
 
 cd src
@@ -8,7 +8,8 @@ set -o verbose
 activate_venv
 
 # Multiversion exclusions can be used when selecting tests.
-$python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-tags --task-path-suffix=/data/multiversion --output=multiversion_exclude_tags.yml
+PATH="$PATH:/data/multiversion"
+$python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-tags --output=multiversion_exclude_tags.yml
 
 # Capture a list of new and modified tests. The expansion macro burn_in_tests_build_variant
 # is used to for finding the associated tasks from a different build varaint than the

@@ -97,7 +97,8 @@ const blockingFp =
     configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState");
 dataSyncFp.off();
 assert.soon(
-    () => tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).state ===
+    () =>
+        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).donor.state ===
         TenantMigrationTest.DonorAccessState.kBlockWritesAndReads);
 
 // Clear the log so we can wait for the new index builds to start.
@@ -117,7 +118,7 @@ assert.soon(() => checkLog.checkContainsWithCountJson(donorPrimary, 4886202, und
 const abortFp = configureFailPoint(donorPrimary, "abortTenantMigrationBeforeLeavingBlockingState");
 blockingFp.off();
 
-assert.commandWorked(migrationThread.returnData());
+TenantMigrationTest.assertAborted(migrationThread.returnData());
 abortFp.off();
 
 // The index creation threads should be done.

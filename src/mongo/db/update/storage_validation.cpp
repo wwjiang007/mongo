@@ -32,6 +32,9 @@
 #include "mongo/bson/bson_depth.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/query/dbref.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/update/modifier_table.h"
 
 namespace mongo {
 
@@ -43,14 +46,22 @@ const StringData idFieldName = "_id"_sd;
 
 void storageValidChildren(mutablebson::ConstElement elem,
                           const bool deep,
-                          std::uint32_t recursionLevel) {
+                          std::uint32_t recursionLevel,
+                          const bool allowTopLevelDollarPrefixes,
+                          const bool shouldValidate,
+                          bool* containsDotsAndDollarsField) {
     if (!elem.hasChildren()) {
         return;
     }
 
     auto curr = elem.leftChild();
     while (curr.ok()) {
-        storageValid(curr, deep, recursionLevel + 1);
+        storageValid(curr,
+                     deep,
+                     recursionLevel + 1,
+                     allowTopLevelDollarPrefixes,
+                     shouldValidate,
+                     containsDotsAndDollarsField);
         curr = curr.rightSibling();
     }
 }
@@ -65,7 +76,7 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
     auto currName = elem.getFieldName();
 
     // Found a $db field.
-    if (currName == "$db") {
+    if (currName == dbref::kDbFieldName) {
         uassert(ErrorCodes::InvalidDBRef,
                 str::stream() << "The DBRef $db field must be a String, not a "
                               << typeName(curr.getType()),
@@ -80,7 +91,7 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
     }
 
     // Found a $id field.
-    if (currName == "$id") {
+    if (currName == dbref::kIdFieldName) {
         curr = curr.leftSibling();
         uassert(ErrorCodes::InvalidDBRef,
                 "Found $id field without a $ref before it, which is invalid.",
@@ -90,7 +101,7 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
     }
 
     // Found a $ref field.
-    if (currName == "$ref") {
+    if (currName == dbref::kRefFieldName) {
         uassert(ErrorCodes::InvalidDBRef,
                 str::stream() << "The DBRef $ref field must be a String, not a "
                               << typeName(curr.getType()),
@@ -100,59 +111,111 @@ void validateDollarPrefixElement(mutablebson::ConstElement elem) {
                 "The DBRef $ref field must be followed by a $id field",
                 curr.rightSibling().ok() && curr.rightSibling().getFieldName() == "$id");
     } else {
-
         // Not an okay, $ prefixed field name.
+        const auto replaceWithHint =
+            serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                    FeatureCompatibilityParams::Version::kVersion50)
+            ? "' is not allowed in the context of an update's replacement document. Consider using "
+              "an aggregation pipeline with $replaceWith."
+            : "' is not valid for storage.";
+
         uasserted(ErrorCodes::DollarPrefixedFieldName,
                   str::stream() << "The dollar ($) prefixed field '" << elem.getFieldName()
-                                << "' in '" << mutablebson::getFullName(elem)
-                                << "' is not valid for storage.");
+                                << "' in '" << mutablebson::getFullName(elem) << replaceWithHint);
     }
 }
 }  // namespace
 
-void storageValid(const mutablebson::Document& doc) {
+Status storageValidIdField(const mongo::BSONElement& element) {
+    switch (element.type()) {
+        case BSONType::RegEx:
+        case BSONType::Array:
+        case BSONType::Undefined:
+            return Status(ErrorCodes::InvalidIdField,
+                          str::stream()
+                              << "The '_id' value cannot be of type " << typeName(element.type()));
+        case BSONType::Object: {
+            auto status = element.Obj().storageValidEmbedded();
+            if (!status.isOK() && status.code() == ErrorCodes::DollarPrefixedFieldName &&
+                serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                    FeatureCompatibilityParams::Version::kVersion50)) {
+                return Status(status.code(),
+                              str::stream() << "_id fields may not contain '$'-prefixed fields: "
+                                            << status.reason());
+            }
+            return status;
+        }
+        default:
+            break;
+    }
+    return Status::OK();
+}
+
+void storageValid(const mutablebson::Document& doc,
+                  const bool allowTopLevelDollarPrefixes,
+                  const bool shouldValidate,
+                  bool* containsDotsAndDollarsField) {
     auto currElem = doc.root().leftChild();
     while (currElem.ok()) {
-        if (currElem.getFieldName() == idFieldName) {
-            switch (currElem.getType()) {
-                case BSONType::RegEx:
-                case BSONType::Array:
-                case BSONType::Undefined:
-                    uasserted(ErrorCodes::InvalidIdField,
-                              str::stream() << "The '_id' value cannot be of type "
-                                            << typeName(currElem.getType()));
-                default:
-                    break;
-            }
+        if (currElem.getFieldName() == idFieldName && shouldValidate) {
+            uassertStatusOK(storageValidIdField(currElem.getValue()));
         }
 
         // Validate this child element.
         const auto deep = true;
         const uint32_t recursionLevel = 1;
-        storageValid(currElem, deep, recursionLevel);
+        storageValid(currElem,
+                     deep,
+                     recursionLevel,
+                     allowTopLevelDollarPrefixes,
+                     shouldValidate,
+                     containsDotsAndDollarsField);
 
         currElem = currElem.rightSibling();
     }
 }
 
-void storageValid(mutablebson::ConstElement elem, const bool deep, std::uint32_t recursionLevel) {
-    uassert(ErrorCodes::BadValue, "Invalid elements cannot be stored.", elem.ok());
+void storageValid(mutablebson::ConstElement elem,
+                  const bool deep,
+                  std::uint32_t recursionLevel,
+                  const bool allowTopLevelDollarPrefixes,
+                  const bool shouldValidate,
+                  bool* containsDotsAndDollarsField) {
+    if (shouldValidate) {
+        uassert(ErrorCodes::BadValue, "Invalid elements cannot be stored.", elem.ok());
 
-    uassert(ErrorCodes::Overflow,
-            str::stream() << "Document exceeds maximum nesting depth of "
-                          << BSONDepth::getMaxDepthForUserStorage(),
-            recursionLevel <= BSONDepth::getMaxDepthForUserStorage());
+        uassert(ErrorCodes::Overflow,
+                str::stream() << "Document exceeds maximum nesting depth of "
+                              << BSONDepth::getMaxDepthForUserStorage(),
+                recursionLevel <= BSONDepth::getMaxDepthForUserStorage());
+    }
 
     // Field names of elements inside arrays are not meaningful in mutable bson,
     // so we do not want to validate them.
     const mutablebson::ConstElement& parent = elem.parent();
     const bool childOfArray = parent.ok() ? (parent.getType() == BSONType::Array) : false;
 
-    if (!childOfArray) {
-        auto fieldName = elem.getFieldName();
+    // Only check top-level fields if 'allowTopLevelDollarPrefixes' is false, and don't validate any
+    // fields for '$'-prefixes if 'allowTopLevelDollarPrefixes' is true.
+    const bool checkTopLevelFields = !allowTopLevelDollarPrefixes && (recursionLevel == 1);
+    const bool dotsAndDollarsFeatureEnabled =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            FeatureCompatibilityParams::Version::kVersion50);
+    const bool checkFields = !dotsAndDollarsFeatureEnabled || checkTopLevelFields;
 
-        // Cannot start with "$", unless dbref.
-        if (fieldName[0] == '$') {
+    auto fieldName = elem.getFieldName();
+    if (fieldName[0] == '$') {
+        if (dotsAndDollarsFeatureEnabled && containsDotsAndDollarsField) {
+            *containsDotsAndDollarsField = true;
+            // If we are not validating for storage, return once a $-prefixed field is found.
+            if (!shouldValidate)
+                return;
+        }
+        if (!childOfArray && checkFields && shouldValidate) {
+            // Cannot start with "$", unless dbref.
             validateDollarPrefixElement(elem);
         }
     }
@@ -160,7 +223,12 @@ void storageValid(mutablebson::ConstElement elem, const bool deep, std::uint32_t
     if (deep) {
 
         // Check children if there are any.
-        storageValidChildren(elem, deep, recursionLevel);
+        storageValidChildren(elem,
+                             deep,
+                             recursionLevel,
+                             allowTopLevelDollarPrefixes,
+                             shouldValidate,
+                             containsDotsAndDollarsField);
     }
 }
 

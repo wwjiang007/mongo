@@ -74,9 +74,6 @@ std::unique_ptr<FindCommandRequest> parseCmdObjectToFindCommandRequest(Operation
         std::move(cmdObj),
         std::move(nss),
         APIParameters::get(opCtx).getAPIStrict().value_or(false));
-    if (!findCommand->getLegacyRuntimeConstants()) {
-        findCommand->setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
-    }
     return findCommand;
 }
 
@@ -198,7 +195,8 @@ public:
             return false;
         }
 
-        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const final {
             return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
         }
 

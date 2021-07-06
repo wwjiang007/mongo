@@ -47,12 +47,16 @@ class OpMsgFuzzerFixture {
 public:
     OpMsgFuzzerFixture(bool skipGlobalInitializers = false);
 
+    ~OpMsgFuzzerFixture();
+
     /**
      * Run a single operation as if it came from the network.
      */
     int testOneInput(const char* Data, size_t Size);
 
 private:
+    void _setAuthorizationManager();
+
     const LogicalTime kInMemoryLogicalTime = LogicalTime(Timestamp(3, 1));
 
     // This member is responsible for both creating and deleting the base directory. Think of it as

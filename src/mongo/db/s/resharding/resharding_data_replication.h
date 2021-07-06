@@ -96,7 +96,7 @@ public:
         std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
         CancellationToken cancelToken,
         CancelableOperationContextFactory opCtxFactory,
-        Milliseconds minimumOperationDuration) = 0;
+        const mongo::Date_t& startConfigTxnCloneTime) = 0;
 
     /**
      * Releases the barrier to allow the fetched oplog entries to be applied.
@@ -117,14 +117,6 @@ public:
      *   (b) the recipient has encountered an operation-fatal error.
      */
     virtual SharedSemiFuture<void> awaitCloningDone() = 0;
-
-    /**
-     * Returns a future that becomes ready when either
-     *   (a) the recipient with respect to each donor shard has applied through the timestamp it has
-     *       finished cloning at (the cloneTimestamp), or
-     *   (b) the recipient has encountered an operation-fatal error.
-     */
-    virtual SharedSemiFuture<void> awaitConsistentButStale() = 0;
 
     /**
      * Returns a future that becomes ready when either
@@ -167,13 +159,11 @@ public:
         std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
         CancellationToken cancelToken,
         CancelableOperationContextFactory opCtxFactory,
-        Milliseconds minimumOperationDuration) override;
+        const mongo::Date_t& startConfigTxnCloneTime) override;
 
     void startOplogApplication() override;
 
     SharedSemiFuture<void> awaitCloningDone() override;
-
-    SharedSemiFuture<void> awaitConsistentButStale() override;
 
     SharedSemiFuture<void> awaitStrictlyConsistent() override;
 
@@ -218,7 +208,7 @@ private:
     static std::vector<std::unique_ptr<ReshardingOplogApplier>> _makeOplogAppliers(
         OperationContext* opCtx,
         ReshardingMetrics* metrics,
-        CommonReshardingMetadata metadata,
+        const CommonReshardingMetadata& metadata,
         const std::vector<DonorShardFetchTimestamp>& donorShards,
         Timestamp cloneTimestamp,
         ChunkManager sourceChunkMgr,
@@ -236,20 +226,16 @@ private:
         std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
         CancellationToken cancelToken,
         CancelableOperationContextFactory opCtxFactory,
-        Milliseconds minimumOperationDuration);
+        const mongo::Date_t& startConfigTxnCloneTime);
 
     std::vector<SharedSemiFuture<void>> _runOplogFetchers(
         std::shared_ptr<executor::TaskExecutor> executor,
         CancellationToken cancelToken,
         CancelableOperationContextFactory opCtxFactory);
 
-    std::vector<SharedSemiFuture<void>> _runOplogAppliersUntilConsistentButStale(
+    std::vector<SharedSemiFuture<void>> _runOplogAppliers(
         std::shared_ptr<executor::TaskExecutor> executor,
-        CancellationToken cancelToken,
-        CancelableOperationContextFactory opCtxFactory);
-
-    std::vector<SharedSemiFuture<void>> _runOplogAppliersUntilStrictlyConsistent(
-        std::shared_ptr<executor::TaskExecutor> executor,
+        std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
         CancellationToken cancelToken,
         CancelableOperationContextFactory opCtxFactory);
 
@@ -270,7 +256,6 @@ private:
     SharedPromise<void> _startOplogApplication;
 
     SharedPromise<void> _cloningDone;
-    SharedPromise<void> _consistentButStale;
     SharedPromise<void> _strictlyConsistent;
 };
 

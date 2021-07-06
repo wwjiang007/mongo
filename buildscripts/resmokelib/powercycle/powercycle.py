@@ -724,13 +724,13 @@ class LocalToRemoteOperations(object):
 
     def __init__(  # pylint: disable=too-many-arguments
             self, user_host, ssh_connection_options=None, ssh_options=None,
-            shell_binary="/bin/bash", use_shell=False):
+            shell_binary="/bin/bash", use_shell=False, access_retry_count=5):
         """Initialize LocalToRemoteOperations."""
 
         self.remote_op = remote_operations.RemoteOperations(
             user_host=user_host, ssh_connection_options=ssh_connection_options,
             ssh_options=ssh_options, shell_binary=shell_binary, use_shell=use_shell,
-            ignore_ret=True)
+            ignore_ret=True, access_retry_count=access_retry_count)
 
     def shell(self, cmds, remote_dir=None):
         """Return tuple (ret, output) from performing remote shell operation."""
@@ -1332,7 +1332,7 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
 
     LOGGER.info("powercycle invocation: %s", " ".join(sys.argv))
 
-    task_name = options.task_name
+    task_name = re.sub(r"(_[0-9]+)(_[\w-]+)?$", "", options.task_name)
     task_config = powercycle_config.get_task_config(task_name, options.remote_operation)
 
     LOGGER.info("powercycle task config: %s", task_config)
@@ -1369,11 +1369,11 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
     num_fsm_clients = powercycle_constants.NUM_FSM_CLIENTS
 
     # Windows task overrides:
-    #   - Execute no more than 10 test loops
+    #   - Execute no more than 3 test loops
     #   - Cap the maximum number of clients to 10 each
     if _IS_WINDOWS:
-        if test_loops > 10:
-            test_loops = 10
+        if test_loops > 3:
+            test_loops = 3
         num_crud_clients = 10
         num_fsm_clients = 10
 
@@ -1415,7 +1415,7 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
     else:
         eval_str = ""
     fsm_test_data = copy.deepcopy(crud_test_data)
-    fsm_test_data["fsmDbBlacklist"] = [powercycle_constants.DB_NAME]
+    fsm_test_data["fsmDbDenylist"] = [powercycle_constants.DB_NAME]
     crud_test_data["dbName"] = powercycle_constants.DB_NAME
 
     # Setup the mongo_repo_root.
@@ -1450,9 +1450,9 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
     ssh_options = "" if _IS_WINDOWS else "-tt"
 
     # Instantiate the local handler object.
-    local_ops = LocalToRemoteOperations(user_host=ssh_user_host,
-                                        ssh_connection_options=ssh_connection_options,
-                                        ssh_options=ssh_options, use_shell=True)
+    local_ops = LocalToRemoteOperations(
+        user_host=ssh_user_host, ssh_connection_options=ssh_connection_options,
+        ssh_options=ssh_options, use_shell=True, access_retry_count=options.ssh_access_retry_count)
     verify_remote_access(local_ops)
 
     # Pass client_args to the remote script invocation.
@@ -1542,6 +1542,7 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
 
         ssh_tunnel_proc = setup_ssh_tunnel(mongod_host, secret_port, standard_port,
                                            ssh_connection_options, ssh_options, ssh_user_host)
+        verify_remote_access(local_ops)
 
         # Optionally validate canary document locally.
         if validate_canary_local:
@@ -1564,6 +1565,14 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
                                      "jstests/hooks/run_validate_collections.js", new_config_file)
         LOGGER.info("Local collection validation: %d %s", ret, output)
         if ret:
+            network_error = (
+                f"[js_test:run_validate_collections] Error: network error while attempting "
+                f"to run command 'isMaster' on host '{host_port}'")
+            # Mark this error as ssh failure, since it happens during the first test loop before
+            # the first server crash and likely related to port forwarding not working, which
+            # uses ssh tunnel command.
+            if loop_num == 1 and network_error in output:
+                ssh_failure_exit(ret, network_error)
             local_exit(ret)
 
         # Shutdown mongod on secret port.
@@ -1662,7 +1671,8 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
         # Reestablish remote access after crash.
         local_ops = LocalToRemoteOperations(user_host=ssh_user_host,
                                             ssh_connection_options=ssh_connection_options,
-                                            ssh_options=ssh_options, use_shell=True)
+                                            ssh_options=ssh_options, use_shell=True,
+                                            access_retry_count=options.ssh_access_retry_count)
         verify_remote_access(local_ops)
         ret, output = call_remote_operation(local_ops, remote_python, script_name, client_args,
                                             "--remoteOperation noop")

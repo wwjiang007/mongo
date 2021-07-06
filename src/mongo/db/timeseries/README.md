@@ -29,13 +29,13 @@ certain properties:
 
 ```
 {
-    _id: <Object ID with time component equal to first measurement in this bucket>,
+    _id: <Object ID with time component equal to control.min.<time field>>,
     control: {
         // <Some statistics on the measurements such min/max values of data fields>
         version: 1,  // Version of bucket schema. Currently fixed at 1 since this is the
                      // first iteration of time-series collections.
         min: {
-            <time field>: <time of first measurement in this bucket>,
+            <time field>: <time of first measurement in this bucket, rounded down based on granularity>,
             <field0>: <minimum value of 'field0' across all measurements>,
             <field1>: <maximum value of 'field1' across all measurements>,
             ...
@@ -46,6 +46,8 @@ certain properties:
             <field1>: <maximum value of 'field1' across all measurements>,
             ...
         },
+        closed: <bool> // Optional, signals the database that this document will not receive any
+                       // additional measurements.
     },
     meta: <meta-data field (if specified at creation) value common to all measurements in this bucket>,
     data: {
@@ -102,6 +104,63 @@ Index types that are not supported on time-series collections include
 [partial](https://docs.mongodb.com/manual/core/index-partial/),
 [unique](https://docs.mongodb.com/manual/core/index-unique/), and
 [text](https://docs.mongodb.com/manual/core/index-text/).
+
+## BucketCatalog
+
+In order to facilitate efficient bucketing, we maintain the set of open buckets in the
+`BucketCatalog` found in [bucket_catalog.h](bucket_catalog.h). At a high level, we attempt to group
+writes from concurrent writers into batches which can be committed together to minimize the number
+of underlying document writes. A writer will insert each document in its input batch to the
+`BucketCatalog`, which will return a handle to a `BucketCatalog::WriteBatch`. Upon finishing its
+inserts, the writer will check each write batch. If no other writer has already claimed commit
+rights to a batch, it will claim the rights and commit the batch itself; otherwise, it will set the
+batch aside to wait on later. When it has checked all batches, the writer will wait on each
+remaining batch to be committed by another writer.
+
+Internally, the `BucketCatalog` maintains a list of updates to each bucket document. When a batch
+is committed, it will pivot the insertions into the column-format for the buckets as well as
+determine any updates necessary for the `control` fields (e.g. `control.min` and `control.max`).
+
+Any time a bucket document is updated without going through the `BucketCatalog`, the writer needs
+to call `BucketCatalog::clear` for the document or namespace in question so that it can update its
+internal state and avoid writing any data which may corrupt the bucket format. This is typically
+handled by an op observer, but may be necessary to call from other places.
+
+A bucket is closed either manually, by setting the optional `control.closed` flag, or automatically
+by the `BucketCatalog` in a number of situations. If the `BucketCatalog` is using more memory than
+it's given threshold (controlled by the server paramter
+`timeseriesIdleBucketExpiryMemoryUsageThreshold`), it will start to close idle buckets. A bucket is
+considered idle if it is open and it does not have any uncommitted measurements pending. The
+`BucketCatalog` will also close a bucket if it contains more than the maximum number of measurments
+(`timeseriesBucketMaxCount`), if it contains more than the maximum amount of data
+(`timeseriesBucketMaxSize`), or if a new measurement would cause the bucket to span a greater
+amount of time between it's oldest and newest time stamp than is allowed (currently hard-coded to
+one hour).
+
+The first time a write batch is committed for a given bucket, the newly-formed document is
+inserted. On subsequent batch commits, we perform an update operation. Instead of generating the
+full document (a so-called "classic" update), we create a DocDiff directly (a "delta" or "v2"
+update).
+
+# Granularity
+
+The `granularity` option for a time-series collection can be set at creation to be 'seconds',
+'minutes' or 'hours'. A later `collMod` operation can change the option from 'seconds' to 'minutes'
+or from 'minutes' to 'hours', but no other transitions are currently allowed. This parameter is
+intended to convey the rough time period between measurements in a given time-series, and is used to
+tweak other internal parameters that affect bucketing.
+
+The maximum span of time that a single bucket is allowed to cover is controlled by `granularity`,
+with the maximum span being set to one hour for 'seconds', 24 hours for 'minutes', and 30 days
+for 'hours'.
+
+When a new bucket is opened by the `BucketCatalog`, the timestamp component of its `_id`, and
+equivalently the value of its `control.min.<time field>`, will be taken from the first measurement
+inserted to the bucket and rounded down based on the `granularity`. It will be rounded down to the
+nearest minute for 'seconds', the nearest hour for 'minutes', and the nearest day for 'hours'. This
+rounding may not be perfect in the case of leap seconds and other irregularities in the calendar,
+and will generally be accomplished by basic modulus aritmetic operating on the number of seconds
+since the epoch, assuming 60 seconds per minute, 60 minutes per hour, and 24 hours per day.
 
 # References
 See:

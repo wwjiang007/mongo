@@ -42,6 +42,7 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/warn_deprecated_wire_ops.h"
 
 namespace mongo {
 namespace {
@@ -119,6 +120,8 @@ public:
             }
         }
 
+        warnDeprecation(c, "getLastError");
+
         // for sharding; also useful in general for debugging
         result.appendNumber("connectionId", c.getConnectionId());
 
@@ -178,17 +181,7 @@ public:
             return bob.obj();
         }());
 
-        // Use the default options if we have no gle options aside from wOpTime/wElectionId
-        const int nFields = writeConcernDoc.nFields();
-        bool useDefaultGLEOptions = (nFields == 1) || (nFields == 2 && lastOpTimePresent) ||
-            (nFields == 3 && lastOpTimePresent && electionIdPresent);
-
         WriteConcernOptions writeConcern;
-
-        if (useDefaultGLEOptions) {
-            writeConcern = repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault();
-        }
-
         auto sw = WriteConcernOptions::parse(writeConcernDoc);
         Status status = sw.getStatus();
 

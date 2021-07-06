@@ -1,7 +1,8 @@
 /**
  * Tests running 50 concurrent migrations against the same recipient.
  * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls,
- * incompatible_with_eft, incompatible_with_macos, requires_persistence]
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence,
+ * incompatible_with_amazon_linux]
  */
 
 (function() {
@@ -59,9 +60,13 @@ hangDuringCollectionClone.off();
 
 migrationOptsArray.forEach((migrationOpts) => {
     jsTestLog("Waiting for migration for tenant: " + migrationOpts.tenantId + " to complete");
-    const stateRes =
-        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
-    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
+    TenantMigrationTest.assertCommitted(
+        tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+
+    // Forget migrations first before shutting down the test to prevent unnecessary failover
+    // retries.
+    jsTestLog("Forgetting migration for tenant: " + migrationOpts.tenantId);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 });
 
 tenantMigrationTest.stop();

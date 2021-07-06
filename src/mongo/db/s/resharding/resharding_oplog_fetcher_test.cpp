@@ -90,9 +90,15 @@ public:
         _opCtx = operationContext();
         _svcCtx = _opCtx->getServiceContext();
 
+        {
+            Lock::GlobalWrite lk(_opCtx);
+            OldClientContext ctx(_opCtx, NamespaceString::kRsOplogNamespace.ns());
+        }
+
         // Initialize ReshardingMetrics to a recipient state compatible with fetching.
         _metrics = std::make_unique<ReshardingMetrics>(_svcCtx);
-        _metrics->onStart();
+        _metrics->onStart(ReshardingMetrics::Role::kRecipient,
+                          _svcCtx->getFastClockSource()->now());
         _metrics->setRecipientState(RecipientStateEnum::kCloning);
 
         for (const auto& shardId : kTwoShardIdList) {
@@ -182,15 +188,10 @@ public:
     }
 
     boost::intrusive_ptr<ExpressionContextForTest> createExpressionContext() {
-        NamespaceString slimNss =
-            NamespaceString("local.system.resharding.slimOplogForGraphLookup");
-
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(
             new ExpressionContextForTest(_opCtx, NamespaceString::kRsOplogNamespace));
         expCtx->setResolvedNamespace(NamespaceString::kRsOplogNamespace,
                                      {NamespaceString::kRsOplogNamespace, {}});
-        expCtx->setResolvedNamespace(slimNss,
-                                     {slimNss, std::vector<BSONObj>{getSlimOplogPipeline()}});
         return expCtx;
     }
 
@@ -209,7 +210,7 @@ public:
 
     void create(NamespaceString nss) {
         writeConflictRetry(_opCtx, "create", nss.ns(), [&] {
-            AutoGetOrCreateDb dbRaii(_opCtx, nss.db(), LockMode::MODE_X);
+            AutoGetDb autoDb(_opCtx, nss.db(), LockMode::MODE_X);
             WriteUnitOfWork wunit(_opCtx);
             if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
                 ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
@@ -217,7 +218,8 @@ public:
 
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(_opCtx);
-            ASSERT(dbRaii.getDb()->createCollection(_opCtx, nss));
+            auto db = autoDb.ensureDbExists();
+            ASSERT(db->createCollection(_opCtx, nss)) << nss;
             wunit.commit();
         });
     }
@@ -307,8 +309,7 @@ public:
 
     long long metricsFetchedCount() const {
         BSONObjBuilder bob;
-        _metrics->serializeCurrentOpMetrics(&bob,
-                                            ReshardingMetrics::ReporterOptions::Role::kRecipient);
+        _metrics->serializeCurrentOpMetrics(&bob, ReshardingMetrics::Role::kRecipient);
         return bob.obj()["oplogEntriesFetched"_sd].Long();
     }
 

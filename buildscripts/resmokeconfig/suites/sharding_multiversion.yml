@@ -11,6 +11,7 @@ selector:
   - requires_fcv_48
   - requires_fcv_49
   - requires_fcv_50
+  - requires_fcv_51
   - backport_required_multiversion
   - replica_sets_multiversion_backport_required_multiversion
   exclude_files:
@@ -19,6 +20,7 @@ selector:
   - jstests/sharding/max_time_ms_enforced_on_shard.js
   # TODO SERVER-46040: Enable when SERVER-46040 is backported
   - jstests/sharding/drop_indexes_with_stale_config_error.js
+  - jstests/sharding/query/merge_write_concern.js
 
   # This tag file can be created using ./buildscripts/evergreen_gen_multiversion_tests.py
   # or downloaded from the evergreen task.
@@ -28,7 +30,6 @@ executor:
   config:
     shell_options:
       nodb: ''
-      readMode: commands
       global_vars:
         TestData:
           useRandomBinVersionsWithinReplicaSet: true

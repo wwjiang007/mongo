@@ -109,16 +109,33 @@ TEST(SBEValues, Hash) {
 
     value::releaseValue(tagDecimalInf, valDecimalInf);
 
-    auto tagDoubleNan = value::TypeTags::NumberDouble;
-    auto valDoubleNan = value::bitcastFrom<double>(std::numeric_limits<double>::quiet_NaN());
+    auto testDoubleVsDecimal = [](double doubleValue, double decimalValue) {
+        auto tagDouble = value::TypeTags::NumberDouble;
+        auto valDouble = value::bitcastFrom<double>(doubleValue);
 
-    auto [tagDecimalNan, valDecimalNan] =
-        value::makeCopyDecimal(mongo::Decimal128(std::numeric_limits<double>::quiet_NaN()));
+        auto [tagDecimal, valDecimal] = value::makeCopyDecimal(mongo::Decimal128(decimalValue));
+        value::ValueGuard guard{tagDecimal, valDecimal};
 
-    ASSERT_EQUALS(value::hashValue(tagDoubleNan, valDoubleNan),
-                  value::hashValue(tagDecimalNan, valDecimalNan));
+        ASSERT_EQUALS(value::hashValue(tagDouble, valDouble),
+                      value::hashValue(tagDecimal, valDecimal));
+    };
 
-    value::releaseValue(tagDecimalNan, valDecimalNan);
+    // Test bitwise identical NaNs.
+    testDoubleVsDecimal(std::numeric_limits<double>::quiet_NaN(),
+                        std::numeric_limits<double>::quiet_NaN());
+
+    // Test NaNs with different bit representation.
+    if constexpr (std::numeric_limits<double>::has_signaling_NaN) {
+        const auto firstNan = std::numeric_limits<double>::quiet_NaN();
+        const auto secondNan = std::numeric_limits<double>::signaling_NaN();
+        auto getDoubleBits = [](double value) {
+            uint64_t bits = 0;
+            memcpy(&bits, &value, sizeof(value));
+            return bits;
+        };
+        ASSERT_NOT_EQUALS(getDoubleBits(firstNan), getDoubleBits(secondNan));
+        testDoubleVsDecimal(firstNan, secondNan);
+    }
 
     // Start with a relatively large number that still fits in 64 bits.
     int64_t num = 0x7000000000000000;
@@ -400,5 +417,53 @@ TEST(SBEVM, ConvertBinDataToBsonObj) {
     auto convertedBinData = builder.done();
 
     ASSERT_EQ(originalBinData.woCompare(convertedBinData), 0);
+}
+
+namespace {
+
+/**
+ * Fills bytes after the null terminator in the string with 'pattern'.
+ *
+ * We use this function in the tests to ensure that the implementation of 'getStringLength' for
+ * 'StringSmall' type does not rely on the fact that all bytes after null terminator are zero or any
+ * other special value.
+ */
+void fillSmallStringTail(value::Value val, char pattern) {
+    char* rawView = value::getRawStringView(value::TypeTags::StringSmall, val);
+    for (auto i = std::strlen(rawView) + 1; i <= value::kSmallStringMaxLength; i++) {
+        rawView[i] = pattern;
+    }
+}
+}  // namespace
+
+TEST(SBESmallString, Length) {
+    std::vector<std::pair<std::string, size_t>> testCases{
+        {"", 0},
+        {"a", 1},
+        {"ab", 2},
+        {"abc", 3},
+        {"abcd", 4},
+        {"abcde", 5},
+        {"abcdef", 6},
+        {"abcdefh", 7},
+    };
+
+    for (const auto& [string, length] : testCases) {
+        ASSERT(value::canUseSmallString(string));
+        auto [tag, val] = value::makeSmallString(string);
+        ASSERT_EQ(tag, value::TypeTags::StringSmall);
+
+        fillSmallStringTail(val, char(0));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+
+        fillSmallStringTail(val, char(1));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+
+        fillSmallStringTail(val, char(1 << 7));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+
+        fillSmallStringTail(val, ~char(0));
+        ASSERT_EQ(length, value::getStringLength(tag, val));
+    }
 }
 }  // namespace mongo::sbe

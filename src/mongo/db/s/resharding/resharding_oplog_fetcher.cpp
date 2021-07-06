@@ -57,8 +57,6 @@ namespace mongo {
 namespace {
 boost::intrusive_ptr<ExpressionContext> _makeExpressionContext(OperationContext* opCtx) {
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
-    const NamespaceString slimOplogNs("local.system.resharding.slimOplogForGraphLookup");
-    resolvedNamespaces[slimOplogNs.coll()] = {slimOplogNs, std::vector<BSONObj>()};
     resolvedNamespaces[NamespaceString::kRsOplogNamespace.coll()] = {
         NamespaceString::kRsOplogNamespace, std::vector<BSONObj>()};
     return make_intrusive<ExpressionContext>(opCtx,
@@ -205,6 +203,10 @@ bool ReshardingOplogFetcher::iterate(Client* client, CancelableOperationContextF
         LOGV2_ERROR(
             5192103, "Fatal resharding error while fetching.", "error"_attr = exceptionToStatus());
         throw;
+    } catch (const ExceptionFor<ErrorCodes::IncompleteTransactionHistory>&) {
+        LOGV2_ERROR(
+            5354400, "Fatal resharding error while fetching.", "error"_attr = exceptionToStatus());
+        throw;
     } catch (const DBException&) {
         LOGV2_WARNING(
             5127200, "Error while fetching, retrying.", "error"_attr = exceptionToStatus());
@@ -228,9 +230,10 @@ void ReshardingOplogFetcher::_ensureCollection(Client* client,
         }
 
         WriteUnitOfWork wuow(opCtx);
-        AutoGetOrCreateDb db(opCtx, nss.db(), LockMode::MODE_IX);
+        AutoGetDb autoDb(opCtx, nss.db(), LockMode::MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-        db.getDb()->createCollection(opCtx, nss);
+        auto db = autoDb.ensureDbExists();
+        db->createCollection(opCtx, nss);
         wuow.commit();
     });
 }

@@ -155,31 +155,29 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
 
     def setup_feature_flags():
         _config.RUN_ALL_FEATURE_FLAG_TESTS = config.pop("run_all_feature_flag_tests")
-        feature_flags = []
+        all_feature_flags = []
+        enabled_feature_flags = []
         try:
-            feature_flags = open(ALL_FEATURE_FLAG_FILE).read().split()
+            all_feature_flags = open(ALL_FEATURE_FLAG_FILE).read().split()
         except FileNotFoundError:
             # If we ask resmoke to run with all feature flags, the feature flags file
             # needs to exist.
             if _config.RUN_ALL_FEATURE_FLAG_TESTS:
                 raise
 
+        if _config.RUN_ALL_FEATURE_FLAG_TESTS:
+            enabled_feature_flags = all_feature_flags[:]
+
         # Specify additional feature flags from the command line.
         # Set running all feature flag tests to True if this options is specified.
         additional_feature_flags = config.pop("additional_feature_flags")
         if additional_feature_flags is not None:
-            if _config.RUN_ALL_FEATURE_FLAG_TESTS:
-                feature_flags.extend(additional_feature_flags)
-            else:
-                feature_flags = additional_feature_flags
+            enabled_feature_flags.extend(additional_feature_flags)
 
-            # `additional_feature_flags` only determines the universal set of feature flags,
-            # resmoke.py is set to run with "all" feature flags regardless.
-            _config.RUN_ALL_FEATURE_FLAG_TESTS = True
+        return enabled_feature_flags, all_feature_flags
 
-        return feature_flags
-
-    all_feature_flags = setup_feature_flags()
+    _config.ENABLED_FEATURE_FLAGS, all_feature_flags = setup_feature_flags()
+    not_enabled_feature_flags = list(set(all_feature_flags) - set(_config.ENABLED_FEATURE_FLAGS))
 
     _config.ALWAYS_USE_LOG_FILES = config.pop("always_use_log_files")
     _config.BASE_PORT = int(config.pop("base_port"))
@@ -193,15 +191,15 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.EXCLUDE_WITH_ANY_TAGS.extend(
         utils.default_if_none(_tags_from_list(config.pop("exclude_with_any_tags")), []))
 
-    # Don't run tests with feature flags if the `run_all_feature_flag_tests` is not specified.
-    if not _config.RUN_ALL_FEATURE_FLAG_TESTS and all_feature_flags:
-        _config.EXCLUDE_WITH_ANY_TAGS.extend(all_feature_flags)
+    # Don't run tests with feature flags that are not enabled.
+    _config.EXCLUDE_WITH_ANY_TAGS.extend(not_enabled_feature_flags)
 
     _config.FAIL_FAST = not config.pop("continue_on_failure")
     _config.FLOW_CONTROL = config.pop("flow_control")
     _config.FLOW_CONTROL_TICKETS = config.pop("flow_control_tickets")
 
     _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("include_with_any_tags"))
+    _config.INCLUDE_TAGS = _tags_from_list(config.pop("include_with_all_tags"))
 
     _config.GENNY_EXECUTABLE = _expand_user(config.pop("genny_executable"))
     _config.JOBS = config.pop("jobs")
@@ -210,6 +208,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.MIXED_BIN_VERSIONS = config.pop("mixed_bin_versions")
     if _config.MIXED_BIN_VERSIONS is not None:
         _config.MIXED_BIN_VERSIONS = _config.MIXED_BIN_VERSIONS.split("-")
+
+    _config.MULTIVERSION_BIN_VERSION = config.pop("multiversion_bin_version")
 
     _config.INSTALL_DIR = config.pop("install_dir")
     if _config.INSTALL_DIR is not None:
@@ -235,8 +235,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.MONGOD_EXECUTABLE = _expand_user(config.pop("mongod_executable"))
 
     mongod_set_parameters = config.pop("mongod_set_parameters")
-    if _config.RUN_ALL_FEATURE_FLAG_TESTS:
-        feature_flag_dict = {ff: "true" for ff in all_feature_flags}
+    if _config.ENABLED_FEATURE_FLAGS:
+        feature_flag_dict = {ff: "true" for ff in _config.ENABLED_FEATURE_FLAGS}
         mongod_set_parameters.append(str(feature_flag_dict))
 
     _config.MONGOD_SET_PARAMETERS = _merge_set_params(mongod_set_parameters)
@@ -254,8 +254,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.MONGOS_EXECUTABLE = _expand_user(config.pop("mongos_executable"))
 
     mongos_set_parameters = config.pop("mongos_set_parameters")
-    if _config.RUN_ALL_FEATURE_FLAG_TESTS:
-        feature_flag_dict = {ff: "true" for ff in all_feature_flags}
+    if _config.ENABLED_FEATURE_FLAGS:
+        feature_flag_dict = {ff: "true" for ff in _config.ENABLED_FEATURE_FLAGS}
         mongos_set_parameters.append(str(feature_flag_dict))
 
     _config.MONGOS_SET_PARAMETERS = _merge_set_params(mongos_set_parameters)
@@ -277,8 +277,6 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.REPORT_FAILURE_STATUS = config.pop("report_failure_status")
     _config.REPORT_FILE = config.pop("report_file")
     _config.SERVICE_EXECUTOR = config.pop("service_executor")
-    _config.SHELL_READ_MODE = config.pop("shell_read_mode")
-    _config.SHELL_WRITE_MODE = config.pop("shell_write_mode")
     _config.SPAWN_USING = config.pop("spawn_using")
     _config.EXPORT_MONGOD_CONFIG = config.pop("export_mongod_config")
     _config.STAGGER_JOBS = config.pop("stagger_jobs") == "on"
@@ -287,7 +285,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.SUITE_FILES = config.pop("suite_files")
     if _config.SUITE_FILES is not None:
         _config.SUITE_FILES = _config.SUITE_FILES.split(",")
-    _config.TAG_FILE = config.pop("tag_file")
+    _config.TAG_FILES = config.pop("tag_files")
     _config.TRANSPORT_LAYER = config.pop("transport_layer")
     _config.USER_FRIENDLY_OUTPUT = config.pop("user_friendly_output")
 
@@ -314,22 +312,21 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.CEDAR_RPC_PORT = config.pop("cedar_rpc_port")
 
     def calculate_debug_symbol_url():
-        url = "https://mciuploads.s3.amazonaws.com/"
+        url = "https://mciuploads.s3.amazonaws.com"
         project_name = _config.EVERGREEN_PROJECT_NAME
         variant_name = _config.EVERGREEN_VARIANT_NAME
         revision = _config.EVERGREEN_REVISION
         task_id = _config.EVERGREEN_TASK_ID
         if (variant_name is not None) and (revision is not None) and (task_id is not None):
             url = "/".join([
-                project_name, variant_name, revision, task_id,
-                f"/debugsymbols/debugsymbols-{task_id}"
+                url, project_name, variant_name, revision,
+                f"debugsymbols/debugsymbols-{_config.EVERGREEN_BUILD_ID}"
             ])
-            url = url + ".tgz" if sys.platform == "win32" else ".zip"
+            url = url + (".zip" if sys.platform == "win32" else ".tgz")
             return url
         return None
 
-    if _config.DEBUG_SYMBOL_PATCH_URL is None:
-        _config.DEBUG_SYMBOL_PATCH_URL = calculate_debug_symbol_url()
+    _config.DEBUG_SYMBOLS_URL = calculate_debug_symbol_url()
 
     # Archival options. Archival is enabled only when running on evergreen.
     if not _config.EVERGREEN_TASK_ID:

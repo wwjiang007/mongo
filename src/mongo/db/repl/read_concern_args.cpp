@@ -101,6 +101,10 @@ bool ReadConcernArgs::isSpecified() const {
     return _specified;
 }
 
+bool ReadConcernArgs::isImplicitDefault() const {
+    return getProvenance().isImplicitDefault();
+}
+
 ReadConcernLevel ReadConcernArgs::getLevel() const {
     return _level.value_or(ReadConcernLevel::kLocalReadConcern);
 }
@@ -186,6 +190,12 @@ Status ReadConcernArgs::parse(const BSONObj& readConcernObj) {
                                             << readConcernLevels::kLinearizableName << "', '"
                                             << readConcernLevels::kAvailableName << "', or '"
                                             << readConcernLevels::kSnapshotName << "'");
+            }
+        } else if (fieldName == kAllowTransactionTableSnapshot) {
+            auto status = bsonExtractBooleanField(
+                readConcernObj, kAllowTransactionTableSnapshot, &_allowTransactionTableSnapshot);
+            if (!status.isOK()) {
+                return status;
             }
         } else if (fieldName == ReadWriteConcernProvenance::kSourceFieldName) {
             try {
@@ -296,6 +306,10 @@ void ReadConcernArgs::_appendInfoInner(BSONObjBuilder* builder) const {
 
     if (_atClusterTime) {
         builder->append(kAtClusterTimeFieldName, _atClusterTime->asTimestamp());
+    }
+
+    if (_allowTransactionTableSnapshot) {
+        builder->append(kAllowTransactionTableSnapshot, _allowTransactionTableSnapshot);
     }
 
     _provenance.serialize(builder);

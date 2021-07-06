@@ -48,7 +48,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/profile_filter.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -143,14 +143,9 @@ BSONObj upconvertQueryEntry(const BSONObj& query,
 }
 
 BSONObj upconvertGetMoreEntry(const NamespaceString& nss, CursorId cursorId, int ntoreturn) {
-    return GetMoreRequest(nss,
-                          cursorId,
-                          ntoreturn,
-                          boost::none,  // awaitDataTimeout
-                          boost::none,  // term
-                          boost::none   // lastKnownCommittedOpTime
-                          )
-        .toBSON();
+    GetMoreCommandRequest getMoreRequest(cursorId, nss.coll().toString());
+    getMoreRequest.setBatchSize(ntoreturn);
+    return getMoreRequest.toBSON({});
 }
 
 /**
@@ -674,6 +669,11 @@ void appendAsObjOrString(StringData name,
             objToString[*maxSize - 3] = '.';
             objToString[*maxSize - 2] = '.';
             objToString[*maxSize - 1] = '.';
+            LOGV2_INFO(4760300,
+                       "Gathering currentOp information, operation of size {size} exceeds the size "
+                       "limit of {limit} and will be truncated.",
+                       "size"_attr = objToString.size(),
+                       "limit"_attr = *maxSize);
         }
 
         StringData truncation = StringData(objToString).substr(0, *maxSize);
@@ -877,6 +877,10 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
         s << " dataThroughputAverage: " << *dataThroughputAverage << " MB/sec";
     }
 
+    if (!resolvedViews.empty()) {
+        s << " resolvedViews: " << getResolvedViewsInfo();
+    }
+
     OPDEBUG_TOSTRING_HELP(nShards);
     OPDEBUG_TOSTRING_HELP(cursorid);
     if (mongotCursorId) {
@@ -936,6 +940,14 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
         s << " locks:" << locks.obj().toString();
     }
 
+    auto userCacheAcquisitionStats = curop.getReadOnlyUserCacheAcquisitionStats();
+    if (userCacheAcquisitionStats->shouldReport()) {
+        StringBuilder userCacheAcquisitionStatsBuilder;
+        userCacheAcquisitionStats->toString(&userCacheAcquisitionStatsBuilder,
+                                            opCtx->getServiceContext()->getTickSource());
+        s << " authorization:" << userCacheAcquisitionStatsBuilder.str();
+    }
+
     BSONObj flowControlObj = makeFlowControlObject(flowControlStats);
     if (flowControlObj.nFields() > 0) {
         s << " flowControl:" << flowControlObj.toString();
@@ -948,7 +960,7 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
         }
     }
 
-    if (writeConcern && !writeConcern->usedDefault) {
+    if (writeConcern && !writeConcern->usedDefaultConstructedWC) {
         s << " writeConcern:" << writeConcern->toBSON();
     }
 
@@ -1048,6 +1060,10 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("dataThroughputAverageMBPerSec", *dataThroughputAverage);
     }
 
+    if (!resolvedViews.empty()) {
+        pAttrs->add("resolvedViews", getResolvedViewsInfo());
+    }
+
     OPDEBUG_TOATTR_HELP(nShards);
     OPDEBUG_TOATTR_HELP(cursorid);
     if (mongotCursorId) {
@@ -1107,6 +1123,14 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("locks", locks.obj());
     }
 
+    auto userCacheAcquisitionStats = curop.getReadOnlyUserCacheAcquisitionStats();
+    if (userCacheAcquisitionStats->shouldReport()) {
+        BSONObjBuilder userCacheAcquisitionStatsBuilder;
+        userCacheAcquisitionStats->report(&userCacheAcquisitionStatsBuilder,
+                                          opCtx->getServiceContext()->getTickSource());
+        pAttrs->add("authorization", userCacheAcquisitionStatsBuilder.obj());
+    }
+
     BSONObj flowControlObj = makeFlowControlObject(flowControlStats);
     if (flowControlObj.nFields() > 0) {
         pAttrs->add("flowControl", flowControlObj);
@@ -1119,7 +1143,7 @@ void OpDebug::report(OperationContext* opCtx,
         }
     }
 
-    if (writeConcern && !writeConcern->usedDefault) {
+    if (writeConcern && !writeConcern->usedDefaultConstructedWC) {
         pAttrs->add("writeConcern", writeConcern->toBSON());
     }
 
@@ -1184,6 +1208,10 @@ void OpDebug::append(OperationContext* opCtx,
         appendAsObjOrString("originatingCommand", originatingCommand, appendMaxElementSize, &b);
     }
 
+    if (!resolvedViews.empty()) {
+        appendResolvedViewsInfo(b);
+    }
+
     OPDEBUG_APPEND_NUMBER(b, nShards);
     OPDEBUG_APPEND_NUMBER(b, cursorid);
     if (mongotCursorId) {
@@ -1231,6 +1259,15 @@ void OpDebug::append(OperationContext* opCtx,
     }
 
     {
+        auto userCacheAcquisitionStats = curop.getReadOnlyUserCacheAcquisitionStats();
+        if (userCacheAcquisitionStats->shouldReport()) {
+            BSONObjBuilder userCacheAcquisitionStatsBuilder(b.subobjStart("authorization"));
+            userCacheAcquisitionStats->report(&userCacheAcquisitionStatsBuilder,
+                                              opCtx->getServiceContext()->getTickSource());
+        }
+    }
+
+    {
         BSONObj flowControlMetrics = makeFlowControlObject(flowControlStats);
         BSONObjBuilder flowControlBuilder(b.subobjStart("flowControl"));
         flowControlBuilder.appendElements(flowControlMetrics);
@@ -1243,7 +1280,7 @@ void OpDebug::append(OperationContext* opCtx,
         }
     }
 
-    if (writeConcern && !writeConcern->usedDefault) {
+    if (writeConcern && !writeConcern->usedDefaultConstructedWC) {
         b.append("writeConcern", writeConcern->toBSON());
     }
 
@@ -1488,6 +1525,15 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
         }
     });
 
+    addIfNeeded("authorization", [](auto field, auto args, auto& b) {
+        auto userCacheAcquisitionStats = args.curop.getReadOnlyUserCacheAcquisitionStats();
+        if (userCacheAcquisitionStats->shouldReport()) {
+            BSONObjBuilder userCacheAcquisitionStatsBuilder(b.subobjStart(field));
+            userCacheAcquisitionStats->report(&userCacheAcquisitionStatsBuilder,
+                                              args.opCtx->getServiceContext()->getTickSource());
+        }
+    });
+
     addIfNeeded("flowControl", [](auto field, auto args, auto& b) {
         BSONObj flowControlMetrics =
             makeFlowControlObject(args.opCtx->lockState()->getFlowControlStats());
@@ -1496,7 +1542,7 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
     });
 
     addIfNeeded("writeConcern", [](auto field, auto args, auto& b) {
-        if (args.op.writeConcern && !args.op.writeConcern->usedDefault) {
+        if (args.op.writeConcern && !args.op.writeConcern->usedDefaultConstructedWC) {
             b.append(field, args.op.writeConcern->toBSON());
         }
     });
@@ -1628,6 +1674,55 @@ BSONObj OpDebug::makeMongotDebugStatsObject() const {
     return cursorBuilder.obj();
 }
 
+void OpDebug::addResolvedViews(const std::vector<NamespaceString>& namespaces,
+                               const std::vector<BSONObj>& pipeline) {
+    if (namespaces.empty())
+        return;
+
+    if (resolvedViews.find(namespaces.front()) == resolvedViews.end()) {
+        resolvedViews[namespaces.front()] = std::make_pair(namespaces, pipeline);
+    }
+}
+
+static void appendResolvedViewsInfoImpl(
+    BSONArrayBuilder& resolvedViewsArr,
+    const std::map<NamespaceString, std::pair<std::vector<NamespaceString>, std::vector<BSONObj>>>&
+        resolvedViews) {
+    for (const auto& kv : resolvedViews) {
+        const NamespaceString& viewNss = kv.first;
+        const std::vector<NamespaceString>& dependencies = kv.second.first;
+        const std::vector<BSONObj>& pipeline = kv.second.second;
+
+        BSONObjBuilder aView;
+        aView.append("viewNamespace", viewNss.ns());
+
+        BSONArrayBuilder dependenciesArr(aView.subarrayStart("dependencyChain"));
+        for (const auto& nss : dependencies) {
+            dependenciesArr.append(nss.coll().toString());
+        }
+        dependenciesArr.doneFast();
+
+        BSONArrayBuilder pipelineArr(aView.subarrayStart("resolvedPipeline"));
+        for (const auto& stage : pipeline) {
+            pipelineArr.append(stage);
+        }
+        pipelineArr.doneFast();
+
+        resolvedViewsArr.append(redact(aView.done()));
+    }
+}
+
+BSONArray OpDebug::getResolvedViewsInfo() const {
+    BSONArrayBuilder resolvedViewsArr;
+    appendResolvedViewsInfoImpl(resolvedViewsArr, this->resolvedViews);
+    return resolvedViewsArr.arr();
+}
+
+void OpDebug::appendResolvedViewsInfo(BSONObjBuilder& builder) const {
+    BSONArrayBuilder resolvedViewsArr(builder.subarrayStart("resolvedViews"));
+    appendResolvedViewsInfoImpl(resolvedViewsArr, this->resolvedViews);
+    resolvedViewsArr.doneFast();
+}
 
 namespace {
 

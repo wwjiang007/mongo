@@ -251,10 +251,6 @@ public:
 
     Timestamp getAllDurableTimestamp() const override;
 
-    bool supportsClusteredIdIndex() const final override {
-        return true;
-    }
-
     bool supportsReadConcernSnapshot() const final override;
 
     bool supportsOplogStones() const final override;
@@ -362,6 +358,8 @@ public:
 
     std::map<std::string, Timestamp> getPinnedTimestampRequests();
 
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override;
+
 private:
     class WiredTigerSessionSweeper;
 
@@ -464,7 +462,7 @@ private:
     mutable Mutex _identToDropMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_identToDropMutex");
     std::list<IdentToDrop> _identToDrop;
 
-    mutable Date_t _previousCheckedDropsQueued;
+    mutable AtomicWord<long long> _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
     WiredTigerBackup _wtBackup;
@@ -493,5 +491,9 @@ private:
     mutable Mutex _oldestTimestampPinRequestsMutex =
         MONGO_MAKE_LATCH("WiredTigerKVEngine::_oldestTimestampPinRequestsMutex");
     std::map<std::string, Timestamp> _oldestTimestampPinRequests;
+
+    // Pins the oplog so that OplogStones will not truncate oplog history equal or newer to this
+    // timestamp.
+    AtomicWord<std::uint64_t> _pinnedOplogTimestamp;
 };
 }  // namespace mongo

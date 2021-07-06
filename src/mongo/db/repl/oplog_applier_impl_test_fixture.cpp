@@ -36,6 +36,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -72,12 +73,11 @@ void OplogApplierImplOpObserver::onDelete(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           OptionalCollectionUUID uuid,
                                           StmtId stmtId,
-                                          bool fromMigrate,
-                                          const boost::optional<BSONObj>& deletedDoc) {
+                                          const OpObserver::OplogDeleteEntryArgs& args) {
     if (!onDeleteFn) {
         return;
     }
-    onDeleteFn(opCtx, nss, uuid, stmtId, fromMigrate, deletedDoc);
+    onDeleteFn(opCtx, nss, uuid, stmtId, args);
 }
 
 void OplogApplierImplOpObserver::onUpdate(OperationContext* opCtx,
@@ -100,6 +100,20 @@ void OplogApplierImplOpObserver::onCreateCollection(OperationContext* opCtx,
     onCreateCollectionFn(opCtx, coll, collectionName, options, idIndex);
 }
 
+void OplogApplierImplOpObserver::onRenameCollection(OperationContext* opCtx,
+                                                    const NamespaceString& fromCollection,
+                                                    const NamespaceString& toCollection,
+                                                    OptionalCollectionUUID uuid,
+                                                    OptionalCollectionUUID dropTargetUUID,
+                                                    std::uint64_t numRecords,
+                                                    bool stayTemp) {
+    if (!onRenameCollectionFn) {
+        return;
+    }
+    onRenameCollectionFn(
+        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+}
+
 void OplogApplierImplOpObserver::onCreateIndex(OperationContext* opCtx,
                                                const NamespaceString& nss,
                                                CollectionUUID uuid,
@@ -109,6 +123,29 @@ void OplogApplierImplOpObserver::onCreateIndex(OperationContext* opCtx,
         return;
     }
     onCreateIndexFn(opCtx, nss, uuid, indexDoc, fromMigrate);
+}
+
+void OplogApplierImplOpObserver::onDropIndex(OperationContext* opCtx,
+                                             const NamespaceString& nss,
+                                             OptionalCollectionUUID uuid,
+                                             const std::string& indexName,
+                                             const BSONObj& idxDescriptor) {
+    if (!onDropIndexFn) {
+        return;
+    }
+    onDropIndexFn(opCtx, nss, uuid, indexName, idxDescriptor);
+}
+
+void OplogApplierImplOpObserver::onCollMod(OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           const UUID& uuid,
+                                           const BSONObj& collModCmd,
+                                           const CollectionOptions& oldCollOptions,
+                                           boost::optional<IndexCollModInfo> indexInfo) {
+    if (!onCollModFn) {
+        return;
+    }
+    onCollModFn(opCtx, nss, uuid, collModCmd, oldCollOptions, indexInfo);
 }
 
 void OplogApplierImplTest::setUp() {
@@ -171,7 +208,8 @@ Status OplogApplierImplTest::_applyOplogEntryOrGroupedInsertsWrapper(
     OplogApplication::Mode oplogApplicationMode) {
     UnreplicatedWritesBlock uwb(opCtx);
     DisableDocumentValidation validationDisabler(opCtx);
-    return applyOplogEntryOrGroupedInserts(opCtx, batch, oplogApplicationMode);
+    const bool dataIsConsistent = true;
+    return applyOplogEntryOrGroupedInserts(opCtx, batch, oplogApplicationMode, dataIsConsistent);
 }
 
 void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
@@ -205,13 +243,12 @@ void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
                                   const NamespaceString& nss,
                                   OptionalCollectionUUID uuid,
                                   StmtId stmtId,
-                                  bool fromMigrate,
-                                  const boost::optional<BSONObj>& deletedDoc) {
+                                  const OpObserver::OplogDeleteEntryArgs& args) {
         applyOpCalled = true;
         checkOpCtx(opCtx);
         ASSERT_EQUALS(NamespaceString("test.t"), nss);
-        ASSERT(deletedDoc);
-        ASSERT_BSONOBJ_EQ(op.getObject(), *deletedDoc);
+        ASSERT(args.deletedDoc);
+        ASSERT_BSONOBJ_EQ(op.getObject(), *(args.deletedDoc));
         return Status::OK();
     };
 
@@ -249,7 +286,9 @@ Status OplogApplierImplTest::runOpsSteadyState(std::vector<OplogEntry> ops) {
         opsPtrs.push_back(&op);
     }
     WorkerMultikeyPathInfo pathInfo;
-    return oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &opsPtrs, &pathInfo);
+    const bool dataIsConsistent = true;
+    return oplogApplier.applyOplogBatchPerWorker(
+        _opCtx.get(), &opsPtrs, &pathInfo, dataIsConsistent);
 }
 
 Status OplogApplierImplTest::runOpInitialSync(const OplogEntry& op) {
@@ -383,7 +422,8 @@ OplogEntry makeOplogEntry(OpTypeEnum opType,
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
                               boost::none,    // ShardId of resharding recipient
-                              boost::none)};  // _id
+                              boost::none,    // _id
+                              boost::none)};  // needsRetryImage
 }
 
 OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {
@@ -408,7 +448,7 @@ void createCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const CollectionOptions& options) {
     writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
-        Lock::DBLock dblk(opCtx, nss.db(), MODE_IX);
+        Lock::DBLock dbLk(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLk(opCtx, nss, MODE_X);
         OldClientContext ctx(opCtx, nss.ns());
         auto db = ctx.db();
@@ -438,6 +478,17 @@ void createDatabase(OperationContext* opCtx, StringData dbName) {
 
 bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
     return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+}
+
+void createIndex(OperationContext* opCtx,
+                 const NamespaceString& nss,
+                 const UUID collUUID,
+                 const BSONObj& spec) {
+    Lock::DBLock dbLk(opCtx, nss.db(), MODE_IX);
+    Lock::CollectionLock collLk(opCtx, nss, MODE_X);
+    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    indexBuildsCoord->createIndex(
+        opCtx, collUUID, spec, IndexBuildsManager::IndexConstraints::kEnforce, false);
 }
 
 }  // namespace repl

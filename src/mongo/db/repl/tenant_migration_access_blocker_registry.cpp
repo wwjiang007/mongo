@@ -62,16 +62,31 @@ void TenantMigrationAccessBlockerRegistry::add(StringData tenantId,
     _tenantMigrationAccessBlockers.emplace(tenantId, mtabPair);
 }
 
-void TenantMigrationAccessBlockerRegistry::remove(StringData tenantId, MtabType type) {
-    stdx::lock_guard<Latch> lg(_mutex);
-
+void TenantMigrationAccessBlockerRegistry::_remove(WithLock, StringData tenantId, MtabType type) {
     auto it = _tenantMigrationAccessBlockers.find(tenantId);
-    invariant(it != _tenantMigrationAccessBlockers.end());
+
+    if (it == _tenantMigrationAccessBlockers.end()) {
+        return;
+    }
+
     auto mtabPair = it->second;
     mtabPair.clearAccessBlocker(type);
     if (!mtabPair.getAccessBlocker(MtabType::kDonor) &&
         !mtabPair.getAccessBlocker(MtabType::kRecipient)) {
         _tenantMigrationAccessBlockers.erase(it);
+    }
+}
+
+void TenantMigrationAccessBlockerRegistry::remove(StringData tenantId, MtabType type) {
+    stdx::lock_guard<Latch> lg(_mutex);
+    _remove(lg, tenantId, type);
+}
+
+void TenantMigrationAccessBlockerRegistry::removeAll(MtabType type) {
+    stdx::lock_guard<Latch> lg(_mutex);
+
+    for (auto& [tenantId, _] : _tenantMigrationAccessBlockers) {
+        _remove(lg, tenantId, type);
     }
 }
 
@@ -131,13 +146,16 @@ void TenantMigrationAccessBlockerRegistry::appendInfoForServerStatus(
     BSONObjBuilder* builder) const {
     stdx::lock_guard<Latch> lg(_mutex);
 
-    for (auto& [_, mtabPair] : _tenantMigrationAccessBlockers) {
+    for (auto& [tenantId, mtabPair] : _tenantMigrationAccessBlockers) {
+        BSONObjBuilder mtabInfoBuilder;
         if (auto recipientMtab = mtabPair.getAccessBlocker(MtabType::kRecipient)) {
-            recipientMtab->appendInfoForServerStatus(builder);
+            recipientMtab->appendInfoForServerStatus(&mtabInfoBuilder);
         }
         if (auto donorMtab = mtabPair.getAccessBlocker(MtabType::kDonor)) {
-            donorMtab->appendInfoForServerStatus(builder);
+            donorMtab->appendInfoForServerStatus(&mtabInfoBuilder);
         }
+
+        builder->append(tenantId, mtabInfoBuilder.obj());
     }
 }
 

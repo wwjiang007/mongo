@@ -62,6 +62,7 @@ namespace repl {
 MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceSkipRebuildingInstances);
 MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceHangBeforeRebuildingInstances);
 MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceFailRebuildingInstances);
+MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic);
 
 namespace {
 const auto _registryDecoration = ServiceContext::declareDecoration<PrimaryOnlyServiceRegistry>();
@@ -218,8 +219,8 @@ void PrimaryOnlyServiceRegistry::onStepDown() {
 void PrimaryOnlyServiceRegistry::reportServiceInfoForServerStatus(BSONObjBuilder* result) noexcept {
     BSONObjBuilder subBuilder(result->subobjStart("primaryOnlyServices"));
     for (auto& service : _servicesByName) {
-        subBuilder.appendNumber(service.first,
-                                static_cast<long long>(service.second->getNumberOfInstances()));
+        BSONObjBuilder serviceInfoBuilder(subBuilder.subobjStart(service.first));
+        service.second->reportForServerStatus(&serviceInfoBuilder);
     }
 }
 
@@ -235,9 +236,10 @@ void PrimaryOnlyServiceRegistry::reportServiceInfoForCurrentOp(
 PrimaryOnlyService::PrimaryOnlyService(ServiceContext* serviceContext)
     : _serviceContext(serviceContext) {}
 
-size_t PrimaryOnlyService::getNumberOfInstances() {
+void PrimaryOnlyService::reportForServerStatus(BSONObjBuilder* result) noexcept {
     stdx::lock_guard lk(_mutex);
-    return _activeInstances.size();
+    result->append("state", _getStateString(lk));
+    result->appendNumber("numInstances", static_cast<long long>(_activeInstances.size()));
 }
 
 void PrimaryOnlyService::reportInstanceInfoForCurrentOp(
@@ -252,11 +254,6 @@ void PrimaryOnlyService::reportInstanceInfoForCurrentOp(
             ops->push_back(std::move(op.get()));
         }
     }
-}
-
-bool PrimaryOnlyService::isRunning() const {
-    stdx::lock_guard lk(_mutex);
-    return _state == State::kRunning;
 }
 
 void PrimaryOnlyService::registerOpCtx(OperationContext* opCtx, bool allowOpCtxWhileRebuilding) {
@@ -326,27 +323,31 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
     invariant(_getHasExecutor());
     auto newThenOldScopedExecutor =
         std::make_shared<executor::ScopedTaskExecutor>(_executor, kExecutorShutdownStatus);
-    {
-        stdx::lock_guard lk(_mutex);
 
-        if (_state == State::kShutdown) {
-            return;
-        }
+    stdx::unique_lock lk(_mutex);
 
-        auto newTerm = stepUpOpTime.getTerm();
-        invariant(newTerm > _term,
-                  str::stream() << "term " << newTerm << " is not greater than " << _term);
-        _term = newTerm;
-        _state = State::kRebuilding;
-        _source = CancellationSource();
-
-        // Install a new executor, while moving the old one into 'newThenOldScopedExecutor' so it
-        // can be accessed outside of _mutex.
-        using std::swap;
-        swap(newThenOldScopedExecutor, _scopedExecutor);
-        // Don't destroy the Instances until all outstanding tasks run against them are complete.
-        swap(savedInstances, _activeInstances);
+    if (_state == State::kShutdown) {
+        return;
     }
+
+    auto newTerm = stepUpOpTime.getTerm();
+    invariant(newTerm > _term,
+              str::stream() << "term " << newTerm << " is not greater than " << _term);
+    _term = newTerm;
+    _state = State::kRebuilding;
+    _source = CancellationSource();
+
+    // Install a new executor, while moving the old one into 'newThenOldScopedExecutor' so it
+    // can be accessed outside of _mutex.
+    using std::swap;
+    swap(newThenOldScopedExecutor, _scopedExecutor);
+    // Don't destroy the Instances until all outstanding tasks run against them are complete.
+    swap(savedInstances, _activeInstances);
+
+    // Save off the new executor temporarily.
+    auto newScopedExecutor = _scopedExecutor;
+
+    lk.unlock();
 
     // Ensure that all tasks from the previous term have completed before allowing tasks to be
     // scheduled on the new executor.
@@ -360,23 +361,47 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
         instance.second.waitForCompletion();
     }
 
+    PrimaryOnlyServiceHangBeforeLaunchingStepUpLogic.pauseWhileSet();
+
     // Now wait for the first write of the new term to be majority committed, so that we know
     // all previous writes to state documents are also committed, and then schedule work to
     // rebuild Instances from their persisted state documents.
-    stdx::lock_guard lk(_mutex);
-    auto term = _term;
+    lk.lock();
+    LOGV2_DEBUG(5601000,
+                2,
+                "Waiting on first write of the new term to be majority committed",
+                "service"_attr = getServiceName(),
+                "stepUpOpTime"_attr = stepUpOpTime);
     WaitForMajorityService::get(_serviceContext)
         .waitUntilMajority(stepUpOpTime, _source.token())
-        .thenRunOn(**_scopedExecutor)
-        .then([this] {
-            if (MONGO_unlikely(PrimaryOnlyServiceSkipRebuildingInstances.shouldFail())) {
-                return ExecutorFuture<void>(**_scopedExecutor, Status::OK());
+        .thenRunOn(**newScopedExecutor)
+        .then([this, newScopedExecutor, newTerm] {
+            // Note that checking both the state and the term are optimizations and are
+            // not strictly necessary. This is also true in the later continuation.
+            {
+                stdx::lock_guard lk(_mutex);
+                if (_state != State::kRebuilding || _term != newTerm) {
+                    return ExecutorFuture<void>(**newScopedExecutor, Status::OK());
+                }
             }
 
-            return _rebuildService(_scopedExecutor, _source.token());
+            if (MONGO_unlikely(PrimaryOnlyServiceSkipRebuildingInstances.shouldFail())) {
+                return ExecutorFuture<void>(**newScopedExecutor, Status::OK());
+            }
+
+            return _rebuildService(newScopedExecutor, _source.token());
         })
-        .then([this, term] { _rebuildInstances(term); })
+        .then([this, newScopedExecutor, newTerm] {
+            {
+                stdx::lock_guard lk(_mutex);
+                if (_state != State::kRebuilding || _term != newTerm) {
+                    return;
+                }
+            }
+            _rebuildInstances(newTerm);
+        })
         .getAsync([](auto&&) {});  // Ignore the result Future
+    lk.unlock();
 }
 
 void PrimaryOnlyService::_interruptInstances(WithLock, Status status) {
@@ -428,7 +453,6 @@ void PrimaryOnlyService::shutdown() {
     bool hasExecutor;
     {
         stdx::lock_guard lk(_mutex);
-
         LOGV2_INFO(
             5123006,
             "Shutting down PrimaryOnlyService {service} with {numInstances} currently running "
@@ -518,7 +542,6 @@ boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyServic
         _rebuildCV, lk, [this]() { return _state != State::kRebuilding; });
 
     if (_state == State::kShutdown || _state == State::kPaused) {
-        invariant(_activeInstances.empty());
         return boost::none;
     }
     if (_state == State::kRebuildFailed) {
@@ -533,6 +556,35 @@ boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyServic
     }
 
     return it->second.getInstance();
+}
+
+std::vector<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyService::getAllInstances(
+    OperationContext* opCtx) {
+    // If this operation is holding any database locks, then it must have opted into getting
+    // interrupted at stepdown to prevent deadlocks.
+    invariant(!opCtx->lockState()->isLocked() || opCtx->shouldAlwaysInterruptAtStepDownOrUp() ||
+              opCtx->lockState()->wasGlobalLockTakenInModeConflictingWithWrites());
+
+    std::vector<std::shared_ptr<PrimaryOnlyService::Instance>> instances;
+
+    stdx::unique_lock lk(_mutex);
+    opCtx->waitForConditionOrInterrupt(
+        _rebuildCV, lk, [this]() { return _state != State::kRebuilding; });
+
+    if (_state == State::kShutdown || _state == State::kPaused) {
+        return instances;
+    }
+    if (_state == State::kRebuildFailed) {
+        uassertStatusOK(_rebuildStatus);
+        return instances;
+    }
+    invariant(_state == State::kRunning);
+
+    for (auto& [instanceId, instance] : _activeInstances) {
+        instances.emplace_back(instance.getInstance());
+    }
+
+    return instances;
 }
 
 void PrimaryOnlyService::releaseInstance(const InstanceID& id, Status status) {
@@ -706,6 +758,23 @@ std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::_insertNewInst
                                                        std::move(instanceCompleteFuture));
     invariant(inserted);
     return it->second.getInstance();
+}
+
+StringData PrimaryOnlyService::_getStateString(WithLock) const {
+    switch (_state) {
+        case State::kRunning:
+            return "running";
+        case State::kPaused:
+            return "paused";
+        case State::kRebuilding:
+            return "rebuilding";
+        case State::kRebuildFailed:
+            return "rebuildFailed";
+        case State::kShutdown:
+            return "shutdown";
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 PrimaryOnlyService::AllowOpCtxWhenServiceRebuildingBlock::AllowOpCtxWhenServiceRebuildingBlock(

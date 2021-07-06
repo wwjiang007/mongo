@@ -168,9 +168,6 @@ var TagsTest = function(options) {
                       ' agree that ' + nodeId + ' (' + replTest.nodes[nodeId].host +
                       ') should be primary.');
 
-            if (options.forceWriteMode) {
-                primary.forceWriteMode(options.forceWriteMode);
-            }
             var writeConcern = {
                 writeConcern: {w: expectedWritableNodesCount, wtimeout: replTest.kDefaultTimeoutMS}
             };
@@ -305,6 +302,15 @@ var TagsTest = function(options) {
         result = assert.writeError(primary.getDB('foo').bar.insert(doc, options));
         assert.neq(null, result.getWriteConcernError());
         assert(result.getWriteConcernError().errInfo.wtimeout);
+
+        jsTestLog('Setting custom write concern via a cluster-wide write concern');
+        assert.commandWorked(primary.adminCommand({
+            setDefaultRWConcern: 1,
+            defaultWriteConcern: {w: "3 and 4", wtimeout: ReplSetTest.kDefaultTimeoutMS}
+        }));
+
+        jsTestLog('Custom write concern "3 and 4" should work');
+        assert.commandWorked(primary.getDB('foo').bar.insert(doc));
 
         replTest.stopSet();
     };

@@ -54,7 +54,6 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ftdc/ftdc_mongos.h"
 #include "mongo/db/initialize_server_global_state.h"
-#include "mongo/db/initialize_server_security_state.h"
 #include "mongo/db/kill_sessions.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
@@ -685,13 +684,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHook(std::move(unshardedHookList)));
 
-    auto shardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
-    shardedHookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
-    shardedHookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
-    shardedHookList->addHook(
-        std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
-    shardedHookList->addHook(std::make_unique<rpc::CommittedOpTimeMetadataHook>(serviceContext));
-
     // Hook up a Listener for changes from the ReplicaSetMonitor
     // This will last for the scope of this function. i.e. until shutdown finishes
     auto shardingRSCL =
@@ -763,6 +755,9 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator::start(serviceContext, opCtx);
+    if (audit::initializeSynchronizeJob) {
+        audit::initializeSynchronizeJob(serviceContext);
+    }
 
     PeriodicTask::startRunningPeriodicTasks();
 
@@ -835,20 +830,13 @@ std::unique_ptr<AuthzManagerExternalState> createAuthzManagerExternalStateMongos
 ExitCode main(ServiceContext* serviceContext) {
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds{10}));
 
-    auto const shardingContext = Grid::get(serviceContext);
-
     // We either have a setting where all processes are in localhost or none are
-    std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
-    for (std::vector<HostAndPort>::const_iterator it = configServers.begin();
-         it != configServers.end();
-         ++it) {
-        const HostAndPort& configAddr = *it;
+    const auto& configServers = mongosGlobalParams.configdbs.getServers();
+    invariant(!configServers.empty());
+    const auto allowLocalHost = configServers.front().isLocalHost();
 
-        if (it == configServers.begin()) {
-            shardingContext->setAllowLocalHost(configAddr.isLocalHost());
-        }
-
-        if (configAddr.isLocalHost() != shardingContext->allowLocalHost()) {
+    for (const auto& configServer : configServers) {
+        if (configServer.isLocalHost() != allowLocalHost) {
             LOGV2_OPTIONS(22852,
                           {LogComponent::kDefault},
                           "cannot mix localhost and ip addresses in configdbs");
@@ -941,9 +929,6 @@ ExitCode mongos_main(int argc, char* argv[]) {
     try {
         if (!initializeServerGlobalState(service))
             return EXIT_ABRUPT;
-
-        if (!initializeServerSecurityGlobalState(service))
-            quickExit(EXIT_FAILURE);
 
         startSignalProcessingThread();
 

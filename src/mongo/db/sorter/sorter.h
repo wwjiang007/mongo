@@ -114,7 +114,15 @@ struct SortOptions {
     // extSortAllowed is true.
     std::string tempDir;
 
-    SortOptions() : limit(0), maxMemoryUsageBytes(64 * 1024 * 1024), extSortAllowed(false) {}
+    // If set to true and sorted data fits into memory, sorted data will be moved into iterator
+    // instead of copying.
+    bool moveSortedDataIntoIterator;
+
+    SortOptions()
+        : limit(0),
+          maxMemoryUsageBytes(64 * 1024 * 1024),
+          extSortAllowed(false),
+          moveSortedDataIntoIterator(false) {}
 
     // Fluent API to support expressions like SortOptions().Limit(1000).ExtSortAllowed(true)
 
@@ -140,6 +148,11 @@ struct SortOptions {
 
     SortOptions& DBName(std::string newDbName) {
         dbName = std::move(newDbName);
+        return *this;
+    }
+
+    SortOptions& MoveSortedDataIntoIterator(bool newMoveSortedDataIntoIterator = true) {
+        moveSortedDataIntoIterator = newMoveSortedDataIntoIterator;
         return *this;
     }
 };
@@ -251,7 +264,7 @@ public:
 
     template <typename Comparator>
     static Sorter* makeFromExistingRanges(const std::string& fileName,
-                                          const std::vector<SorterRange> ranges,
+                                          const std::vector<SorterRange>& ranges,
                                           const SortOptions& opts,
                                           const Comparator& comp,
                                           const Settings& settings = Settings());
@@ -270,7 +283,7 @@ public:
     virtual ~Sorter() {}
 
     size_t numSpills() const {
-        return _numSpills;
+        return _iters.size();
     }
 
     size_t numSorted() const {
@@ -288,8 +301,7 @@ protected:
 
     virtual void spill() = 0;
 
-    size_t _numSpills = 0;  // Keeps track of the number of times data was spilled to disk.
-    size_t _numSorted = 0;  // Keeps track of the number of keys sorted.
+    size_t _numSorted = 0;              // Keeps track of the number of keys sorted.
     uint64_t _totalDataSizeSorted = 0;  // Keeps track of the total size of data sorted.
 
     // Whether the files written by this Sorter should be kept on destruction.
@@ -392,7 +404,7 @@ private:
         const SortOptions& opts, const Comparator& comp, const Settings& settings);            \
     template ::mongo::Sorter<Key, Value>* ::mongo::Sorter<Key, Value>::makeFromExistingRanges< \
         Comparator>(const std::string& fileName,                                               \
-                    const std::vector<SorterRange> ranges,                                     \
+                    const std::vector<SorterRange>& ranges,                                    \
                     const SortOptions& opts,                                                   \
                     const Comparator& comp,                                                    \
                     const Settings& settings);

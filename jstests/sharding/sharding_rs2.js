@@ -38,6 +38,15 @@ var db = s.getDB("test");
 var t = db.foo;
 
 assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+// The default WC is 'majority' and fsyncLock will prevent satisfying any majority writes.
+// The default RC is 'local' but fsync will block any refresh on secondaries, that's why RC is
+// defaulted to 'available'.
+assert.commandWorked(s.s.adminCommand({
+    setDefaultRWConcern: 1,
+    defaultReadConcern: {level: "available"},
+    defaultWriteConcern: {w: 1},
+    writeConcern: {w: "majority"}
+}));
 s.ensurePrimaryShard('test', s.shard0.shardName);
 
 // -------------------------------------------------------------------------------------------
@@ -195,7 +204,6 @@ assert.lte(before.query + 10, after.query, "D3");
 // by shard key
 
 m = new Mongo(s.s.name);
-m.forceWriteMode("commands");
 
 s.printShardingStatus();
 
@@ -221,8 +229,12 @@ assert.eq(100, ts.count(), "E4");
 assert.eq(100, ts.find().itcount(), "E5");
 printjson(ts.find().batchSize(5).explain());
 
-// fsyncLock the secondaries
+// fsyncLock the secondaries and enable command logging on all the mongods.
+assert.commandWorked(
+    rs.getPrimary().adminCommand({setParameter: 1, logComponentVerbosity: {command: 2}}));
 rs.getSecondaries().forEach(function(secondary) {
+    assert.commandWorked(
+        secondary.adminCommand({setParameter: 1, logComponentVerbosity: {command: 2}}));
     assert.commandWorked(secondary.getDB("test").fsyncLock());
 });
 

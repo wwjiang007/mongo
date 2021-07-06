@@ -59,14 +59,14 @@ namespace {
 void createLockFile(ServiceContext* service);
 }  // namespace
 
-LastStorageEngineShutdownState initializeStorageEngine(OperationContext* opCtx,
-                                                       const StorageEngineInitFlags initFlags) {
+StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx,
+                                                         const StorageEngineInitFlags initFlags) {
     ServiceContext* service = opCtx->getServiceContext();
 
     // This should be set once.
     invariant(!service->getStorageEngine());
 
-    if (0 == (initFlags & StorageEngineInitFlags::kAllowNoLockFile)) {
+    if ((initFlags & StorageEngineInitFlags::kAllowNoLockFile) == StorageEngineInitFlags{}) {
         createLockFile(service);
     }
 
@@ -130,7 +130,7 @@ LastStorageEngineShutdownState initializeStorageEngine(OperationContext* opCtx,
     }
 
     std::unique_ptr<StorageEngineMetadata> metadata;
-    if ((initFlags & StorageEngineInitFlags::kSkipMetadataFile) == 0) {
+    if ((initFlags & StorageEngineInitFlags::kSkipMetadataFile) == StorageEngineInitFlags{}) {
         metadata = StorageEngineMetadata::forPath(dbpath);
     }
 
@@ -163,7 +163,8 @@ LastStorageEngineShutdownState initializeStorageEngine(OperationContext* opCtx,
     }
 
     // Write a new metadata file if it is not present.
-    if (!metadata.get() && (initFlags & StorageEngineInitFlags::kSkipMetadataFile) == 0) {
+    if (!metadata.get() &&
+        (initFlags & StorageEngineInitFlags::kSkipMetadataFile) == StorageEngineInitFlags{}) {
         invariant(!storageGlobalParams.readOnly);
         metadata.reset(new StorageEngineMetadata(storageGlobalParams.dbpath));
         metadata->setStorageEngine(factory->getCanonicalName().toString());
@@ -174,9 +175,9 @@ LastStorageEngineShutdownState initializeStorageEngine(OperationContext* opCtx,
     guard.dismiss();
 
     if (lockFile && lockFile->createdByUncleanShutdown()) {
-        return LastStorageEngineShutdownState::kUnclean;
+        return StorageEngine::LastShutdownState::kUnclean;
     } else {
-        return LastStorageEngineShutdownState::kClean;
+        return StorageEngine::LastShutdownState::kClean;
     }
 }
 

@@ -15,6 +15,12 @@
  *                 *when the the collection has been dropped and recreated as empty.*
  * - behavior: Must be "unshardedOnly", or "versioned". Determines what system profiler checks are
  * performed.
+ *
+ * @tags: [
+ *   # SERVER-56565 avoid CS stepdowns, since  an election may trigger a  refresh of stale metadata
+ *   #              that form part of the test setup.
+ *   does_not_support_stepdowns,
+ *  ]
  */
 (function() {
 "use strict";
@@ -45,6 +51,7 @@ let testCases = {
     _configsvrBalancerStop: {skip: "primary only"},
     _configsvrClearJumboFlag: {skip: "primary only"},
     _configsvrCommitChunkMerge: {skip: "primary only"},
+    _configsvrCommitChunksMerge: {skip: "primary only"},
     _configsvrCommitChunkMigration: {skip: "primary only"},
     _configsvrCommitChunkSplit: {skip: "primary only"},
     _configsvrCommitMovePrimary: {skip: "primary only"},
@@ -59,6 +66,7 @@ let testCases = {
     _flushReshardingStateChange: {skip: "does not return user data"},
     _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
     _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "does not return user data"},
+    _getAuditConfigGeneration: {skip: "does not return user data"},
     _getUserCacheGeneration: {skip: "does not return user data"},
     _hashBSONElement: {skip: "does not return user data"},
     _isSelf: {skip: "does not return user data"},
@@ -106,6 +114,7 @@ let testCases = {
     cloneCollectionAsCapped: {skip: "primary only"},
     collMod: {skip: "primary only"},
     collStats: {skip: "does not return user data"},
+    commitReshardCollection: {skip: "primary only"},
     commitTransaction: {skip: "primary only"},
     compact: {skip: "does not return user data"},
     configureFailPoint: {skip: "does not return user data"},
@@ -178,6 +187,7 @@ let testCases = {
     forceerror: {skip: "does not return user data"},
     fsync: {skip: "does not return user data"},
     fsyncUnlock: {skip: "does not return user data"},
+    getAuditConfig: {skip: "does not return user data"},
     getCmdLineOpts: {skip: "does not return user data"},
     getDefaultRWConcern: {skip: "does not return user data"},
     getDiagnosticData: {skip: "does not return user data"},
@@ -514,6 +524,9 @@ let staleMongos = st.s1;
 
 let res = st.s.adminCommand({listCommands: 1});
 assert.commandWorked(res);
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(staleMongos.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 let commands = Object.keys(res.commands);
 for (let command of commands) {

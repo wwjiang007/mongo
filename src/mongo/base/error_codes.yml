@@ -419,7 +419,6 @@ error_codes:
     - {code: 337, name: AuthenticationAbandoned, categories: [InternalOnly]}
     
     - {code: 338, name: ReshardCollectionInProgress}
-
     - {code: 339, name: NoSuchReshardCollection}
     - {code: 340, name: ReshardCollectionCommitted}
     - {code: 341, name: ReshardCollectionAborted}
@@ -430,10 +429,20 @@ error_codes:
     # case where it would be possible for MongoS to retry where MongoD couldn't.
     - {code: 343, name: ShardCannotRefreshDueToLocksHeld,
                   extra: ShardCannotRefreshDueToLocksHeldInfo}
-
+    
     - {code: 344, name: AuditingNotEnabled}
     - {code: 345, name: RuntimeAuditConfigurationNotEnabled}
+    
+    - {code: 346,name: ChangeStreamInvalidated, extra: ChangeStreamInvalidationInfo}
 
+    - {code: 347, name: APIMismatchError, categories: [VersionedAPIError,VoteAbortError]}
+    
+    - {code: 348,name: ChangeStreamTopologyChange, extra: ChangeStreamTopologyChangeInfo}
+
+    - {code: 349, name: KeyPatternShorterThanBound}
+
+    - {code: 350, name: ReshardCollectionTruncatedError}
+    
     # Error codes 4000-8999 are reserved.
 
     # Non-sequential error codes for compatibility only)
@@ -460,4 +469,5 @@ error_codes:
     - {code: 14031,name: OutOfDiskSpace}
     - {code: 17280,name: OBSOLETE_KeyTooLong}
     - {code: 46841,name: ClientMarkedKilled,categories: [Interruption,CancellationError]}
+    - {code: 50768,name: NotARetryableWriteCommand}
 

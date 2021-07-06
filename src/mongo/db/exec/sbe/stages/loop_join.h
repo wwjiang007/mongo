@@ -34,6 +34,25 @@
 #include "mongo/db/exec/sbe/vm/vm.h"
 
 namespace mongo::sbe {
+/**
+ * Implements a traditional nested loop join. For each advance from the 'outer' child, re-opens the
+ * 'inner' child and calls 'getNext()' on the inner child until EOF. The caller can optionally
+ * provide a join 'predicate' which is evaluated once per pair of outer and inner rows. If no
+ * predicate expression is provided, then the Cartesian product is produced.
+ *
+ * For symmetry with hash join, this is a binding reflector on the outer side. Nodes higher in the
+ * tree can only access those slots from the outer side that are named in 'outerProjects'. All slots
+ * from the inner side are visible.
+ *
+ * The 'outerCorrelated' slots are slots from the outer side which are made visible to the inner
+ * side.
+ *
+ * Debug string format:
+ *
+ *  nlj [<outer projects>] [<outer correlated>] { predicate }
+ *      left childStage
+ *      right childStage
+ */
 class LoopJoinStage final : public PlanStage {
 public:
     LoopJoinStage(std::unique_ptr<PlanStage> outer,
@@ -50,12 +69,20 @@ public:
     void open(bool reOpen) final;
     PlanState getNext() final;
     void close() final;
+    void doSaveState() final;
 
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
 
 private:
+    PlanState getNextOuterSide() {
+        _isReadingLeftSide = true;
+        auto ret = _children[0]->getNext();
+        _isReadingLeftSide = false;
+        return ret;
+    }
+
     // Set of variables coming from the outer side.
     const value::SlotVector _outerProjects;
     // Set of correlated variables from the outer side that are visible on the inner side.
@@ -72,6 +99,10 @@ private:
     bool _reOpenInner{false};
     bool _outerGetNext{false};
     LoopJoinStats _specificStats;
+
+    // Tracks whether or not we're reading from the left child or the right child.
+    // This is necessary for yielding.
+    bool _isReadingLeftSide = false;
 
     void openInner();
 };

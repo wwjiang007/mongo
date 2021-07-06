@@ -6,7 +6,6 @@
  *   assumes_no_implicit_collection_creation_after_drop,
  *   does_not_support_stepdowns,
  *   requires_fcv_49,
- *   requires_find_command,
  *   requires_getmore,
  * ]
  */
@@ -50,8 +49,8 @@ const testCase = (testFn) => {
         timeseries: {
             timeField: timeFieldName,
             metaField: metaFieldName,
-            expireAfterSeconds: expireAfterSeconds,
-        }
+        },
+        expireAfterSeconds: expireAfterSeconds,
     }));
 
     testFn(coll, bucketsColl);
@@ -163,15 +162,10 @@ testCase((coll, bucketsColl) => {
 
     // Make the collection TTL and expect the data to be deleted because the bucket minimum is past
     // the expiry plus the maximum bucket range.
-    if (TimeseriesTest.supportsClusteredIndexes(conn)) {
-        assert.commandWorked(testDB.runCommand({
-            collMod: 'system.buckets.ts',
-            clusteredIndex: {expireAfterSeconds: expireAfterSeconds}
-        }));
-    } else {
-        assert.commandWorked(bucketsColl.createIndex({['control.min.' + timeFieldName]: 1},
-                                                     {expireAfterSeconds: expireAfterSeconds}));
-    }
+    assert.commandWorked(testDB.runCommand({
+        collMod: 'system.buckets.ts',
+        expireAfterSeconds: expireAfterSeconds,
+    }));
 
     waitForTTL();
     assert.eq(0, coll.find().itcount());

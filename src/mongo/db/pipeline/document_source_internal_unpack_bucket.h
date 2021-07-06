@@ -39,11 +39,15 @@
 namespace mongo {
 class DocumentSourceInternalUnpackBucket : public DocumentSource {
 public:
-    static constexpr StringData kStageName = "$_internalUnpackBucket"_sd;
+    static constexpr StringData kStageNameInternal = "$_internalUnpackBucket"_sd;
+    static constexpr StringData kStageNameExternal = "$_unpackBucket"_sd;
     static constexpr StringData kInclude = "include"_sd;
     static constexpr StringData kExclude = "exclude"_sd;
+    static constexpr StringData kBucketMaxSpanSeconds = "bucketMaxSpanSeconds"_sd;
 
-    static boost::intrusive_ptr<DocumentSource> createFromBson(
+    static boost::intrusive_ptr<DocumentSource> createFromBsonInternal(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<DocumentSource> createFromBsonExternal(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     DocumentSourceInternalUnpackBucket(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -51,7 +55,7 @@ public:
                                        int bucketMaxSpanSeconds);
 
     const char* getSourceName() const override {
-        return kStageName.rawData();
+        return kStageNameInternal.rawData();
     }
 
     void serializeToArray(
@@ -82,7 +86,7 @@ public:
                 TransactionRequirement::kAllowed,
                 LookupRequirement::kAllowed,
                 UnionRequirement::kAllowed,
-                ChangeStreamRequirement::kBlacklist};
+                ChangeStreamRequirement::kDenylist};
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
@@ -186,6 +190,14 @@ public:
      * renamed from the user defined name to 'kBucketMetaFieldName'.
      */
     std::pair<BSONObj, bool> extractProjectForPushDown(DocumentSource* src) const;
+
+    /**
+     * Helper method which checks if we can avoid unpacking if we have a group stage with min/max
+     * aggregates. If a rewrite is possible, 'container' is modified, and we returns result value
+     * for 'doOptimizeAt'.
+     */
+    std::pair<bool, Pipeline::SourceContainer::iterator> rewriteGroupByMinMax(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
 
 private:
     GetNextResult doGetNext() final;

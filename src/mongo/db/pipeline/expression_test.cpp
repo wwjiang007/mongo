@@ -3091,6 +3091,17 @@ TEST(ExpressionToHashedIndexKeyTest, UndefinedInputSucceeds) {
     ASSERT_VALUE_EQ(result, Value::createIntOrLong(40158834000849533LL));
 }
 
+TEST(ExpressionToHashedIndexKeyTest, DoesAddInputDependencies) {
+    auto expCtx = ExpressionContextForTest{};
+    const BSONObj obj = BSON("$toHashedIndexKey"
+                             << "$someValue");
+    auto expression = Expression::parseExpression(&expCtx, obj, expCtx.variablesParseState);
+
+    DepsTracker deps;
+    expression->addDependencies(&deps);
+    ASSERT_EQ(deps.fields.count("someValue"), 1u);
+    ASSERT_EQ(deps.fields.size(), 1u);
+}
 }  // namespace ExpressionToHashedIndexKeyTest
 
 TEST(ExpressionSubtractTest, OverflowLong) {
@@ -3134,22 +3145,125 @@ TEST(ExpressionGetFieldTest, GetFieldSerializesStringArgumentCorrectly) {
     auto expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
     ASSERT_BSONOBJ_EQ(BSON("ignoredField" << BSON("$getField" << BSON("field" << BSON("$const"
                                                                                       << "foo")
-                                                                              << "from"
-                                                                              << "$$ROOT"))),
+                                                                              << "input"
+                                                                              << "$$CURRENT"))),
                       BSON("ignoredField" << expression->serialize(false)));
 }
 
 TEST(ExpressionGetFieldTest, GetFieldSerializesCorrectly) {
     auto expCtx = ExpressionContextForTest{};
     VariablesParseState vps = expCtx.variablesParseState;
-    BSONObj expr = fromjson("{$meta: {\"field\": \"foo\", \"from\": {a: 1}}}");
+    BSONObj expr = fromjson("{$meta: {\"field\": \"foo\", \"input\": {a: 1}}}");
     auto expression = ExpressionGetField::parse(&expCtx, expr.firstElement(), vps);
-    ASSERT_BSONOBJ_EQ(BSON("ignoredField"
-                           << BSON("$getField"
-                                   << BSON("field" << BSON("$const"
-                                                           << "foo")
-                                                   << "from" << BSON("a" << BSON("$const" << 1))))),
-                      BSON("ignoredField" << expression->serialize(false)));
+    ASSERT_BSONOBJ_EQ(
+        BSON("ignoredField" << BSON(
+                 "$getField" << BSON("field" << BSON("$const"
+                                                     << "foo")
+                                             << "input" << BSON("a" << BSON("$const" << 1))))),
+        BSON("ignoredField" << expression->serialize(false)));
+}
+
+TEST(ExpressionSetFieldTest, SetFieldSerializesCorrectly) {
+    auto expCtx = ExpressionContextForTest{};
+    VariablesParseState vps = expCtx.variablesParseState;
+    BSONObj expr = fromjson("{$meta: {\"field\": \"foo\", \"input\": {a: 1}, \"value\": 24}}");
+    auto expression = ExpressionSetField::parse(&expCtx, expr.firstElement(), vps);
+    ASSERT_BSONOBJ_EQ(
+        BSON("ignoredField" << BSON("$setField"
+                                    << BSON("field" << BSON("$const"
+                                                            << "foo")
+                                                    << "input" << BSON("a" << BSON("$const" << 1))
+                                                    << "value" << BSON("$const" << 24)))),
+        BSON("ignoredField" << expression->serialize(false)));
+}
+
+TEST(ExpressionIfNullTest, OptimizedExpressionIfNullShouldRemoveNullConstant) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, \"$a\", \"$b\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$ifNull: [\"$a\", \"$b\"]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest,
+     OptimizedExpressionIfNullShouldRemoveNullConstantAndReturnSingleExpression) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, \"$a\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    ASSERT_VALUE_EQ(optimizedNullRemoved->serialize(false), Value("$a"_sd));
+}
+
+TEST(ExpressionIfNullTest, OptimizedExpressionIfNullShouldRemoveAllNullConstants) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, \"$a\", null, null]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    ASSERT_VALUE_EQ(optimizedNullRemoved->serialize(false), Value("$a"_sd));
+}
+
+TEST(ExpressionIfNullTest,
+     OptimizedExpressionIfNullShouldRemoveAllNullConstantsUnlessItIsOnlyChild) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, null]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$const: null}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest, ExpressionIfNullWithAllConstantsShouldOptimizeToExpressionConstant) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [1, 2]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprConstant = exprIfNull->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprConstant.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 1}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprConstant));
+}
+
+TEST(ExpressionIfNullTest,
+     ExpressionIfNullWithNonNullConstantFirstShouldOptimizeByReturningConstantExpression) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [1, \"$a\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprConstant = exprIfNull->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprConstant.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 1}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprConstant));
+}
+
+TEST(ExpressionIfNullTest,
+     ExpressionIfNullWithNonNullConstantShouldOptimizeByRemovingFollowingOperands) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [\"$a\", 5, \"$b\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedNullRemoved = exprIfNull->optimize();
+    auto expectedResult = fromjson("{$ifNull: [\"$a\", {$const: 5}]}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedNullRemoved));
+}
+
+TEST(ExpressionIfNullTest,
+     ExpressionIfNullWithNullConstantAndNonNullConstantShouldOptimizeToFirstNonNullConstant) {
+    auto expCtx = ExpressionContextForTest{};
+    auto vps = expCtx.variablesParseState;
+    auto expr = fromjson("{$ifNull: [null, 1, \"$a\"]}");
+    auto exprIfNull = ExpressionIfNull::parse(&expCtx, expr.firstElement(), vps);
+    auto optimizedExprConstant = exprIfNull->optimize();
+    auto exprConstant = dynamic_cast<ExpressionConstant*>(optimizedExprConstant.get());
+    ASSERT_TRUE(exprConstant);
+    auto expectedResult = fromjson("{$const: 1}");
+    ASSERT_BSONOBJ_BINARY_EQ(expectedResult, expressionToBson(optimizedExprConstant));
 }
 
 }  // namespace ExpressionTests

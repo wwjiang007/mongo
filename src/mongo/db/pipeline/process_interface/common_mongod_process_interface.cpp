@@ -65,7 +65,6 @@
 #include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/logv2/log.h"
@@ -141,6 +140,17 @@ bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
     return (index->descriptor()->unique() && !index->descriptor()->isPartial() &&
             keyPatternNamesExactPaths(index->descriptor()->keyPattern(), uniqueKeyPaths) &&
             CollatorInterface::collatorsMatch(index->getCollator(), expCtx->getCollator()));
+}
+
+// In an operation across GetMore requests we need to check that ignore conflicts is set for each
+// write to the RecordStore.
+void setIgnoreConflictsWriteBehavior(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (expCtx->opCtx->recoveryUnit()->getPrepareConflictBehavior() !=
+        PrepareConflictBehavior::kIgnoreConflictsAllowWrites) {
+        expCtx->opCtx->recoveryUnit()->abandonSnapshot();
+        expCtx->opCtx->recoveryUnit()->setPrepareConflictBehavior(
+            PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+    }
 }
 
 }  // namespace
@@ -274,9 +284,7 @@ BSONObj CommonMongodProcessInterface::getCollectionOptions(OperationContext* opC
         return collectionOptions;
     }
 
-    collectionOptions = DurableCatalog::get(opCtx)
-                            ->getCollectionOptions(opCtx, collection->getCatalogId())
-                            .toBSON();
+    collectionOptions = collection->getCollectionOptions().toBSON();
     return collectionOptions;
 }
 
@@ -658,6 +666,72 @@ BSONObj CommonMongodProcessInterface::_convertRenameToInternalRename(
     }
     indexArrayBuilder.done();
     return newCmd.obj();
+}
+
+void CommonMongodProcessInterface::writeRecordsToRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    RecordStore* rs,
+    std::vector<Record>* records,
+    const std::vector<Timestamp>& ts) const {
+    tassert(5643012, "Attempted to write to record store with nullptr", records);
+    setIgnoreConflictsWriteBehavior(expCtx);
+    writeConflictRetry(expCtx->opCtx, "MPI::writeRecordsToRecordStore", expCtx->ns.ns(), [&] {
+        AutoGetCollection autoColl(expCtx->opCtx, expCtx->ns, MODE_IX);
+        WriteUnitOfWork wuow(expCtx->opCtx);
+        auto writeResult = rs->insertRecords(expCtx->opCtx, records, ts);
+        tassert(5643002,
+                str::stream() << "Failed to write to disk because " << writeResult.reason(),
+                writeResult.isOK());
+        wuow.commit();
+    });
+}
+std::unique_ptr<TemporaryRecordStore> CommonMongodProcessInterface::createTemporaryRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+    expCtx->opCtx->recoveryUnit()->abandonSnapshot();
+    expCtx->opCtx->recoveryUnit()->setPrepareConflictBehavior(
+        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+    return expCtx->opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(
+        expCtx->opCtx);
+}
+
+Document CommonMongodProcessInterface::readRecordFromRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, RecordStore* rs, RecordId rID) const {
+    RecordData possibleRecord;
+    AutoGetCollection autoColl(expCtx->opCtx, expCtx->ns, MODE_IX);
+    auto foundDoc = rs->findRecord(expCtx->opCtx, RecordId(rID), &possibleRecord);
+    tassert(775101, str::stream() << "Could not find document id " << rID, foundDoc);
+    return Document(possibleRecord.toBson());
+}
+
+void CommonMongodProcessInterface::deleteRecordFromRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, RecordStore* rs, RecordId rID) const {
+    setIgnoreConflictsWriteBehavior(expCtx);
+    writeConflictRetry(expCtx->opCtx, "MPI::deleteFromRecordStore", expCtx->ns.ns(), [&] {
+        AutoGetCollection autoColl(expCtx->opCtx, expCtx->ns, MODE_IX);
+        WriteUnitOfWork wuow(expCtx->opCtx);
+        rs->deleteRecord(expCtx->opCtx, rID);
+        wuow.commit();
+    });
+}
+
+void CommonMongodProcessInterface::truncateRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, RecordStore* rs) const {
+    setIgnoreConflictsWriteBehavior(expCtx);
+    writeConflictRetry(expCtx->opCtx, "MPI::truncateRecordStore", expCtx->ns.ns(), [&] {
+        AutoGetCollection autoColl(expCtx->opCtx, expCtx->ns, MODE_IX);
+        WriteUnitOfWork wuow(expCtx->opCtx);
+        auto status = rs->truncate(expCtx->opCtx);
+        tassert(5643000, "Unable to clear record store", status.isOK());
+        wuow.commit();
+    });
+}
+
+void CommonMongodProcessInterface::deleteTemporaryRecordStore(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::unique_ptr<TemporaryRecordStore> rs) const {
+    setIgnoreConflictsWriteBehavior(expCtx);
+    AutoGetCollection autoColl(expCtx->opCtx, expCtx->ns, MODE_IX);
+    rs->finalizeTemporaryTable(expCtx->opCtx, TemporaryRecordStore::FinalizationAction::kDelete);
 }
 
 }  // namespace mongo

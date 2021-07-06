@@ -63,7 +63,8 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
                           const boost::optional<OpTime>& preImageOpTime,
                           const boost::optional<OpTime>& postImageOpTime,
                           const boost::optional<ShardId>& destinedRecipient,
-                          const boost::optional<Value>& idField) {
+                          const boost::optional<Value>& idField,
+                          const boost::optional<repl::RetryImageEnum>& needsRetryImage) {
     BSONObjBuilder builder;
     if (idField) {
         idField->addToBsonObj(&builder, OplogEntryBase::k_idFieldName);
@@ -109,13 +110,18 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
         const BSONObj localObject = postImageOpTime.get().toBSON();
         builder.append(OplogEntryBase::kPostImageOpTimeFieldName, localObject);
     }
+
     if (destinedRecipient) {
         builder.append(OplogEntryBase::kDestinedRecipientFieldName,
                        destinedRecipient.get().toString());
     }
+
+    if (needsRetryImage) {
+        builder.append(OplogEntryBase::kNeedsRetryImageFieldName,
+                       RetryImage_serializer(needsRetryImage.get()));
+    }
     return builder.obj();
 }
-
 }  // namespace
 
 DurableOplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
@@ -319,7 +325,8 @@ DurableOplogEntry::DurableOplogEntry(OpTime opTime,
                                      const boost::optional<OpTime>& preImageOpTime,
                                      const boost::optional<OpTime>& postImageOpTime,
                                      const boost::optional<ShardId>& destinedRecipient,
-                                     const boost::optional<Value>& idField)
+                                     const boost::optional<Value>& idField,
+                                     const boost::optional<repl::RetryImageEnum>& needsRetryImage)
     : DurableOplogEntry(makeOplogEntryDoc(opTime,
                                           hash,
                                           opType,
@@ -337,7 +344,8 @@ DurableOplogEntry::DurableOplogEntry(OpTime opTime,
                                           preImageOpTime,
                                           postImageOpTime,
                                           destinedRecipient,
-                                          idField)) {}
+                                          idField,
+                                          needsRetryImage)) {}
 
 bool DurableOplogEntry::isCommand() const {
     return getOpType() == OpTypeEnum::kCommand;
@@ -516,10 +524,6 @@ BSONObj OplogEntry::toBSONForLogging() const {
         builder.append("isForCappedCollection", _isForCappedCollection);
     }
 
-    if (_isForReshardingSessionApplication) {
-        builder.append("isForReshardingSessionApplication", _isForReshardingSessionApplication);
-    }
-
     if (_preImageOp) {
         auto op = _preImageOp->toBSON();
         if (estimatedTotalSize + op.objsize() > sizeTooBig) {
@@ -575,14 +579,6 @@ void OplogEntry::setPostImageOp(std::shared_ptr<DurableOplogEntry> postImageOp) 
 void OplogEntry::setPostImageOp(const BSONObj& postImageOp) {
     setPostImageOp(std::make_shared<DurableOplogEntry>(
         uassertStatusOK(DurableOplogEntry::parse(postImageOp))));
-}
-
-bool OplogEntry::isForReshardingSessionApplication() const {
-    return _isForReshardingSessionApplication;
-}
-
-void OplogEntry::setIsForReshardingSessionApplication(bool isForReshardingSessionApplication) {
-    _isForReshardingSessionApplication = isForReshardingSessionApplication;
 }
 
 const boost::optional<mongo::Value>& OplogEntry::get_id() const& {
@@ -674,6 +670,10 @@ const boost::optional<mongo::repl::OpTime>& OplogEntry::getPrevWriteOpTimeInTran
 
 const boost::optional<mongo::repl::OpTime>& OplogEntry::getPostImageOpTime() const& {
     return _entry.getPostImageOpTime();
+}
+
+const boost::optional<RetryImageEnum> OplogEntry::getNeedsRetryImage() const {
+    return _entry.getNeedsRetryImage();
 }
 
 OpTime OplogEntry::getOpTime() const {

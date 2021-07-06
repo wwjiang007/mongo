@@ -1,6 +1,6 @@
 test_kind: js_test
-# This suite's blacklist is a sharded_collections_jscore_passthrough blacklist with some additions
-# from causally_consistent_jscore_passthrough blacklist.
+# This suite's denylist is a sharded_collections_jscore_passthrough denylist with some additions
+# from causally_consistent_jscore_passthrough denylist.
 
 selector:
   roots:
@@ -18,12 +18,9 @@ selector:
   - jstests/core/currentop.js  # uses fsync.
   - jstests/core/dbhash.js  # dbhash.
   - jstests/core/dbhash2.js  # dbhash.
-  - jstests/core/dropdb_race.js  # syncdelay.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
-  - jstests/core/invalidated_legacy_cursors.js # capped collections.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
   - jstests/core/tailable_cursor_invalidation.js # capped collections.
@@ -35,6 +32,7 @@ selector:
   - jstests/core/geo_2d_explain.js  # executionSuccess in different spot in explain().
   - jstests/core/geo_s2explain.js  # inputStage in different spot in explain().
   - jstests/core/geo_s2sparse.js  # keysPerIndex in different spot in validate().
+  - jstests/core/or_to_in.js # queryPlanner in different spot in explain()
   # The following tests fail because they count indexes. These counts do not take into account the
   # additional hashed shard key indexes that are automatically added by this passthrough.
   - jstests/core/bad_index_plugin.js
@@ -47,7 +45,7 @@ selector:
   - jstests/core/dbcase2.js
   - jstests/core/no_db_created.js
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
-  # Tests that need triaging & remediation | blacklist decision
+  # Tests that need triaging & remediation | denylist decision
   # Comments list possible problem point under review.
   - jstests/core/stages_delete.js # Uses stageDebug command for deletes.
   # Tests that fail for Causal Consistency as they have statements that do not support
@@ -110,7 +108,6 @@ executor:
       eval: |
          load("jstests/libs/override_methods/enable_causal_consistency.js");
          load("jstests/libs/override_methods/implicitly_shard_accessed_collections.js");
-      readMode: commands
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash

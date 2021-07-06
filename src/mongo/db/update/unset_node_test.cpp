@@ -36,6 +36,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/update/update_node_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -376,11 +377,17 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
 
     mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
     setPathTaken(makeRuntimeUpdatePathForTest("a.$id"));
-    ASSERT_THROWS_CODE_AND_WHAT(
-        node.apply(getApplyParams(doc.root()["a"]["$id"]), getUpdateNodeApplyParams()),
-        AssertionException,
-        ErrorCodes::InvalidDBRef,
-        "The DBRef $ref field must be followed by a $id field");
+    auto result = node.apply(getApplyParams(doc.root()["a"]["$id"]), getUpdateNodeApplyParams());
+    ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(result.indexesAffected);
+    auto updated = BSON("a" << BSON("$ref"
+                                    << "c"));
+    ASSERT_EQUALS(updated, doc);
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+    assertOplogEntry(fromjson("{$unset: {'a.$id': true}}"),
+                     fromjson("{$v: 2, diff: {sa: {d: {$id: false}}}}"));
+    ASSERT_EQUALS(getModifiedPaths(), "{a.$id}");
 }
 
 TEST_F(UnsetNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFalse) {

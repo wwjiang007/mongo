@@ -36,6 +36,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/filter.h"
+#include "mongo/db/exec/sbe/stages/makeobj.h"
 #include "mongo/db/exec/sbe/stages/project.h"
 #include "mongo/db/query/sbe_stage_builder_eval_frame.h"
 #include "mongo/db/query/stage_types.h"
@@ -263,19 +264,13 @@ EvalStage makeFilter(EvalStage stage,
             std::move(stage.outSlots)};
 }
 
+EvalStage makeProject(EvalStage stage,
+                      sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> projects,
+                      PlanNodeId planNodeId);
+
 template <typename... Ts>
 EvalStage makeProject(EvalStage stage, PlanNodeId planNodeId, Ts&&... pack) {
-    stage = stageOrLimitCoScan(std::move(stage), planNodeId);
-
-    auto outSlots = std::move(stage.outSlots);
-    auto projects = makeEM(std::forward<Ts>(pack)...);
-
-    for (auto& [slot, expr] : projects) {
-        outSlots.push_back(slot);
-    }
-
-    return {sbe::makeS<sbe::ProjectStage>(std::move(stage.stage), std::move(projects), planNodeId),
-            std::move(outSlots)};
+    return makeProject(std::move(stage), makeEM(std::forward<Ts>(pack)...), planNodeId);
 }
 
 /**
@@ -301,14 +296,14 @@ EvalStage makeUnwind(EvalStage inputEvalStage,
                      bool preserveNullAndEmptyArrays = true);
 
 /**
- * Creates a branch stage with the specified condition ifExpr and creates output slots for the
- * branch stage. This forwards the outputs of the thenStage to the output slots of the branchStage
- * if the condition evaluates to true, and forwards the elseStage outputs if the condition is false.
+ * Creates a branch stage with the specified condition ifExpr.
  */
-EvalStage makeBranch(std::unique_ptr<sbe::EExpression> ifExpr,
-                     EvalStage thenStage,
+EvalStage makeBranch(EvalStage thenStage,
                      EvalStage elseStage,
-                     sbe::value::SlotIdGenerator* slotIdGenerator,
+                     std::unique_ptr<sbe::EExpression> ifExpr,
+                     sbe::value::SlotVector thenVals,
+                     sbe::value::SlotVector elseVals,
+                     sbe::value::SlotVector outputVals,
                      PlanNodeId planNodeId);
 
 /**
@@ -335,6 +330,23 @@ EvalStage makeUnion(std::vector<EvalStage> inputStages,
                     std::vector<sbe::value::SlotVector> inputVals,
                     sbe::value::SlotVector outputVals,
                     PlanNodeId planNodeId);
+
+EvalStage makeHashAgg(EvalStage stage,
+                      sbe::value::SlotVector gbs,
+                      sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> aggs,
+                      boost::optional<sbe::value::SlotId> collatorSlot,
+                      PlanNodeId planNodeId);
+
+EvalStage makeMkBsonObj(EvalStage stage,
+                        sbe::value::SlotId objSlot,
+                        boost::optional<sbe::value::SlotId> rootSlot,
+                        boost::optional<sbe::MakeObjFieldBehavior> fieldBehavior,
+                        std::vector<std::string> fields,
+                        std::vector<std::string> projectFields,
+                        sbe::value::SlotVector projectVars,
+                        bool forceNewObject,
+                        bool returnOldObject,
+                        PlanNodeId planNodeId);
 
 using BranchFn = std::function<std::pair<sbe::value::SlotId, EvalStage>(
     EvalExpr expr,
@@ -380,10 +392,17 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
     sbe::value::Value arrVal);
 
 /**
- * Converts a BSONArray to an SBE Array. Caller owns the SBE Array returned. This method does not
- * assume ownership of the BSONArray.
+ * Helper functions for converting from BSONObj/BSONArray to SBE Object/Array. Caller owns the SBE
+ * Object/Array returned. These helper functions do not assume ownership of the BSONObj/BSONArray.
  */
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONObj& bo);
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba);
+
+/**
+ * Helper function for converting mongo::Value to SBE Value. Caller owns the SBE Value returned.
+ * This helper function does not assume ownership of the mongo::Value.
+ */
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const Value& val);
 
 /**
  * Returns a BSON type mask of all data types coercible to date.
@@ -762,4 +781,50 @@ std::pair<sbe::IndexKeysInclusionSet, std::vector<std::string>> makeIndexKeyIncl
 
     return {std::move(indexKeyBitset), std::move(keyFieldNames)};
 }
+
+/**
+ * Common parameters to SBE stage builder functions extracted into separate class to simplify
+ * argument passing. Also contains a mapping of global variable ids to slot ids.
+ */
+struct StageBuilderState {
+    StageBuilderState(OperationContext* opCtx,
+                      sbe::RuntimeEnvironment* env,
+                      const Variables& variables,
+                      sbe::value::SlotIdGenerator* slotIdGenerator,
+                      sbe::value::FrameIdGenerator* frameIdGenerator,
+                      sbe::value::SpoolIdGenerator* spoolIdGenerator)
+        : slotIdGenerator{slotIdGenerator},
+          frameIdGenerator{frameIdGenerator},
+          spoolIdGenerator{spoolIdGenerator},
+          opCtx{opCtx},
+          env{env},
+          variables{variables} {}
+
+    StageBuilderState(const StageBuilderState& other) = delete;
+
+    sbe::value::SlotId getGlobalVariableSlot(Variables::Id variableId);
+
+    sbe::value::SlotId slotId() {
+        return slotIdGenerator->generate();
+    }
+
+    sbe::FrameId frameId() {
+        return frameIdGenerator->generate();
+    }
+
+    sbe::SpoolId spoolId() {
+        return spoolIdGenerator->generate();
+    }
+
+    sbe::value::SlotIdGenerator* const slotIdGenerator;
+    sbe::value::FrameIdGenerator* const frameIdGenerator;
+    sbe::value::SpoolIdGenerator* const spoolIdGenerator;
+
+    OperationContext* const opCtx;
+    sbe::RuntimeEnvironment* const env;
+
+    const Variables& variables;
+    stdx::unordered_map<Variables::Id, sbe::value::SlotId> globalVariables;
+};
+
 }  // namespace mongo::stage_builder

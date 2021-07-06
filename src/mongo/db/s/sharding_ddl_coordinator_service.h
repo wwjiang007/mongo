@@ -31,7 +31,6 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/primary_only_service.h"
-#include "mongo/db/s/sharding_ddl_coordinator.h"
 
 namespace mongo {
 
@@ -55,21 +54,31 @@ public:
     }
 
     ThreadPool::Limits getThreadPoolLimits() const override {
-        return ThreadPool::Limits();
+        ThreadPool::Limits limits;
+        limits.maxThreads = ThreadPool::Options::kUnlimited;
+        return limits;
     }
 
     std::shared_ptr<Instance> constructInstance(BSONObj initialState) override;
 
     std::shared_ptr<Instance> getOrCreateInstance(OperationContext* opCtx, BSONObj initialState);
 
-private:
-    std::shared_ptr<ShardingDDLCoordinator> _constructCoordinator(BSONObj initialState) const;
+    // TODO SERVER-53283 remove the following function after 5.0 became last LTS
+    void waitForAllCoordinatorsToComplete(OperationContext* opCtx) const;
 
+private:
     ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                          const CancellationToken& token) override;
 
+    void _waitForRecoveryCompletion(OperationContext* opCtx) const;
     void _afterStepDown() override;
     size_t _countCoordinatorDocs(OperationContext* opCtx);
+
+    // TODO SERVER-53283 remove the following 3 variables after 5.0 became last LTS
+    mutable Mutex _completionMutex =
+        MONGO_MAKE_LATCH("ShardingDDLCoordinatorService::_completionMutex");
+    size_t _numActiveCoordinators{0};
+    mutable stdx::condition_variable _completedCV;
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ShardingDDLCoordinatorService::_mutex");
 
@@ -85,7 +94,7 @@ private:
 
     State _state = State::kPaused;
 
-    stdx::condition_variable _recoveredCV;
+    mutable stdx::condition_variable _recoveredCV;
 
     // This counter is set up at stepUp and reprensent the number of coordinator instances
     // that needs to be recovered from disk.

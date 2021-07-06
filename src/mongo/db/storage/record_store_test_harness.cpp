@@ -285,8 +285,9 @@ TEST(RecordStoreTestHarness, UpdateInPlace1) {
             mutablebson::DamageVector dv;
             dv.push_back(mutablebson::DamageEvent());
             dv[0].sourceOffset = 0;
+            dv[0].sourceSize = 3;
             dv[0].targetOffset = 3;
-            dv[0].size = 3;
+            dv[0].targetSize = 3;
 
             auto newRecStatus = rs->updateWithDamages(opCtx.get(), loc, s1Rec, damageSource, dv);
             ASSERT_OK(newRecStatus.getStatus());
@@ -408,14 +409,9 @@ TEST(RecordStoreTestHarness, Cursor1) {
 
 TEST(RecordStoreTestHarness, ClusteredRecordStore) {
     const auto harnessHelper = newRecordStoreHarnessHelper();
-    if (!harnessHelper->getEngine()->supportsClusteredIdIndex()) {
-        // Only WiredTiger supports clustered indexes on _id.
-        return;
-    }
-
     const std::string ns = "test.system.buckets.a";
     CollectionOptions options;
-    options.clusteredIndex = ClusteredIndexOptions{};
+    options.clusteredIndex = true;
     std::unique_ptr<RecordStore> rs = harnessHelper->newNonCappedRecordStore(ns, options);
     invariant(rs->keyFormat() == KeyFormat::String);
 
@@ -452,9 +448,8 @@ TEST(RecordStoreTestHarness, ClusteredRecordStore) {
         ASSERT_EQ(numRecords, currRecord);
     }
 
-    {
+    if (auto cursor = rs->getRandomCursor(opCtx.get())) {
         // Verify random cursors work on ObjectId's.
-        auto cursor = rs->getRandomCursor(opCtx.get());
         auto record = cursor->next();
         ASSERT(record);
 
@@ -519,14 +514,9 @@ TEST(RecordStoreTestHarness, ClusteredRecordStore) {
 
 TEST(RecordStoreTestHarness, ClusteredRecordStoreSeekNear) {
     const auto harnessHelper = newRecordStoreHarnessHelper();
-    if (!harnessHelper->getEngine()->supportsClusteredIdIndex()) {
-        // Only WiredTiger supports clustered indexes on _id.
-        return;
-    }
-
     const std::string ns = "test.system.buckets.a";
     CollectionOptions options;
-    options.clusteredIndex = ClusteredIndexOptions{};
+    options.clusteredIndex = true;
     std::unique_ptr<RecordStore> rs = harnessHelper->newNonCappedRecordStore(ns, options);
     invariant(rs->keyFormat() == KeyFormat::String);
 

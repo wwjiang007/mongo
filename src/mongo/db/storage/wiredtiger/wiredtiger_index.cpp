@@ -82,6 +82,7 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(WTCompactIndexEBUSY);
 MONGO_FAIL_POINT_DEFINE(WTEmulateOutOfOrderNextIndexKey);
+MONGO_FAIL_POINT_DEFINE(WTIndexPauseAfterSearchNear);
 
 using std::string;
 using std::vector;
@@ -172,7 +173,6 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(
         ss << "prefix_compression=true,";
     }
 
-    ss << "block_compressor=" << wiredTigerGlobalOptions.indexBlockCompressor << ",";
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
               ->getTableCreateConfig(collectionNamespace.ns());
     ss << sysIndexConfig << ",";
@@ -243,14 +243,14 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                                  bool isReadOnly)
     : SortedDataInterface(ident,
                           _handleVersionInfo(ctx, uri, desc, isReadOnly),
-                          Ordering::make(desc->keyPattern())),
+                          Ordering::make(desc->keyPattern()),
+                          rsKeyFormat),
       _uri(uri),
       _tableId(WiredTigerSession::genTableId()),
       _desc(desc),
       _indexName(desc->indexName()),
       _keyPattern(desc->keyPattern()),
-      _collation(desc->collation()),
-      _rsKeyFormat(rsKeyFormat) {}
+      _collation(desc->collation()) {}
 
 NamespaceString WiredTigerIndex::getCollectionNamespace(OperationContext* opCtx) const {
     return _desc->getEntry()->getNSSFromCatalog(opCtx);
@@ -510,7 +510,7 @@ KeyString::Version WiredTigerIndex::_handleVersionInfo(OperationContext* ctx,
                                       << versionStatus.reason() << " Index: {name: "
                                       << desc->indexName() << ", ns: " << collectionNamespace
                                       << "} - version either too old or too new for this mongod.");
-        fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
+        fassertFailedWithStatus(28579, indexVersionStatus);
     }
     _dataFormatVersion = version.getValue();
 
@@ -660,7 +660,7 @@ public:
 
         // Do a duplicate check, but only if dups aren't allowed.
         if (!_dupsAllowed) {
-            const int cmp = newKeyString.compareWithoutRecordId(_previousKeyString);
+            const int cmp = newKeyString.compareWithoutRecordIdLong(_previousKeyString);
             if (cmp == 0) {
                 // Duplicate found!
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
@@ -719,7 +719,7 @@ public:
     Status addKey(const KeyString::Value& newKeyString) override {
         dassertRecordIdAtEnd(newKeyString, KeyFormat::Long);
 
-        const int cmp = newKeyString.compareWithoutRecordId(_previousKeyString);
+        const int cmp = newKeyString.compareWithoutRecordIdLong(_previousKeyString);
         // _previousKeyString.isEmpty() is only true on the first call to addKey().
         invariant(_previousKeyString.isEmpty() || cmp > 0);
 
@@ -735,8 +735,8 @@ public:
             value.appendTypeBits(typeBits);
         }
 
-        auto sizeWithoutRecordId =
-            KeyString::sizeWithoutRecordIdAtEnd(newKeyString.getBuffer(), newKeyString.getSize());
+        auto sizeWithoutRecordId = KeyString::sizeWithoutRecordIdLongAtEnd(newKeyString.getBuffer(),
+                                                                           newKeyString.getSize());
         WiredTigerItem keyItem(newKeyString.getBuffer(), sizeWithoutRecordId);
         WiredTigerItem valueItem(value.getBuffer(), value.getSize());
 
@@ -869,8 +869,8 @@ public:
 
         if (KeyString::compare(ksEntry->keyString.getBuffer(),
                                key.getBuffer(),
-                               KeyString::sizeWithoutRecordIdAtEnd(ksEntry->keyString.getBuffer(),
-                                                                   ksEntry->keyString.getSize()),
+                               KeyString::sizeWithoutRecordIdLongAtEnd(
+                                   ksEntry->keyString.getBuffer(), ksEntry->keyString.getSize()),
                                key.getSize()) == 0) {
             return KeyStringEntry(ksEntry->keyString, ksEntry->loc);
         }
@@ -1032,8 +1032,8 @@ protected:
         WT_CURSOR* c = _cursor->get();
 
         int cmp = -1;
-        const WiredTigerItem keyItem(query.getBuffer(), query.getSize());
-        setKey(c, keyItem.Get());
+        const WiredTigerItem searchKey(query.getBuffer(), query.getSize());
+        setKey(c, searchKey.Get());
 
         int ret = wiredTigerPrepareConflictRetry(_opCtx, [&] { return c->search_near(c, &cmp); });
         if (ret == WT_NOTFOUND) {
@@ -1050,14 +1050,56 @@ protected:
 
         LOGV2_TRACE_CURSOR(20089, "cmp: {cmp}", "cmp"_attr = cmp);
 
+        WTIndexPauseAfterSearchNear.executeIf(
+            [](const BSONObj&) {
+                LOGV2(5683901, "hanging after search_near");
+                WTIndexPauseAfterSearchNear.pauseWhileSet();
+            },
+            [&](const BSONObj& data) { return data["indexName"].str() == _idx.indexName(); });
+
         if (cmp == 0) {
             // Found it!
             return true;
         }
 
         // Make sure we land on a matching key (after/before for forward/reverse).
-        if (_forward ? cmp < 0 : cmp > 0) {
+        // If this operation is ignoring prepared updates and search_near() lands on a key that
+        // compares lower than the search key (for a forward cursor), calling next() is not
+        // guaranteed to return a key that compares greater than the search key. This is because
+        // ignoring prepare conflicts does not provide snapshot isolation and the call to next()
+        // may land on a newly-committed prepared entry. We must advance our cursor until we find a
+        // key that compares greater than the search key. The same principle applies to reverse
+        // cursors. See SERVER-56839.
+        const bool enforcingPrepareConflicts =
+            _opCtx->recoveryUnit()->getPrepareConflictBehavior() ==
+            PrepareConflictBehavior::kEnforce;
+        WT_ITEM curKey;
+        while (_forward ? cmp < 0 : cmp > 0) {
             advanceWTCursor();
+            if (_cursorAtEof) {
+                break;
+            }
+
+            if (!kDebugBuild && enforcingPrepareConflicts) {
+                break;
+            }
+
+            getKey(c, &curKey);
+            cmp = std::memcmp(curKey.data, searchKey.data, std::min(searchKey.size, curKey.size));
+
+            LOGV2_TRACE_CURSOR(5683900, "cmp after advance: {cmp}", "cmp"_attr = cmp);
+
+            // We do not expect any exact matches or matches of prefixes by comparing keys of
+            // different lengths. Callers either seek using keys with discriminators that always
+            // compare unequally, or in the case of restoring a cursor, perform exact searches. In
+            // the case of an exact search, we will have returned earlier.
+            dassert(cmp);
+
+            if (enforcingPrepareConflicts) {
+                // If we are enforcing prepare conflicts, calling next() or prev() must always give
+                // us a key that compares, respectively, greater than or less than our search key.
+                dassert(_forward ? cmp > 0 : cmp < 0);
+            }
         }
 
         return false;
@@ -1365,12 +1407,12 @@ bool WiredTigerIndexUnique::_keyExists(OperationContext* opCtx,
     int cmp;
     int ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return c->search_near(c, &cmp); });
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneCursorSeek();
+
     if (ret == WT_NOTFOUND)
         return false;
     invariantWTOK(ret);
-
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
-    metricsCollector.incrementOneCursorSeek();
 
     if (cmp == 0)
         return true;
@@ -1454,7 +1496,7 @@ Status WiredTigerIdIndex::_insert(OperationContext* opCtx,
     invariant(id.isValid());
 
     auto sizeWithoutRecordId =
-        KeyString::sizeWithoutRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+        KeyString::sizeWithoutRecordIdLongAtEnd(keyString.getBuffer(), keyString.getSize());
     WiredTigerItem keyItem(keyString.getBuffer(), sizeWithoutRecordId);
 
     KeyString::Builder value(getKeyStringVersion(), id);
@@ -1493,7 +1535,7 @@ Status WiredTigerIndexUnique::_insert(OperationContext* opCtx,
         // A prefix key is KeyString of index key. It is the component of the index entry that
         // should be unique.
         auto sizeWithoutRecordId =
-            KeyString::sizeWithoutRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+            KeyString::sizeWithoutRecordIdLongAtEnd(keyString.getBuffer(), keyString.getSize());
         WiredTigerItem prefixKeyItem(keyString.getBuffer(), sizeWithoutRecordId);
 
         // First phase inserts the prefix key to prohibit concurrent insertions of same key
@@ -1522,7 +1564,12 @@ Status WiredTigerIndexUnique::_insert(OperationContext* opCtx,
         invariantWTOK(ret);
 
         // Second phase looks up for existence of key to avoid insertion of duplicate key
-        if (_keyExists(opCtx, c, keyString.getBuffer(), sizeWithoutRecordId)) {
+        // The usage of 'prefix_key=true' enables an optimization that allows this search to return
+        // more quickly. See SERVER-56509.
+        c->reconfigure(c, "prefix_key=true");
+        ON_BLOCK_EXIT([c] { c->reconfigure(c, "prefix_key=false"); });
+        auto keyExists = _keyExists(opCtx, c, keyString.getBuffer(), sizeWithoutRecordId);
+        if (keyExists) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
             auto entry = _desc->getEntry();
@@ -1567,7 +1614,7 @@ void WiredTigerIdIndex::_unindex(OperationContext* opCtx,
     invariant(id.isValid());
 
     auto sizeWithoutRecordId =
-        KeyString::sizeWithoutRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+        KeyString::sizeWithoutRecordIdLongAtEnd(keyString.getBuffer(), keyString.getSize());
     WiredTigerItem keyItem(keyString.getBuffer(), sizeWithoutRecordId);
     setKey(c, keyItem.Get());
 
@@ -1657,7 +1704,7 @@ void WiredTigerIndexUnique::_unindex(OperationContext* opCtx,
     // format key has index key + Record id. WT_NOTFOUND is possible if index key is in old format.
     // Retry removal of key using old format.
     auto sizeWithoutRecordId =
-        KeyString::sizeWithoutRecordIdAtEnd(keyString.getBuffer(), keyString.getSize());
+        KeyString::sizeWithoutRecordIdLongAtEnd(keyString.getBuffer(), keyString.getSize());
     WiredTigerItem keyItem(keyString.getBuffer(), sizeWithoutRecordId);
     setKey(c, keyItem.Get());
 

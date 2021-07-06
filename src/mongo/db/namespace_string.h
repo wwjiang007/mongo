@@ -157,6 +157,9 @@ public:
     // Namespace for persisting sharding DDL coordinators state documents
     static const NamespaceString kShardingDDLCoordinatorsNamespace;
 
+    // Namespace for persisting sharding DDL rename participant state documents
+    static const NamespaceString kShardingRenameParticipantsNamespace;
+
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
 
@@ -174,6 +177,9 @@ public:
 
     // Dummy namespace used for forcing secondaries to handle an oplog entry on its own batch.
     static const NamespaceString kForceOplogBatchBoundaryNamespace;
+
+    // Namespace used for storing retryable findAndModify images.
+    static const NamespaceString kConfigImagesNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -359,6 +365,11 @@ public:
      * Returns the time-series buckets namespace for this view.
      */
     NamespaceString makeTimeseriesBucketsNamespace() const;
+
+    /**
+     * Returns the time-series view namespace for this buckets namespace.
+     */
+    NamespaceString getTimeseriesViewNamespace() const;
 
     /**
      * Returns whether a namespace is replicated, based only on its string value. One notable

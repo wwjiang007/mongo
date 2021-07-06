@@ -730,6 +730,53 @@ TEST_F(TenantCollectionClonerTest, QueryStageNamespaceNotFoundOnSubsequentBatch)
 
 // We receive a QueryPlanKilled error, then a NamespaceNotFound error, indicating that the
 // collection no longer exists in the database.
+TEST_F(TenantCollectionClonerTest, QueryPlanKilledCheckIfDonorCollectionIsEmptyStage) {
+    // Set up data for preliminary stages.
+    _mockServer->setCommandReply("count", createCountResponse(3));
+
+    // Set up failpoints.
+    auto beforeStageFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
+    auto timesEnteredBeforeStage = beforeStageFailPoint->setMode(
+        FailPoint::alwaysOn,
+        0,
+        fromjson("{cloner: 'TenantCollectionCloner', stage: 'checkIfDonorCollectionIsEmpty'}"));
+    auto beforeRetryFailPoint = globalFailPointRegistry().find("hangBeforeRetryingClonerStage");
+    auto timesEnteredBeforeRetry = beforeRetryFailPoint->setMode(
+        FailPoint::alwaysOn,
+        0,
+        fromjson("{cloner: 'TenantCollectionCloner', stage: 'checkIfDonorCollectionIsEmpty'}"));
+
+    auto cloner = makeCollectionCloner();
+    cloner->setBatchSize_forTest(2);
+
+    stdx::thread clonerThread([&] {
+        Client::initThread("ClonerRunner");
+        ASSERT_OK(cloner->run());
+        ASSERT_EQ(0, cloner->getStats().documentsCopied);
+    });
+
+    // Wait until we get to the 'checkIfDonorCollectionIsEmpty' stage.
+    beforeStageFailPoint->waitForTimesEntered(timesEnteredBeforeStage + 1);
+
+    // Despite the name, this will also trigger on the initial batch.
+    auto failNextBatch = globalFailPointRegistry().find("mockCursorThrowErrorOnGetMore");
+    failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'QueryPlanKilled'}"));
+
+    // Proceed with the 'checkIfDonorCollectionIsEmpty' stage.
+    beforeStageFailPoint->setMode(FailPoint::off, 0);
+    beforeRetryFailPoint->waitForTimesEntered(timesEnteredBeforeRetry + 1);
+
+    // Follow-up the QueryPlanKilled error with a NamespaceNotFound.
+    failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'NamespaceNotFound'}"));
+
+    beforeRetryFailPoint->setMode(FailPoint::off, 0);
+    clonerThread.join();
+
+    ASSERT_EQUALS(0, _opObserver->numDocsInserted);
+}
+
+// We receive a QueryPlanKilled error, then a NamespaceNotFound error, indicating that the
+// collection no longer exists in the database.
 TEST_F(TenantCollectionClonerTest, QueryPlanKilledThenNamespaceNotFoundFirstBatch) {
     // Set up data for preliminary stages.
     _mockServer->setCommandReply("count", createCountResponse(3));
@@ -842,6 +889,12 @@ TEST_F(TenantCollectionClonerTest, QueryPlanKilledThenNamespaceNotFoundSubsequen
 }
 
 TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingAllSecondaryIndexes) {
+    // TODO (SERVER-57194): enable lock-free reads.
+    bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+    storageGlobalParams.disableLockFreeReads = true;
+    ON_BLOCK_EXIT(
+        [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
     TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
     auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
 
@@ -874,6 +927,12 @@ TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingAllSecondaryI
 }
 
 TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingSomeSecondaryIndexes) {
+    // TODO (SERVER-57194): enable lock-free reads.
+    bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+    storageGlobalParams.disableLockFreeReads = true;
+    ON_BLOCK_EXIT(
+        [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
     TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
     auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
 
@@ -908,6 +967,12 @@ TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingSomeSecondary
 }
 
 TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingNoSecondaryIndexes) {
+    // TODO (SERVER-57194): enable lock-free reads.
+    bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+    storageGlobalParams.disableLockFreeReads = true;
+    ON_BLOCK_EXIT(
+        [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
     TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
     auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
 
@@ -966,7 +1031,43 @@ TEST_F(TenantCollectionClonerTest, ResumeFromNonEmptyCollection) {
     ASSERT_EQ(1, cloner->getStats().documentsCopied);
 }
 
+TEST_F(TenantCollectionClonerTest, ResumeFromRecreatedCollection) {
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
+
+    // Simulate that the namespace already exists under a different uuid.
+    CollectionOptions oldOptions;
+    oldOptions.uuid = UUID::gen();  // A different uuid.
+    ASSERT_OK(createCollection(_nss, oldOptions));
+
+    _mockServer->setCommandReply("count", createCountResponse(3));
+    _mockServer->setCommandReply("listIndexes",
+                                 createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+    _mockServer->setCommandReply("find", createFindResponse());  // majority read after listIndexes
+
+    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+
+    ASSERT_EQUALS(Status::OK(), cloner->run());
+
+    // Test that the cloner correctly skips cloning this collection as it must have been dropped and
+    // re-created on the donor. And the drop and the re-create will be covered by the oplog
+    // application phase.
+    ASSERT_EQUALS(_nss.ns(), _opObserver->nssToCapture.ns());
+    ASSERT_EQUALS(0, _opObserver->numDocsInserted);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(0, stats.documentsCopied);
+    ASSERT_EQUALS(0, stats.receivedBatches);
+}
+
 TEST_F(TenantCollectionClonerTest, ResumeFromRenamedCollection) {
+    // TODO (SERVER-57194): enable lock-free reads.
+    bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+    storageGlobalParams.disableLockFreeReads = true;
+    ON_BLOCK_EXIT(
+        [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
     TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
     auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
 

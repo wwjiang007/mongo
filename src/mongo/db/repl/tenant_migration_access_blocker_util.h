@@ -72,13 +72,18 @@ void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringDat
  * Throws TenantMigrationConflict if the database is being migrated and the migration is in the
  * blocking state. Throws TenantMigrationCommitted if it is in committed.
  */
-void checkIfCanWriteOrThrow(OperationContext* opCtx, StringData dbName);
+void checkIfCanWriteOrThrow(OperationContext* opCtx, StringData dbName, Timestamp writeTs);
 
 /**
  * Returns TenantMigrationConflict if the database is being migrated (even if migration is not yet
  * in the blocking state). Returns TenantMigrationCommitted if it is in committed.
  */
 Status checkIfCanBuildIndex(OperationContext* opCtx, StringData dbName);
+
+/**
+ * Returns true if there is either a donor or recipient access blocker for the given dbName.
+ */
+bool hasActiveTenantMigration(OperationContext* opCtx, StringData dbName);
 
 /**
  * Scan config.tenantMigrationDonors and creates the necessary TenantMigrationAccessBlockers for

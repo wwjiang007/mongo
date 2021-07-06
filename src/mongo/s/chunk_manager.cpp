@@ -193,9 +193,13 @@ ShardVersionMap ChunkMap::constructShardVersionMap() const {
 
 void ChunkMap::appendChunk(const std::shared_ptr<ChunkInfo>& chunk) {
     appendChunkTo(_chunkMap, chunk);
-
-    if (_collectionVersion.isOlderThan(chunk->getLastmod()))
-        _collectionVersion = chunk->getLastmod();
+    const auto chunkVersion = chunk->getLastmod();
+    if (_collectionVersion.isOlderThan(chunkVersion)) {
+        _collectionVersion = ChunkVersion(chunkVersion.majorVersion(),
+                                          chunkVersion.minorVersion(),
+                                          chunkVersion.epoch(),
+                                          _collTimestamp);
+    }
 }
 
 std::shared_ptr<ChunkInfo> ChunkMap::findIntersectingChunk(const BSONObj& shardKey) const {
@@ -346,16 +350,29 @@ void RoutingTableHistory::setAllShardsRefreshed() {
     }
 }
 
-Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj& collation) const {
+Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey,
+                                          const BSONObj& collation,
+                                          bool bypassIsFieldHashedCheck) const {
     const bool hasSimpleCollation = (collation.isEmpty() && !_rt->optRt->getDefaultCollator()) ||
         SimpleBSONObjComparator::kInstance.evaluate(collation == CollationSpec::kSimpleSpec);
     if (!hasSimpleCollation) {
         for (BSONElement elt : shardKey) {
+            // We must assume that if the field is specified as "hashed" in the shard key pattern,
+            // then the hash value could have come from a collatable type.
+            const bool isFieldHashed =
+                (_rt->optRt->getShardKeyPattern().isHashedPattern() &&
+                 _rt->optRt->getShardKeyPattern().getHashedField().fieldNameStringData() ==
+                     elt.fieldNameStringData());
+
+            // If we want to skip the check in the special case where the _id field is hashed and
+            // used as the shard key, set bypassIsFieldHashedCheck. This assumes that a request with
+            // a query that contains an _id field can target a specific shard.
             uassert(ErrorCodes::ShardKeyNotFound,
                     str::stream() << "Cannot target single shard due to collation of key "
                                   << elt.fieldNameStringData() << " for namespace "
                                   << _rt->optRt->nss(),
-                    !CollationIndexKey::isCollatableType(elt.type()));
+                    !CollationIndexKey::isCollatableType(elt.type()) &&
+                        (!isFieldHashed || bypassIsFieldHashedCheck));
         }
     }
 
@@ -825,11 +842,8 @@ ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersionForForc
                                   _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
 }
 
-ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh(
-    const ChunkVersion& version) {
-    return ComparableChunkVersion(_forcedRefreshSequenceNumSource.addAndFetch(1),
-                                  version,
-                                  _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
+void ComparableChunkVersion::setChunkVersion(const ChunkVersion& version) {
+    _chunkVersion = version;
 }
 
 BSONObj ComparableChunkVersion::toBSONForLogging() const {

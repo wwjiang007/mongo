@@ -74,8 +74,8 @@ ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service)
 
 ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
-void ReplicationCoordinatorMock::startup(
-    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+void ReplicationCoordinatorMock::startup(OperationContext* opCtx,
+                                         StorageEngine::LastShutdownState lastShutdownState) {
     // TODO
 }
 
@@ -159,7 +159,7 @@ Seconds ReplicationCoordinatorMock::getSecondaryDelaySecs() const {
     return Seconds(0);
 }
 
-void ReplicationCoordinatorMock::clearSyncSourceBlacklist() {}
+void ReplicationCoordinatorMock::clearSyncSourceDenylist() {}
 
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
     OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern) {
@@ -376,6 +376,67 @@ ReplSetConfig ReplicationCoordinatorMock::getConfig() const {
     return _getConfigReturnValue;
 }
 
+ConnectionString ReplicationCoordinatorMock::getConfigConnectionString() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getConnectionString();
+}
+
+Milliseconds ReplicationCoordinatorMock::getConfigElectionTimeoutPeriod() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getElectionTimeoutPeriod();
+}
+
+std::vector<MemberConfig> ReplicationCoordinatorMock::getConfigVotingMembers() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.votingMembers();
+}
+
+std::int64_t ReplicationCoordinatorMock::getConfigTerm() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getConfigTerm();
+}
+
+std::int64_t ReplicationCoordinatorMock::getConfigVersion() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getConfigVersion();
+}
+
+ConfigVersionAndTerm ReplicationCoordinatorMock::getConfigVersionAndTerm() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getConfigVersionAndTerm();
+}
+
+int ReplicationCoordinatorMock::getConfigNumMembers() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getNumMembers();
+}
+
+Milliseconds ReplicationCoordinatorMock::getConfigHeartbeatTimeoutPeriodMillis() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getHeartbeatTimeoutPeriodMillis();
+}
+
+BSONObj ReplicationCoordinatorMock::getConfigBSON() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.toBSON();
+}
+
+const MemberConfig* ReplicationCoordinatorMock::findConfigMemberByHostAndPort(
+    const HostAndPort& hap) const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.findMemberByHostAndPort(hap);
+}
+
+bool ReplicationCoordinatorMock::isConfigLocalHostAllowed() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.isLocalHostAllowed();
+}
+
+Milliseconds ReplicationCoordinatorMock::getConfigHeartbeatInterval() const {
+    stdx::lock_guard<Mutex> lock(_mutex);
+    return _getConfigReturnValue.getHeartbeatInterval();
+}
+
 void ReplicationCoordinatorMock::setGetConfigReturnValue(ReplSetConfig returnValue) {
     stdx::lock_guard<Mutex> lk(_mutex);
 
@@ -496,7 +557,7 @@ HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource(const OpTime& lastOp
     return HostAndPort();
 }
 
-void ReplicationCoordinatorMock::blacklistSyncSource(const HostAndPort& host, Date_t until) {}
+void ReplicationCoordinatorMock::denylistSyncSource(const HostAndPort& host, Date_t until) {}
 
 void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* opCtx) {
     stdx::lock_guard<Mutex> lk(_mutex);

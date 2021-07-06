@@ -41,7 +41,7 @@
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state_mock.h"
 #include "mongo/db/repl/initial_syncer.h"
@@ -163,14 +163,14 @@ public:
     }
 
     // SyncSourceSelector
-    void clearSyncSourceBlacklist() override {
-        _syncSourceSelector->clearSyncSourceBlacklist();
+    void clearSyncSourceDenylist() override {
+        _syncSourceSelector->clearSyncSourceDenylist();
     }
     HostAndPort chooseNewSyncSource(const OpTime& ot) override {
         return _syncSourceSelector->chooseNewSyncSource(ot);
     }
-    void blacklistSyncSource(const HostAndPort& host, Date_t until) override {
-        _syncSourceSelector->blacklistSyncSource(host, until);
+    void denylistSyncSource(const HostAndPort& host, Date_t until) override {
+        _syncSourceSelector->denylistSyncSource(host, until);
     }
     ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort& currentSource,
                                                   const rpc::ReplSetMetadata& replMetadata,
@@ -640,7 +640,8 @@ OplogEntry makeOplogEntry(int t,
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
                               boost::none,    // ShardId of resharding recipient
-                              boost::none)};  // _id
+                              boost::none,    // _id
+                              boost::none)};  // needsRetryImage
 }
 
 BSONObj makeOplogEntryObj(int t, OpTypeEnum opType, int version) {
@@ -649,9 +650,10 @@ BSONObj makeOplogEntryObj(int t, OpTypeEnum opType, int version) {
 
 void InitialSyncerTest::processSuccessfulLastOplogEntryFetcherResponse(std::vector<BSONObj> docs) {
     auto net = getNet();
-    auto request = assertRemoteCommandNameEquals(
-        "find",
-        net->scheduleSuccessfulResponse(makeCursorResponse(0LL, _options.localOplogNS, docs)));
+    auto request =
+        assertRemoteCommandNameEquals("find",
+                                      net->scheduleSuccessfulResponse(makeCursorResponse(
+                                          0LL, NamespaceString::kRsOplogNamespace, docs)));
     ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
     ASSERT_TRUE(request.cmdObj.hasField("sort"));
     ASSERT_EQUALS(mongo::BSONType::Object, request.cmdObj["sort"].type());
@@ -1471,7 +1473,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughLastOplogEntryFetcherSchedul
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 
     ASSERT_EQUALS(syncSource, request.target);
-    ASSERT_EQUALS(_options.localOplogNS.db(), request.dbname);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.db(), request.dbname);
     assertRemoteCommandNameEquals("find", request);
     ASSERT_BSONOBJ_EQ(BSON("$natural" << -1), request.cmdObj.getObjectField("sort"));
     ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
@@ -1743,9 +1745,10 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherCallbackError_Mock
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
 
     _mock
-        ->expect(BSON("find"
-                      << "oplog.rs"),
-                 makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}))
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
         .times(2);
 
     // This is what we want to test.
@@ -2012,9 +2015,10 @@ TEST_F(
 
     // Only respond to oplog queries twice to block the initial syncer on getting stopTimestamp.
     _mock
-        ->expect(BSON("find"
-                      << "oplog.rs"),
-                 makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}))
+        ->expect(
+            BSON("find"
+                 << "oplog.rs"),
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}))
         .times(2);
 
     // This is what we want to test.
@@ -2043,7 +2047,8 @@ TEST_F(
 
     _mock
         ->expect([](auto& request) { return request["find"].str() == "oplog.rs"; },
-                 makeCursorResponse(0LL, _options.localOplogNS, {lastOp.getEntry().toBSON()}))
+                 makeCursorResponse(
+                     0LL, NamespaceString::kRsOplogNamespace, {lastOp.getEntry().toBSON()}))
         .times(1);
 
     _mock->runUntilExpectationsSatisfied();
@@ -2151,7 +2156,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughOplogFetcherCallbackError) {
 
         // Oplog entry associated with the beginApplyingTimestamp.
         net->scheduleSuccessfulResponse(
-            makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}));
+            makeCursorResponse(0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)}));
         net->runReadyNetworkOperations();
 
         // Feature Compatibility Version.
@@ -2200,10 +2205,10 @@ TEST_F(InitialSyncerTest,
         net->runReadyNetworkOperations();
 
         // Oplog entry associated with the beginApplyingTimestamp.
-        request =
-            assertRemoteCommandNameEquals("find",
-                                          net->scheduleSuccessfulResponse(makeCursorResponse(
-                                              0LL, _options.localOplogNS, {makeOplogEntryObj(1)})));
+        request = assertRemoteCommandNameEquals(
+            "find",
+            net->scheduleSuccessfulResponse(makeCursorResponse(
+                0LL, NamespaceString::kRsOplogNamespace, {makeOplogEntryObj(1)})));
         ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
         net->runReadyNetworkOperations();
 
@@ -2986,7 +2991,7 @@ TEST_F(
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
-    ASSERT_EQUALS(_options.localOplogNS, insertDocumentNss);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace, insertDocumentNss);
     ASSERT_BSONOBJ_EQ(oplogEntry, insertDocumentDoc.obj);
 }
 
@@ -3056,7 +3061,7 @@ TEST_F(
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _lastApplied);
-    ASSERT_EQUALS(_options.localOplogNS, insertDocumentNss);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace, insertDocumentNss);
     ASSERT_BSONOBJ_EQ(oplogEntry, insertDocumentDoc.obj);
 }
 

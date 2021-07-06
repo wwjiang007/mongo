@@ -54,7 +54,6 @@ class CountTypes(Enum):
     PUB_EDGE = auto()
     PRIV_EDGE = auto()
     IF_EDGE = auto()
-    SHIM = auto()
     PROG = auto()
     LIB = auto()
 
@@ -67,6 +66,7 @@ class DependsReportTypes(Enum):
     EXCLUDE_DEPENDS = auto()
     GRAPH_PATHS = auto()
     CRITICAL_EDGES = auto()
+    IN_DEGREE_ONE = auto()
 
 
 class LinterTypes(Enum):
@@ -87,7 +87,6 @@ class EdgeProps(Enum):
 class NodeProps(Enum):
     """Enums for node properties."""
 
-    shim = auto()
     bin_type = auto()
 
 
@@ -120,11 +119,6 @@ class LibdepsGraph(networkx.DiGraph):
                 self._deptypes['Typeinfo'] = self._deptypes.get('Typeinfo', 4)
 
         return self._deptypes[deptype]
-
-    def _strip_build_dir(self, node):
-        """Small util function for making args match the graph paths."""
-
-        return str(Path(node).resolve().relative_to(Path(self.graph['build_dir']).resolve()))
 
     def get_direct_nonprivate_graph(self):
         """Get a graph view of direct nonprivate edges."""
@@ -176,3 +170,10 @@ class LibdepsGraph(networkx.DiGraph):
             self._progressbar = null_progressbar
 
         return self._progressbar
+
+
+def load_libdeps_graph(graph_file):
+    """Load a graphml file and create a LibdepGraph."""
+
+    graph = networkx.read_graphml(graph_file)
+    return LibdepsGraph(graph=graph)

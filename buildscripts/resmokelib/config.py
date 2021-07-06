@@ -62,6 +62,7 @@ DEFAULTS = {
     "config_fuzz_seed": None,
     "genny_executable": None,
     "include_with_any_tags": None,
+    "include_with_all_tags": None,
     "install_dir": None,
     "jobs": 1,
     "logger_file": "console",
@@ -89,8 +90,6 @@ DEFAULTS = {
     "service_executor": None,
     "shell_conn_string": None,
     "shell_port": None,
-    "shell_read_mode": None,
-    "shell_write_mode": None,
     "shuffle": None,
     "spawn_using": None,
     "stagger_jobs": None,
@@ -98,11 +97,12 @@ DEFAULTS = {
     "storage_engine": None,
     "storage_engine_cache_size_gb": None,
     "suite_files": "with_server",
-    "tag_file": None,
+    "tag_files": [],
     "test_files": [],
     "transport_layer": None,
     "user_friendly_output": None,
     "mixed_bin_versions": None,
+    "multiversion_bin_version": "last_lts",
     "linear_chain": None,
     "num_replset_nodes": None,
     "num_shards": None,
@@ -239,6 +239,20 @@ class SuiteOptions(_SuiteOptions):
 SuiteOptions.ALL_INHERITED = SuiteOptions(  # type: ignore
     **dict(list(zip(SuiteOptions._fields, itertools.repeat(SuiteOptions.INHERIT)))))
 
+
+class MultiversionOptions(object):
+    """Represent the multiversion version choices."""
+
+    LAST_LTS = "last_lts"
+    LAST_CONTINOUS = "last_continous"
+
+    @classmethod
+    def all_options(cls):
+        """Return available version options for multiversion."""
+
+        return [cls.LAST_LTS, cls.LAST_CONTINOUS]
+
+
 ##
 # Variables that are set by the user at the command line or with --options.
 ##
@@ -319,7 +333,7 @@ EVERGREEN_VARIANT_NAME = None
 EVERGREEN_VERSION_ID = None
 
 # The url that retrieve the debug symbol from a patch build.
-DEBUG_SYMBOL_PATCH_URL = None
+DEBUG_SYMBOLS_URL = None
 
 # If set, then any jstests that have any of the specified tags will be excluded from the suite(s).
 EXCLUDE_WITH_ANY_TAGS = None
@@ -340,6 +354,9 @@ GENNY_EXECUTABLE = None
 # jstest portion of the suite(s).
 INCLUDE_WITH_ANY_TAGS = None
 
+# If set, only jstests that have all the tags will be run.
+INCLUDE_TAGS = None
+
 # Params that can be set to change internal resmoke behavior. Used to test resmoke and should
 # not be set by the user.
 INTERNAL_PARAMS = []
@@ -355,6 +372,9 @@ INSTALL_DIR = None
 
 # Whether to run tests for feature flags.
 RUN_ALL_FEATURE_FLAG_TESTS = None
+
+# List of enabled feature flags.
+ENABLED_FEATURE_FLAGS = []
 
 # The path to the mongo executable used by resmoke.py.
 MONGO_EXECUTABLE = None
@@ -418,12 +438,6 @@ SERVICE_EXECUTOR = None
 # connection string instead.
 SHELL_CONN_STRING = None
 
-# If set, then mongo shells started by resmoke.py will use the specified read mode.
-SHELL_READ_MODE = None
-
-# If set, then mongo shells started by resmoke.py will use the specified write mode.
-SHELL_WRITE_MODE = None
-
 # If true, then the order the tests run in is randomized. Otherwise the tests will run in
 # alphabetical (case-insensitive) order.
 SHUFFLE = None
@@ -444,6 +458,9 @@ MAJORITY_READ_CONCERN = None
 
 # Specifies the binary versions of each node we should run for a replica set.
 MIXED_BIN_VERSIONS = None
+
+# Specifies the binary version of last-lts or last-continous when multiversion enabled
+MULTIVERSION_BIN_VERSION = None
 
 # Specifies the number of replica set members in a ReplicaSetFixture.
 NUM_REPLSET_NODES = None
@@ -479,7 +496,7 @@ STORAGE_ENGINE_CACHE_SIZE = None
 SUITE_FILES = None
 
 # The tag file to use that associates tests with tags.
-TAG_FILE = None
+TAG_FILES = None
 
 # The test files to execute.
 TEST_FILES = None

@@ -288,8 +288,8 @@ Message getMore(OperationContext* opCtx,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
-            auto view = autoDb.getDb() ? ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns())
-                                       : nullptr;
+            auto view =
+                autoDb.getDb() ? ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss) : nullptr;
             uassert(
                 ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "Namespace " << nss.ns()
@@ -380,7 +380,7 @@ Message getMore(OperationContext* opCtx,
             << "OP_GET_MORE does not support cursors with a write concern other than the default."
                " Use the getMore command instead. Write concern was: "
             << cursorPin->getWriteConcernOptions().toBSON(),
-        cursorPin->getWriteConcernOptions().usedDefault);
+        cursorPin->getWriteConcernOptions().isImplicitDefaultWriteConcern());
 
     // If the operation that spawned this cursor had a time limit set, apply leftover time to this
     // getmore.

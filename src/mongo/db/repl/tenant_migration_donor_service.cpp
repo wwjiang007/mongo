@@ -68,6 +68,7 @@ MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeLeavingDataSyncState);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeFetchingKeys);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationDonorBeforeWaitingForKeysToReplicate);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationDonorBeforeMarkingStateGarbageCollectable);
+MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationDonorAfterMarkingStateGarbageCollectable);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeEnteringFutureChain);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationAfterFetchingAndStoringKeys);
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationDonorWhileUpdatingStateDoc);
@@ -97,12 +98,10 @@ bool shouldStopSendingRecipientCommand(Status status) {
 }
 
 bool shouldStopFetchingRecipientClusterTimeKeyDocs(Status status) {
-    // TODO (SERVER-54926): Convert HostUnreachable error in
-    // _fetchAndStoreRecipientClusterTimeKeyDocs to specific error.
     return status.isOK() ||
-        !(ErrorCodes::isRetriableError(status) || ErrorCodes::isInterruption(status)) ||
-        status.code() == ErrorCodes::HostUnreachable;
+        !(ErrorCodes::isRetriableError(status) || ErrorCodes::isInterruption(status));
 }
+
 void checkForTokenInterrupt(const CancellationToken& token) {
     uassert(ErrorCodes::CallbackCanceled, "Donor service interrupted", !token.isCanceled());
 }
@@ -140,6 +139,15 @@ void setPromiseOkIfNotReady(WithLock lk, Promise& promise) {
 }
 
 }  // namespace
+
+void TenantMigrationDonorService::abortAllMigrations(OperationContext* opCtx) {
+    LOGV2(5356301, "Aborting all tenant migrations on donor");
+    auto instances = getAllInstances(opCtx);
+    for (auto& instance : instances) {
+        auto typedInstance = checked_pointer_cast<TenantMigrationDonorService::Instance>(instance);
+        typedInstance->onReceiveDonorAbortMigration();
+    }
+}
 
 // Note this index is required on both the donor and recipient in a tenant migration, since each
 // will copy cluster time keys from the other. The donor service is set up on all mongods on stepup
@@ -487,9 +495,21 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_updateState
                            opCtx->recoveryUnit()->getSnapshotId(), originalStateDocBson);
                        invariant(!originalRecordId.isNull());
 
+                       if (nextState == TenantMigrationDonorStateEnum::kBlocking) {
+                           // Start blocking writes before getting an oplog slot to guarantee no
+                           // writes to the tenant's data can commit with a timestamp after the
+                           // block timestamp.
+                           auto mtab = tenant_migration_access_blocker::
+                               getTenantMigrationDonorAccessBlocker(_serviceContext, _tenantId);
+                           invariant(mtab);
+                           mtab->startBlockingWrites();
+
+                           opCtx->recoveryUnit()->onRollback(
+                               [mtab] { mtab->rollBackStartBlocking(); });
+                       }
+
                        // Reserve an opTime for the write.
-                       auto oplogSlot =
-                           repl::LocalOplogInfo::get(opCtx)->getNextOpTimes(opCtx, 1U)[0];
+                       auto oplogSlot = LocalOplogInfo::get(opCtx)->getNextOpTimes(opCtx, 1U)[0];
                        {
                            stdx::lock_guard<Latch> lg(_mutex);
 
@@ -503,15 +523,6 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_updateState
                                }
                                case TenantMigrationDonorStateEnum::kBlocking: {
                                    _stateDoc.setBlockTimestamp(oplogSlot.getTimestamp());
-
-                                   auto mtab = tenant_migration_access_blocker::
-                                       getTenantMigrationDonorAccessBlocker(_serviceContext,
-                                                                            _tenantId);
-                                   invariant(mtab);
-
-                                   mtab->startBlockingWrites();
-                                   opCtx->recoveryUnit()->onRollback(
-                                       [mtab] { mtab->rollBackStartBlocking(); });
                                    break;
                                }
                                case TenantMigrationDonorStateEnum::kCommitted:
@@ -674,7 +685,7 @@ ExecutorFuture<void> TenantMigrationDonorService::Instance::_sendRecipientSyncDa
 
     const auto cmdObj = [&] {
         auto donorConnString =
-            repl::ReplicationCoordinator::get(_serviceContext)->getConfig().getConnectionString();
+            repl::ReplicationCoordinator::get(_serviceContext)->getConfigConnectionString();
 
         RecipientSyncData request;
         request.setDbName(NamespaceString::kAdminDb);
@@ -701,7 +712,7 @@ ExecutorFuture<void> TenantMigrationDonorService::Instance::_sendRecipientForget
     const CancellationToken& token) {
 
     auto donorConnString =
-        repl::ReplicationCoordinator::get(_serviceContext)->getConfig().getConnectionString();
+        repl::ReplicationCoordinator::get(_serviceContext)->getConfigConnectionString();
 
     RecipientForgetMigration request;
     request.setDbName(NamespaceString::kAdminDb);
@@ -738,6 +749,13 @@ SemiFuture<void> TenantMigrationDonorService::Instance::run(
         if (!_stateDoc.getMigrationStart()) {
             _stateDoc.setMigrationStart(_serviceContext->getFastClockSource()->now());
         }
+    }
+
+    // We must abort the migration if we try to start or resume while upgrading or downgrading.
+    // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+    if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading()) {
+        LOGV2(5356302, "Must abort tenant migration as donor is upgrading or downgrading");
+        onReceiveDonorAbortMigration();
     }
 
     auto abortToken = _initAbortMigrationSource(token);
@@ -1064,7 +1082,7 @@ TenantMigrationDonorService::Instance::_waitForRecipientToReachBlockTimestampAnd
             if (idx == 0) {
                 LOGV2(5290301,
                       "Tenant migration blocking stage timeout expired",
-                      "timeoutMs"_attr = repl::tenantMigrationGarbageCollectionDelayMS.load());
+                      "timeoutMs"_attr = repl::tenantMigrationBlockingStateTimeoutMS.load());
                 // Deadline reached, cancel the pending '_sendRecipientSyncDataCommand()'...
                 recipientSyncDataSource.cancel();
                 // ...and return error.
@@ -1121,6 +1139,10 @@ ExecutorFuture<void> TenantMigrationDonorService::Instance::_handleErrorOrEnterA
     const CancellationToken& token,
     const CancellationToken& abortToken,
     Status status) {
+    // Don't handle errors if the instance token is canceled to guarantee we don't enter the abort
+    // state because of an earlier error from token cancellation.
+    checkForTokenInterrupt(token);
+
     {
         stdx::lock_guard<Latch> lg(_mutex);
         if (_stateDoc.getState() == TenantMigrationDonorStateEnum::kAborted) {
@@ -1129,22 +1151,28 @@ ExecutorFuture<void> TenantMigrationDonorService::Instance::_handleErrorOrEnterA
         }
     }
 
-    if (abortToken.isCanceled()) {
+    // Note we must check the parent token has not been canceled so we don't change the error if the
+    // abortToken was canceled because of an instance interruption. The checks don't need to be
+    // atomic because a token cannot be uncanceled.
+    if (abortToken.isCanceled() && !token.isCanceled()) {
         status = Status(ErrorCodes::TenantMigrationAborted, "Aborted due to donorAbortMigration.");
     }
 
     auto mtab = tenant_migration_access_blocker::getTenantMigrationDonorAccessBlocker(
         _serviceContext, _tenantId);
-    if (status == ErrorCodes::ConflictingOperationInProgress || !mtab) {
+    if ((status == ErrorCodes::ConflictingOperationInProgress &&
+         !_initialDonorStateDurablePromise.getFuture().isReady()) ||
+        !mtab) {
+        // The migration failed either before or during inserting the state doc. Use the status to
+        // fulfill the _initialDonorStateDurablePromise to fail the donorStartMigration command
+        // immediately.
         stdx::lock_guard<Latch> lg(_mutex);
-        // Fulfill the promise since the state doc failed to insert.
         setPromiseErrorIfNotReady(lg, _initialDonorStateDurablePromise, status);
 
         return ExecutorFuture(**executor);
-    } else if (status == ErrorCodes::PrimarySteppedDown) {
-        // The node started stepping down while the instance was waiting for key docs to
-        // to replicate. Do not abort the migration since the migration can safely resume
-        // when the new primary steps up.
+    } else if (ErrorCodes::isNotPrimaryError(status) || ErrorCodes::isShutdownError(status)) {
+        // Don't abort the migration on retriable errors that may have been generated by the local
+        // server shutting/stepping down because it can be resumed when the client retries.
         stdx::lock_guard<Latch> lg(_mutex);
         setPromiseErrorIfNotReady(lg, _initialDonorStateDurablePromise, status);
 
@@ -1210,6 +1238,9 @@ TenantMigrationDonorService::Instance::_waitForForgetMigrationThenMarkMigrationG
         })
         .then([this, self = shared_from_this(), executor, token](repl::OpTime opTime) {
             return _waitForMajorityWriteConcern(executor, std::move(opTime), token);
+        })
+        .then([this, self = shared_from_this()] {
+            pauseTenantMigrationDonorAfterMarkingStateGarbageCollectable.pauseWhileSet();
         });
 }
 

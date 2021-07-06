@@ -27,10 +27,17 @@ if(${u_intmax_size} STREQUAL "")
     endif()
 endif()
 
+set(default_offt_def)
+if("${WT_OS}" STREQUAL "windows")
+    set(default_offt_def "typedef int64_t wt_off_t\\;")
+else()
+    set(default_offt_def "typedef off_t wt_off_t\\;")
+endif()
+
 config_string(
     off_t_decl
     "off_t type declaration."
-    DEFAULT "typedef off_t wt_off_t\\;"
+    DEFAULT "${default_offt_def}"
     INTERNAL
 )
 
@@ -222,56 +229,52 @@ config_lib(
     HAVE_LIBPTHREAD
     "Pthread library exists."
     LIB "pthread"
-    FUNC "pthread_create"
 )
 
 config_lib(
     HAVE_LIBRT
     "rt library exists."
     LIB "rt"
-    FUNC "timer_create"
 )
 
 config_lib(
     HAVE_LIBDL
     "dl library exists."
     LIB "dl"
-    FUNC "dlopen"
 )
 
 config_lib(
     HAVE_LIBLZ4
     "lz4 library exists."
     LIB "lz4"
-    FUNC "LZ4_versionNumber"
+    HEADER "lz4.h"
 )
 
 config_lib(
     HAVE_LIBSNAPPY
     "snappy library exists."
     LIB "snappy"
-    FUNC "snappy_compress"
+    HEADER "snappy.h"
 )
 
 config_lib(
     HAVE_LIBZ
     "zlib library exists."
     LIB "z"
-    FUNC "zlibVersion"
+    HEADER "zlib.h"
 )
 
 config_lib(
     HAVE_LIBZSTD
     "zstd library exists."
     LIB "zstd"
-    FUNC "ZSTD_versionString"
+    HEADER "zstd.h"
 )
 
 config_lib(
     HAVE_LIBTCMALLOC
     "tcmalloc library exists."
     LIB "tcmalloc"
-    FUNC "tc_malloc"
 )
 
 config_compile(
@@ -282,11 +285,22 @@ config_compile(
     DEPENDS "HAVE_LIBPTHREAD"
 )
 
+include(TestBigEndian)
+test_big_endian(is_big_endian)
+if(NOT is_big_endian)
+    set(is_big_endian FALSE)
+endif()
+config_bool(
+    WORDS_BIGENDIAN
+    "If the target system is big endian"
+    DEFAULT ${is_big_endian}
+)
+
 set(wiredtiger_includes_decl)
 if(HAVE_SYS_TYPES_H)
     list(APPEND wiredtiger_includes_decl "#include <sys/types.h>")
 endif()
-if(HAVE_INTTYPES_H)
+if(HAVE_INTTYPES_H AND (NOT "${WT_OS}" STREQUAL "windows"))
     list(APPEND wiredtiger_includes_decl "#include <inttypes.h>")
 endif()
 if(HAVE_STDARG_H)

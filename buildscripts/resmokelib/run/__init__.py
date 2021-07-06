@@ -347,6 +347,10 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
             curator_path, "jasper", "service", "run", "rpc", "--port",
             str(jasper_port)
         ]
+        if sys.platform == "win32" or sys.platform == "cygwin":
+            # If running on windows, we need to add the `--interactive` flag
+            # for jasper to run.
+            jasper_command.append("--interactive")
         self._jasper_server = process.Process(self._resmoke_logger, jasper_command)
         self._jasper_server.start()
         config.JASPER_CONNECTION_STR = jasper_conn_str
@@ -643,6 +647,12 @@ class RunPlugin(PluginInterface):
                   " only tests which have at least one of the specified tags will be"
                   " run."))
 
+        parser.add_argument(
+            "--includeWithAllTags", action="append", dest="include_with_all_tags",
+            metavar="TAG1,TAG2",
+            help=("Comma separated list of tags. For the jstest portion of the suite(s),"
+                  "tests that have all of the specified tags will be run."))
+
         parser.add_argument("-n", action="store_const", const="tests", dest="dry_run",
                             help="Outputs the tests that would be run.")
 
@@ -727,14 +737,6 @@ class RunPlugin(PluginInterface):
         parser.add_argument("--mongo", dest="mongo_executable", metavar="PATH",
                             help="The path to the mongo shell executable for resmoke.py to use.")
 
-        parser.add_argument("--shellReadMode", action="store", dest="shell_read_mode",
-                            choices=("commands", "compatibility", "legacy"), metavar="READ_MODE",
-                            help="The read mode used by the mongo shell.")
-
-        parser.add_argument("--shellWriteMode", action="store", dest="shell_write_mode",
-                            choices=("commands", "compatibility", "legacy"), metavar="WRITE_MODE",
-                            help="The write mode used by the mongo shell.")
-
         parser.add_argument(
             "--shuffle", action="store_const", const="on", dest="shuffle",
             help=("Randomizes the order in which tests are executed. This is equivalent"
@@ -759,6 +761,11 @@ class RunPlugin(PluginInterface):
             " binary version configuration. Specify 'old-new' to configure a replica set with a"
             " 'last-lts' version primary and 'latest' version secondary. For a sharded cluster"
             " with two shards and two replica set nodes each, specify 'old-new-old-new'.")
+
+        parser.add_argument(
+            "--multiversionBinVersion", type=str, dest="multiversion_bin_version",
+            choices=config.MultiversionOptions.all_options(),
+            help="Chose the multiverion binary version as last-lts or last-continous.")
 
         parser.add_argument(
             "--linearChain", action="store", dest="linear_chain", choices=("on", "off"),
@@ -1005,8 +1012,9 @@ class RunPlugin(PluginInterface):
                                        metavar="REVISION_ORDER_ID",
                                        help="Sets the chronological order number of this commit.")
 
-        evergreen_options.add_argument("--tagFile", dest="tag_file", metavar="OPTIONS",
-                                       help="A YAML file that associates tests and tags.")
+        evergreen_options.add_argument("--tagFile", action="append", dest="tag_files",
+                                       metavar="TAG_FILES",
+                                       help="One or more YAML files that associate tests and tags.")
 
         evergreen_options.add_argument(
             "--taskName", dest="task_name", metavar="TASK_NAME",
@@ -1118,6 +1126,13 @@ def to_local_args(input_args=None):  # pylint: disable=too-many-branches,too-man
     origin_suite = getattr(parsed_args, "origin_suite", None)
     if origin_suite is not None:
         setattr(parsed_args, "suite_files", origin_suite)
+
+    # Replace --runAllFeatureFlagTests with an explicit list of feature flags. The former relies on
+    # all_feature_flags.txt which may not exist in the local dev environment.
+    run_all_feature_flag_tests = getattr(parsed_args, "run_all_feature_flag_tests", None)
+    if run_all_feature_flag_tests is not None:
+        setattr(parsed_args, "additional_feature_flags", config.ENABLED_FEATURE_FLAGS)
+        del parsed_args.run_all_feature_flag_tests
 
     # The top-level parser has one subparser that contains all subcommand parsers.
     command_subparser = [

@@ -51,7 +51,7 @@ public:
         const char* end = be + obj.objsize();
         while (*be != 0) {
             auto sv = bson::fieldNameView(be);
-            auto [tag, val] = bson::convertFrom(false, be, end, sv.size());
+            auto [tag, val] = bson::convertFrom<false>(be, end, sv.size());
             be = bson::advance(be, sv.size());
 
             objView->push_back(sv, tag, val);
@@ -239,26 +239,22 @@ public:
         }
 
         auto [expectedTag, expectedVal] =
-            stage_builder::makeValue(BSON_ARRAY(BSON("a"
-                                                     << "one"
-                                                     << "b"
-                                                     << "two"
-                                                     << "c" << 3)
-                                                << BSON("a"
-                                                        << "one"
-                                                        << "c" << 2 << "b"
-                                                        << "two")
-                                                <<
-
-                                                BSON("a"
-                                                     << "one"
-                                                     << "b"
-                                                     << "two"
-                                                     << "c" << 3)
-                                                << BSON("a"
-                                                        << "one"
-                                                        << "c" << 2 << "b"
-                                                        << "two")));
+            stage_builder::makeValue(BSON_ARRAY(BSON("c" << 3 << "a"
+                                                         << "one"
+                                                         << "b"
+                                                         << "two")
+                                                << BSON("c" << 2 << "a"
+                                                            << "one"
+                                                            << "b"
+                                                            << "two")
+                                                << BSON("c" << 3 << "a"
+                                                            << "one"
+                                                            << "b"
+                                                            << "two")
+                                                << BSON("c" << 2 << "a"
+                                                            << "one"
+                                                            << "b"
+                                                            << "two")));
         value::ValueGuard expectedGuard{expectedTag, expectedVal};
 
         inputGuard.reset();

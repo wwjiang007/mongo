@@ -17,6 +17,10 @@ const primary = rst.getPrimary();
 const primaryDb = primary.getDB("test");
 let initialSyncSource = rst.getSecondary();
 
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Add some data to be cloned.
 assert.commandWorked(primaryDb.test.insert([{a: 1}, {b: 2}, {c: 3}]));
 rst.awaitReplication();
@@ -83,6 +87,9 @@ assert.commandWorked(initialSyncNodeDb.adminCommand(
     {configureFailPoint: "hangBeforeStartingOplogFetcher", mode: "off"}));
 assert.commandWorked(initialSyncSource.getDB("admin").adminCommand(
     {configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
+
+// Wait for the fassert to stop the initial sync node.
+assert.eq(MongoRunner.EXIT_ABRUPT, waitMongoProgram(initialSyncNode.port));
 
 // We skip validation and dbhashes because the initial sync failed so the initial sync node is
 // invalid and unreachable.

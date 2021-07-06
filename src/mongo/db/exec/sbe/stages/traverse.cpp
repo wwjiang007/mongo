@@ -144,11 +144,10 @@ void TraverseStage::openInner(value::TypeTags tag, value::Value val) {
 PlanState TraverseStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
-    auto state = _children[0]->getNext();
+    auto state = getNextOuterSide();
     if (state != PlanState::ADVANCED) {
         return trackPlanState(state);
     }
-
     [[maybe_unused]] auto earlyExit = traverse(_inFieldAccessor, &_outFieldOutputAccessor, 0);
 
     return trackPlanState(PlanState::ADVANCED);
@@ -163,8 +162,8 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
 
     if (value::isArray(tag)) {
         // If it is an array then we have to traverse it.
-        value::ArrayAccessor inArrayAccessor;
-        inArrayAccessor.reset(tag, val);
+        auto& inArrayAccessor = _inArrayAccessors.emplace_back(value::ArrayAccessor{});
+        inArrayAccessor.reset(inFieldAccessor);
         value::Array* arrOut{nullptr};
 
         if (!_foldCode) {
@@ -236,14 +235,15 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
                 }
             }
         }
+
+        _inArrayAccessors.pop_back();
     } else {
         // For non-arrays we simply execute the inner side once.
+        outFieldOutputAccessor->reset();
         openInner(tag, val);
         auto state = _children[1]->getNext();
 
-        if (state == PlanState::IS_EOF) {
-            outFieldOutputAccessor->reset();
-        } else {
+        if (state == PlanState::ADVANCED) {
             auto [tag, val] = _outFieldInputAccessor->getViewOfValue();
             // We don't have to copy the value.
             outFieldOutputAccessor->reset(false, tag, val);
@@ -256,7 +256,7 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
 void TraverseStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 
     if (_reOpenInner) {
         _children[1]->close();
@@ -265,6 +265,35 @@ void TraverseStage::close() {
     }
 
     _children[0]->close();
+}
+
+void TraverseStage::doSaveState() {
+    if (_isReadingLeftSide) {
+        // If we yield while reading the left side, there is no need to makeOwned() data held in
+        // the right side, since we will have to re-open it anyway.
+        const bool recursive = true;
+        _children[1]->disableSlotAccess(recursive);
+
+        // As part of reading the left side we're about to reset the out field accessor anyway.
+        // No point in keeping its data around.
+        _outFieldOutputAccessor.reset();
+    }
+
+    if (!slotsAccessible()) {
+        return;
+    }
+
+    _outFieldOutputAccessor.makeOwned();
+}
+
+void TraverseStage::doRestoreState() {
+    if (!slotsAccessible()) {
+        return;
+    }
+
+    for (auto& accessor : _inArrayAccessors) {
+        accessor.refresh();
+    }
 }
 
 std::unique_ptr<PlanStageStats> TraverseStage::getStats(bool includeDebugInfo) const {

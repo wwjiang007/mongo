@@ -99,7 +99,7 @@ std::vector<std::unique_ptr<FieldRef>> parseShardKeyPattern(const BSONObj& keyPa
                               << " can contain at most one 'hashed' field, and/or multiple "
                                  "numerical fields set to a value of 1. Failed to parse field "
                               << patternEl.fieldNameStringData(),
-                (patternEl.isNumber() && patternEl.numberInt() == 1) ||
+                (patternEl.isNumber() && patternEl.safeNumberInt() == 1) ||
                     (isHashedPattern && numHashedFields == 1));
         parsedPaths.emplace_back(std::move(newFieldRef));
     }
@@ -174,6 +174,16 @@ std::pair<BSONElement, bool> extractFieldFromIndexData(
                 // raw document value in other indexes.
                 break;
             }
+        }
+    }
+    return output;
+}
+
+BSONElement extractFieldFromDocumentKey(const BSONObj& documentKey, StringData fieldName) {
+    BSONElement output;
+    for (auto&& documentKeyElt : documentKey) {
+        if (fieldName == documentKeyElt.fieldNameStringData()) {
+            return documentKeyElt;
         }
     }
     return output;
@@ -341,6 +351,44 @@ BSONObj ShardKeyPattern::extractShardKeyFromIndexKeyData(
     }
     dassert(isShardKey(keyBuilder.asTempObj()));
     return keyBuilder.obj();
+}
+
+BSONObj ShardKeyPattern::extractShardKeyFromDocumentKey(const BSONObj& documentKey) const {
+    BSONObjBuilder keyBuilder;
+    for (auto&& shardKeyField : _keyPattern.toBSON()) {
+        auto matchEl =
+            extractFieldFromDocumentKey(documentKey, shardKeyField.fieldNameStringData());
+
+        if (matchEl.eoo()) {
+            matchEl = kNullObj.firstElement();
+        }
+
+        // A shard key field cannot have array values. If we encounter array values return
+        // immediately.
+        if (!isValidShardKeyElementForExtractionFromDocument(matchEl)) {
+            return BSONObj();
+        }
+
+        if (isHashedPatternEl(shardKeyField)) {
+            keyBuilder.append(
+                shardKeyField.fieldNameStringData(),
+                BSONElementHasher::hash64(matchEl, BSONElementHasher::DEFAULT_HASH_SEED));
+        } else {
+            keyBuilder.appendAs(matchEl, shardKeyField.fieldNameStringData());
+        }
+    }
+    dassert(isShardKey(keyBuilder.asTempObj()));
+    return keyBuilder.obj();
+}
+
+BSONObj ShardKeyPattern::extractShardKeyFromDocumentKeyThrows(const BSONObj& documentKey) const {
+    auto shardKey = extractShardKeyFromDocumentKey(documentKey);
+
+    uassert(ErrorCodes::ShardKeyNotFound,
+            "Shard key cannot contain array values or array descendants.",
+            !shardKey.isEmpty());
+
+    return shardKey;
 }
 
 BSONObj ShardKeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {

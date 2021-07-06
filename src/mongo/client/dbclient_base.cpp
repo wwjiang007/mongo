@@ -172,6 +172,55 @@ rpc::UniqueReply DBClientBase::parseCommandReplyMessage(const std::string& host,
     return rpc::UniqueReply(replyMsg, std::move(commandReply));
 }
 
+namespace {
+void appendMetadata(OperationContext* opCtx,
+                    const rpc::RequestMetadataWriter& metadataWriter,
+                    const ClientAPIVersionParameters& apiParameters,
+                    OpMsgRequest& request) {
+
+    if (!metadataWriter && !apiParameters.getVersion()) {
+        return;
+    }
+
+    BSONObjBuilder bob(std::move(request.body));
+    if (metadataWriter) {
+        uassertStatusOK(metadataWriter(opCtx, &bob));
+    }
+
+    if (apiParameters.getVersion()) {
+        bool hasVersion = false, hasStrict = false, hasDeprecationErrors = false;
+        auto i = bob.iterator();
+        while (i.more()) {
+            auto elem = i.next();
+            if (elem.fieldNameStringData() == APIParametersFromClient::kApiVersionFieldName) {
+                hasVersion = true;
+            } else if (elem.fieldNameStringData() == APIParametersFromClient::kApiStrictFieldName) {
+                hasStrict = true;
+            } else if (elem.fieldNameStringData() ==
+                       APIParametersFromClient::kApiDeprecationErrorsFieldName) {
+                hasDeprecationErrors = true;
+            }
+        }
+
+        if (!hasVersion) {
+            bob.append(APIParametersFromClient::kApiVersionFieldName, *apiParameters.getVersion());
+        }
+
+        // Include apiStrict/apiDeprecationErrors if they are not boost::none.
+        if (!hasStrict && apiParameters.getStrict()) {
+            bob.append(APIParametersFromClient::kApiStrictFieldName, *apiParameters.getStrict());
+        }
+
+        if (!hasDeprecationErrors && apiParameters.getDeprecationErrors()) {
+            bob.append(APIParametersFromClient::kApiDeprecationErrorsFieldName,
+                       *apiParameters.getDeprecationErrors());
+        }
+    }
+
+    request.body = bob.obj();
+}
+}  // namespace
+
 DBClientBase* DBClientBase::runFireAndForgetCommand(OpMsgRequest request) {
     // Make sure to reconnect if needed before building our request, since the request depends on
     // the negotiated protocol which can change due to a reconnect.
@@ -184,55 +233,13 @@ DBClientBase* DBClientBase::runFireAndForgetCommand(OpMsgRequest request) {
         return runCommandWithTarget(request).second;
     }
 
-    if (_metadataWriter) {
-        BSONObjBuilder metadataBob(std::move(request.body));
-        uassertStatusOK(
-            _metadataWriter((haveClient() ? cc().getOperationContext() : nullptr), &metadataBob));
-        request.body = metadataBob.obj();
-    }
-
+    auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
+    appendMetadata(opCtx, _metadataWriter, _apiParameters, request);
     auto requestMsg = request.serialize();
     OpMsg::setFlag(&requestMsg, OpMsg::kMoreToCome);
     say(requestMsg);
     return this;
 }
-
-namespace {
-void appendAPIVersionParameters(BSONObjBuilder& bob,
-                                const ClientAPIVersionParameters& apiParameters) {
-    if (!apiParameters.getVersion()) {
-        return;
-    }
-
-    bool hasVersion = false, hasStrict = false, hasDeprecationErrors = false;
-    BSONObjIterator i = bob.iterator();
-    while (i.more()) {
-        auto elem = i.next();
-        if (elem.fieldNameStringData() == APIParametersFromClient::kApiVersionFieldName) {
-            hasVersion = true;
-        } else if (elem.fieldNameStringData() == APIParametersFromClient::kApiStrictFieldName) {
-            hasStrict = true;
-        } else if (elem.fieldNameStringData() ==
-                   APIParametersFromClient::kApiDeprecationErrorsFieldName) {
-            hasDeprecationErrors = true;
-        }
-    }
-
-    if (!hasVersion) {
-        bob.append(APIParametersFromClient::kApiVersionFieldName, *apiParameters.getVersion());
-    }
-
-    // Include apiStrict/apiDeprecationErrors if they are not boost::none.
-    if (!hasStrict && apiParameters.getStrict()) {
-        bob.append(APIParametersFromClient::kApiStrictFieldName, *apiParameters.getStrict());
-    }
-
-    if (!hasDeprecationErrors && apiParameters.getDeprecationErrors()) {
-        bob.append(APIParametersFromClient::kApiDeprecationErrorsFieldName,
-                   *apiParameters.getDeprecationErrors());
-    }
-}
-}  // namespace
 
 std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     OpMsgRequest request) {
@@ -244,16 +251,7 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     auto host = getServerAddress();
 
     auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
-
-    if (_metadataWriter || _apiParameters.getVersion()) {
-        BSONObjBuilder metadataBob(std::move(request.body));
-        if (_metadataWriter) {
-            uassertStatusOK(_metadataWriter(opCtx, &metadataBob));
-        }
-        appendAPIVersionParameters(metadataBob, _apiParameters);
-        request.body = metadataBob.obj();
-    }
-
+    appendMetadata(opCtx, _metadataWriter, _apiParameters, request);
     auto requestMsg =
         rpc::messageFromOpMsgRequest(getClientRPCProtocols(), getServerRPCProtocols(), request);
 
@@ -403,63 +401,6 @@ BSONObj DBClientBase::_countCmd(const NamespaceStringOrUUID nsOrUuid,
     return b.obj();
 }
 
-BSONObj DBClientBase::getLastErrorDetailed(bool fsync, bool j, int w, int wtimeout) {
-    return getLastErrorDetailed("admin", fsync, j, w, wtimeout);
-}
-
-BSONObj DBClientBase::getLastErrorDetailed(
-    const std::string& db, bool fsync, bool j, int w, int wtimeout) {
-    BSONObj info;
-    BSONObjBuilder b;
-    b.append("getlasterror", 1);
-
-    if (fsync)
-        b.append("fsync", 1);
-    if (j)
-        b.append("j", 1);
-
-    // only affects request when greater than one node
-    if (w >= 1)
-        b.append("w", w);
-    else if (w == -1)
-        b.append("w", "majority");
-
-    if (wtimeout > 0)
-        b.append("wtimeout", wtimeout);
-
-    runCommand(db, b.obj(), info);
-
-    return info;
-}
-
-string DBClientBase::getLastError(bool fsync, bool j, int w, int wtimeout) {
-    return getLastError("admin", fsync, j, w, wtimeout);
-}
-
-string DBClientBase::getLastError(const std::string& db, bool fsync, bool j, int w, int wtimeout) {
-    BSONObj info = getLastErrorDetailed(db, fsync, j, w, wtimeout);
-    return getLastErrorString(info);
-}
-
-string DBClientBase::getLastErrorString(const BSONObj& info) {
-    if (info["ok"].trueValue()) {
-        BSONElement e = info["err"];
-        if (e.eoo())
-            return "";
-        if (e.type() == Object)
-            return e.toString();
-        return e.str();
-    } else {
-        // command failure
-        BSONElement e = info["errmsg"];
-        if (e.eoo())
-            return "";
-        if (e.type() == Object)
-            return "getLastError command failed: " + e.toString();
-        return "getLastError command failed: " + e.str();
-    }
-}
-
 string DBClientBase::createPasswordDigest(const string& username, const string& clearTextPassword) {
     return mongo::createPasswordDigest(username, clearTextPassword);
 }
@@ -582,7 +523,7 @@ void DBClientBase::logout(const string& dbname, BSONObj& info) {
 
 bool DBClientBase::isPrimary(bool& isPrimary, BSONObj* info) {
     BSONObjBuilder bob;
-    bob.append("ismaster", 1);
+    bob.append(_apiParameters.getVersion() ? "hello" : "ismaster", 1);
     if (auto wireSpec = WireSpec::instance().get(); wireSpec->isInternalClient) {
         WireSpec::appendInternalClientWireVersion(wireSpec->outgoing, &bob);
     }
@@ -591,7 +532,8 @@ bool DBClientBase::isPrimary(bool& isPrimary, BSONObj* info) {
     if (info == nullptr)
         info = &o;
     bool ok = runCommand("admin", bob.obj(), *info);
-    isPrimary = info->getField("ismaster").trueValue();
+    isPrimary =
+        info->getField(_apiParameters.getVersion() ? "isWritablePrimary" : "ismaster").trueValue();
     return ok;
 }
 
@@ -880,17 +822,11 @@ unsigned long long DBClientBase::query(std::function<void(DBClientCursorBatchIte
     return n;
 }
 
-void DBClientBase::insert(const string& ns,
-                          BSONObj obj,
-                          int flags,
-                          boost::optional<BSONObj> writeConcernObj) {
-    insert(ns, std::vector<BSONObj>{obj}, flags, writeConcernObj);
-}
-
-void DBClientBase::insert(const string& ns,
-                          const vector<BSONObj>& v,
-                          int flags,
-                          boost::optional<BSONObj> writeConcernObj) {
+namespace {
+OpMsgRequest createInsertRequest(const string& ns,
+                                 const vector<BSONObj>& v,
+                                 int flags,
+                                 boost::optional<BSONObj> writeConcernObj) {
     bool ordered = !(flags & InsertOption_ContinueOnError);
     auto nss = NamespaceString(ns);
     BSONObjBuilder cmdBuilder;
@@ -902,33 +838,15 @@ void DBClientBase::insert(const string& ns,
     auto request = OpMsgRequest::fromDBAndBody(nss.db(), cmdBuilder.obj());
     request.sequences.push_back({"documents", v});
 
-    runFireAndForgetCommand(std::move(request));
+    return request;
 }
 
-void DBClientBase::remove(const string& ns,
-                          Query obj,
-                          int flags,
-                          boost::optional<BSONObj> writeConcernObj) {
-    int limit = (flags & RemoveOption_JustOne) ? 1 : 0;
-    auto nss = NamespaceString(ns);
-
-    BSONObjBuilder cmdBuilder;
-    cmdBuilder.append("delete", nss.coll());
-    if (writeConcernObj) {
-        cmdBuilder.append(WriteConcernOptions::kWriteConcernField, *writeConcernObj);
-    }
-    auto request = OpMsgRequest::fromDBAndBody(nss.db(), cmdBuilder.obj());
-    request.sequences.push_back({"deletes", {BSON("q" << obj.obj << "limit" << limit)}});
-
-    runFireAndForgetCommand(std::move(request));
-}
-
-void DBClientBase::update(const string& ns,
-                          Query query,
-                          BSONObj obj,
-                          bool upsert,
-                          bool multi,
-                          boost::optional<BSONObj> writeConcernObj) {
+OpMsgRequest createUpdateRequest(const string& ns,
+                                 Query query,
+                                 BSONObj obj,
+                                 bool upsert,
+                                 bool multi,
+                                 boost::optional<BSONObj> writeConcernObj) {
     auto nss = NamespaceString(ns);
 
     BSONObjBuilder cmdBuilder;
@@ -941,6 +859,87 @@ void DBClientBase::update(const string& ns,
         {"updates",
          {BSON("q" << query.obj << "u" << obj << "upsert" << upsert << "multi" << multi)}});
 
+    return request;
+}
+
+OpMsgRequest createRemoveRequest(const string& ns,
+                                 Query obj,
+                                 int flags,
+                                 boost::optional<BSONObj> writeConcernObj) {
+    int limit = (flags & RemoveOption_JustOne) ? 1 : 0;
+    auto nss = NamespaceString(ns);
+
+    BSONObjBuilder cmdBuilder;
+    cmdBuilder.append("delete", nss.coll());
+    if (writeConcernObj) {
+        cmdBuilder.append(WriteConcernOptions::kWriteConcernField, *writeConcernObj);
+    }
+    auto request = OpMsgRequest::fromDBAndBody(nss.db(), cmdBuilder.obj());
+    request.sequences.push_back({"deletes", {BSON("q" << obj.obj << "limit" << limit)}});
+
+    return request;
+}
+}  // namespace
+
+BSONObj DBClientBase::insertAcknowledged(const string& ns,
+                                         const vector<BSONObj>& v,
+                                         int flags,
+                                         boost::optional<BSONObj> writeConcernObj) {
+    OpMsgRequest request = createInsertRequest(ns, v, flags, writeConcernObj);
+    rpc::UniqueReply reply = runCommand(std::move(request));
+    return reply->getCommandReply();
+}
+
+void DBClientBase::insert(const string& ns,
+                          BSONObj obj,
+                          int flags,
+                          boost::optional<BSONObj> writeConcernObj) {
+    insert(ns, std::vector<BSONObj>{obj}, flags, writeConcernObj);
+}
+
+void DBClientBase::insert(const string& ns,
+                          const vector<BSONObj>& v,
+                          int flags,
+                          boost::optional<BSONObj> writeConcernObj) {
+    auto request = createInsertRequest(ns, v, flags, writeConcernObj);
+    runFireAndForgetCommand(std::move(request));
+}
+
+BSONObj DBClientBase::removeAcknowledged(const string& ns,
+                                         Query obj,
+                                         int flags,
+                                         boost::optional<BSONObj> writeConcernObj) {
+    OpMsgRequest request = createRemoveRequest(ns, obj, flags, writeConcernObj);
+    rpc::UniqueReply reply = runCommand(std::move(request));
+    return reply->getCommandReply();
+}
+
+void DBClientBase::remove(const string& ns,
+                          Query obj,
+                          int flags,
+                          boost::optional<BSONObj> writeConcernObj) {
+    auto request = createRemoveRequest(ns, obj, flags, writeConcernObj);
+    runFireAndForgetCommand(std::move(request));
+}
+
+BSONObj DBClientBase::updateAcknowledged(const string& ns,
+                                         Query query,
+                                         BSONObj obj,
+                                         bool upsert,
+                                         bool multi,
+                                         boost::optional<BSONObj> writeConcernObj) {
+    auto request = createUpdateRequest(ns, query, obj, upsert, multi, writeConcernObj);
+    rpc::UniqueReply reply = runCommand(std::move(request));
+    return reply->getCommandReply();
+}
+
+void DBClientBase::update(const string& ns,
+                          Query query,
+                          BSONObj obj,
+                          bool upsert,
+                          bool multi,
+                          boost::optional<BSONObj> writeConcernObj) {
+    auto request = createUpdateRequest(ns, query, obj, upsert, multi, writeConcernObj);
     runFireAndForgetCommand(std::move(request));
 }
 

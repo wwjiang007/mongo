@@ -49,7 +49,7 @@ DatabaseVersion DatabaseVersion::makeUpdated() const {
 }
 
 ComparableDatabaseVersion ComparableDatabaseVersion::makeComparableDatabaseVersion(
-    const DatabaseVersion& version) {
+    const boost::optional<DatabaseVersion>& version) {
     return ComparableDatabaseVersion(version,
                                      _uuidDisambiguatingSequenceNumSource.fetchAndAdd(1),
                                      _forcedRefreshSequenceNumSource.load());
@@ -62,11 +62,8 @@ ComparableDatabaseVersion::makeComparableDatabaseVersionForForcedRefresh() {
                                      _forcedRefreshSequenceNumSource.addAndFetch(2) - 1);
 }
 
-ComparableDatabaseVersion ComparableDatabaseVersion::makeComparableDatabaseVersionForForcedRefresh(
-    const DatabaseVersion& version) {
-    return ComparableDatabaseVersion(version,
-                                     _uuidDisambiguatingSequenceNumSource.fetchAndAdd(1),
-                                     _forcedRefreshSequenceNumSource.addAndFetch(1));
+void ComparableDatabaseVersion::setDatabaseVersion(const DatabaseVersion& version) {
+    _dbVersion = version;
 }
 
 BSONObj ComparableDatabaseVersion::toBSONForLogging() const {

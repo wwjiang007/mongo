@@ -169,7 +169,9 @@ public:
      */
     virtual Status createCollection(OperationContext* opCtx,
                                     const NamespaceString& nss,
-                                    const CollectionOptions& options) = 0;
+                                    const CollectionOptions& options,
+                                    const bool createIdIndex = true,
+                                    const BSONObj& idIndexSpec = BSONObj()) = 0;
 
     /**
      * Creates all the specified non-_id indexes on a given collection, which must be empty.
@@ -486,6 +488,14 @@ public:
      * Returns the read timestamp of the recovery unit of the given operation context.
      */
     virtual Timestamp getPointInTimeReadTimestamp(OperationContext* opCtx) const = 0;
+
+    /**
+     * Prevents oplog history at 'pinnedTimestamp' and later from being truncated. Setting
+     * Timestamp::max() effectively nullifies the pin because no oplog truncation will be stopped by
+     * it.
+     */
+    virtual void setPinnedOplogTimestamp(OperationContext* opCtx,
+                                         const Timestamp& pinnedTimestamp) const = 0;
 };
 
 }  // namespace repl

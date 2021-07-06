@@ -118,8 +118,16 @@ private:
 };
 
 
-// Global lock manager instance.
-LockManager globalLockManager;
+// Provide backwards compatibility for debugger scripts that expect a 'globalLockManager' variable
+// in the anonymous namespace. See buildscripts/gdb/mongo.py and buildscripts/lldb/lldb_commands.py.
+[[maybe_unused]] struct {
+    void dump() {
+        auto serviceContext = getGlobalServiceContext();
+        invariant(serviceContext);
+        auto lockManager = LockManager::get(serviceContext);
+        lockManager->dump();
+    }
+} globalLockManager;
 
 // How often (in millis) to check for deadlock if a lock has not been granted for some time
 const Milliseconds MaxWaitTime = Milliseconds(500);
@@ -222,6 +230,21 @@ void LockerImpl::dump() const {
           "requests"_attr = entries);
 }
 
+void LockerImpl::_dumpLockerAndLockManagerRequests() {
+    // Log the _requests that this locker holds. This will provide identifying information to cross
+    // reference with the LockManager dump below for extra information.
+    dump();
+
+    // Log the LockManager's lock information. Given the locker 'dump()' above, we should be able to
+    // easily cross reference to find the lock info matching this operation. The LockManager can
+    // safely access (under internal locks) the LockRequest data that the locker cannot.
+    BSONObjBuilder builder;
+    auto lockToClientMap = LockManager::getLockToClientMap(getGlobalServiceContext());
+    getGlobalLockManager()->getLockInfoBSON(lockToClientMap, &builder);
+    auto lockInfo = builder.done();
+    LOGV2_ERROR(5736000, "Operation ending while holding locks.", "LockInfo"_attr = lockInfo);
+}
+
 
 //
 // CondVarLockGrantNotification
@@ -303,7 +326,12 @@ LockerImpl::~LockerImpl() {
     // to delete with unaccounted locks anyways.
     invariant(!inAWriteUnitOfWork());
     invariant(_numResourcesToUnlockAtEndUnitOfWork == 0);
+
+    if (!_requests.empty()) {
+        _dumpLockerAndLockManagerRequests();
+    }
     invariant(_requests.empty());
+
     invariant(_modeForTicket == MODE_NONE);
 
     // Reset the locking statistics so the object can be reused
@@ -537,7 +565,7 @@ void LockerImpl::lock(OperationContext* opCtx, ResourceId resId, LockMode mode, 
 
 void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
     LockRequestsMap::Iterator it = _requests.find(resId);
-    globalLockManager.downgrade(it.objAddr(), newMode);
+    getGlobalLockManager()->downgrade(it.objAddr(), newMode);
 }
 
 bool LockerImpl::unlock(ResourceId resId) {
@@ -876,8 +904,8 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
     // otherwise we might reset state if the lock becomes granted very fast.
     _notify.clear();
 
-    LockResult result = isNew ? globalLockManager.lock(resId, request, mode)
-                              : globalLockManager.convert(resId, request, mode);
+    LockResult result = isNew ? getGlobalLockManager()->lock(resId, request, mode)
+                              : getGlobalLockManager()->convert(resId, request, mode);
 
     if (result == LOCK_WAITING) {
         globalStats.recordWait(_id, resId, mode);
@@ -1042,7 +1070,7 @@ void LockerImpl::_releaseTicket() {
 }
 
 bool LockerImpl::_unlockImpl(LockRequestsMap::Iterator* it) {
-    if (globalLockManager.unlock(it->objAddr())) {
+    if (getGlobalLockManager()->unlock(it->objAddr())) {
         if (it->key() == resourceIdGlobal) {
             invariant(_modeForTicket != MODE_NONE);
 
@@ -1097,13 +1125,14 @@ public:
 } unusedLockCleaner;
 }  // namespace
 
-
 //
 // Standalone functions
 //
 
 LockManager* getGlobalLockManager() {
-    return &globalLockManager;
+    auto serviceContext = getGlobalServiceContext();
+    invariant(serviceContext);
+    return LockManager::get(serviceContext);
 }
 
 void reportGlobalLockingStats(SingleThreadedLockStats* outStats) {

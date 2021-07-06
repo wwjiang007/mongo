@@ -43,16 +43,10 @@ using boost::intrusive_ptr;
 
 REGISTER_ACCUMULATOR(max, genericParseSingleExpressionAccumulator<AccumulatorMax>);
 REGISTER_ACCUMULATOR(min, genericParseSingleExpressionAccumulator<AccumulatorMin>);
-REGISTER_EXPRESSION(max, ExpressionFromAccumulator<AccumulatorMax>::parse);
-REGISTER_EXPRESSION(min, ExpressionFromAccumulator<AccumulatorMin>::parse);
+REGISTER_STABLE_EXPRESSION(max, ExpressionFromAccumulator<AccumulatorMax>::parse);
+REGISTER_STABLE_EXPRESSION(min, ExpressionFromAccumulator<AccumulatorMin>::parse);
 REGISTER_REMOVABLE_WINDOW_FUNCTION(max, AccumulatorMax, WindowFunctionMax);
 REGISTER_REMOVABLE_WINDOW_FUNCTION(min, AccumulatorMin, WindowFunctionMin);
-
-const char* AccumulatorMinMax::getOpName() const {
-    if (_sense == Sense::kMin)
-        return "$min";
-    return "$max";
-}
 
 void AccumulatorMinMax::processInternal(const Value& input, bool merging) {
     // nullish values should have no impact on result

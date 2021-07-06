@@ -32,10 +32,10 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/views/view.h"
 
 namespace mongo {
@@ -398,38 +398,6 @@ private:
 LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode);
 
 /**
- * RAII-style class, which acquires a lock on the specified database in the requested mode and
- * obtains a reference to the database, creating it was non-existing. Used as a shortcut for
- * calls to DatabaseHolder::get(opCtx)->openDb(), taking care of locking details. The
- * requested mode must be MODE_IX or MODE_X.
- *
- * Use this when you are about to perform a write, and want to create the database if it doesn't
- * already exist.
- *
- * It is guaranteed that locks will be released when this object goes out of scope, therefore
- * the database reference returned by this class should not be retained.
- */
-class AutoGetOrCreateDb {
-    AutoGetOrCreateDb(const AutoGetOrCreateDb&) = delete;
-    AutoGetOrCreateDb& operator=(const AutoGetOrCreateDb&) = delete;
-
-public:
-    AutoGetOrCreateDb(OperationContext* opCtx,
-                      StringData dbName,
-                      LockMode mode,
-                      Date_t deadline = Date_t::max());
-
-    Database* getDb() const {
-        return _db;
-    }
-
-private:
-    AutoGetDb _autoDb;
-
-    Database* _db;
-};
-
-/**
  * RAII type to set and restore the timestamp read source on the recovery unit.
  *
  * Snapshot is abandoned in constructor and destructor, so it can only be used before
@@ -476,7 +444,7 @@ public:
     /**
      * Return a pointer to the per-service-context LocalOplogInfo.
      */
-    repl::LocalOplogInfo* getOplogInfo() const {
+    LocalOplogInfo* getOplogInfo() const {
         return _oplogInfo;
     }
 
@@ -493,7 +461,7 @@ private:
     boost::optional<Lock::GlobalLock> _globalLock;
     boost::optional<Lock::DBLock> _dbWriteLock;
     boost::optional<Lock::CollectionLock> _collWriteLock;
-    repl::LocalOplogInfo* _oplogInfo;
+    LocalOplogInfo* _oplogInfo;
     const CollectionPtr* _oplog;
 };
 

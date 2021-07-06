@@ -273,6 +273,7 @@ public:
                             const BSONObj& idIndex,
                             const OplogSlot& createOpTime) override;
 
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -520,6 +521,12 @@ TEST_F(MapReduceCommandTest, PrimaryStepDownPreventsTemporaryCollectionDrops) {
 }
 
 TEST_F(MapReduceCommandTest, ReplacingExistingOutputCollectionPreservesIndexes) {
+    // TODO (SERVER-57194): enable lock-free reads.
+    bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+    storageGlobalParams.disableLockFreeReads = true;
+    ON_BLOCK_EXIT(
+        [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
     CollectionOptions options;
     options.uuid = UUID::gen();
     ASSERT_OK(_storage.createCollection(_opCtx.get(), outputNss, options));
@@ -536,7 +543,7 @@ TEST_F(MapReduceCommandTest, ReplacingExistingOutputCollectionPreservesIndexes) 
                 WriteUnitOfWork wuow(_opCtx.get());
                 ASSERT_OK(
                     coll.getWritableCollection()->getIndexCatalog()->createIndexOnEmptyCollection(
-                        _opCtx.get(), indexSpec));
+                        _opCtx.get(), coll.getWritableCollection(), indexSpec));
                 wuow.commit();
             });
     }

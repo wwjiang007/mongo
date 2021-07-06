@@ -58,6 +58,7 @@
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/stage_builder_util.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
@@ -75,7 +76,7 @@ using std::vector;
 static const NamespaceString nss("unittests.QueryStageMultiPlan");
 
 std::unique_ptr<QuerySolution> createQuerySolution() {
-    auto soln = std::make_unique<QuerySolution>(QueryPlannerParams::Options::DEFAULT);
+    auto soln = std::make_unique<QuerySolution>();
     soln->cacheData = std::make_unique<SolutionCacheData>();
     soln->cacheData->solnType = SolutionCacheData::COLLSCAN_SOLN;
     soln->cacheData->tree = std::make_unique<PlanCacheIndexTree>();
@@ -147,7 +148,7 @@ unique_ptr<PlanStage> getIxScanPlan(ExpressionContext* expCtx,
         expCtx->opCtx, BSON("foo" << 1), false, &indexes);
     ASSERT_EQ(indexes.size(), 1U);
 
-    IndexScanParams ixparams(expCtx->opCtx, indexes[0]);
+    IndexScanParams ixparams(expCtx->opCtx, coll, indexes[0]);
     ixparams.bounds.isSimpleRange = true;
     ixparams.bounds.startKey = BSON("" << desiredFooValue);
     ixparams.bounds.endKey = BSON("" << desiredFooValue);
@@ -423,12 +424,12 @@ TEST_F(QueryStageMultiPlanTest, MPSBackupPlan) {
 
     // We should have picked the index intersection plan due to forcing ixisect.
     auto soln = static_cast<const MultiPlanStage*>(mps.get())->bestSolution();
-    ASSERT(
-        QueryPlannerTestLib::solutionMatches("{sort: {pattern: {b: 1}, limit: 0, node:"
-                                             "{fetch: {node: {andSorted: {nodes: ["
-                                             "{ixscan: {filter: null, pattern: {a:1}}},"
-                                             "{ixscan: {filter: null, pattern: {b:1}}}]}}}}}}",
-                                             soln->root()));
+    ASSERT(QueryPlannerTestLib::solutionMatches("{sort: {pattern: {b: 1}, limit: 0, node:"
+                                                "{fetch: {node: {andSorted: {nodes: ["
+                                                "{ixscan: {filter: null, pattern: {a:1}}},"
+                                                "{ixscan: {filter: null, pattern: {b:1}}}]}}}}}}",
+                                                soln->root())
+               .isOK());
 
     // Get the resulting document.
     PlanStage::StageState state = PlanStage::NEED_TIME;
@@ -447,12 +448,12 @@ TEST_F(QueryStageMultiPlanTest, MPSBackupPlan) {
     // and the winning plan should still be the index intersection one.
     ASSERT(!mps->hasBackupPlan());
     soln = static_cast<const MultiPlanStage*>(mps.get())->bestSolution();
-    ASSERT(
-        QueryPlannerTestLib::solutionMatches("{sort: {pattern: {b: 1}, limit: 0, node:"
-                                             "{fetch: {node: {andSorted: {nodes: ["
-                                             "{ixscan: {filter: null, pattern: {a:1}}},"
-                                             "{ixscan: {filter: null, pattern: {b:1}}}]}}}}}}",
-                                             soln->root()));
+    ASSERT(QueryPlannerTestLib::solutionMatches("{sort: {pattern: {b: 1}, limit: 0, node:"
+                                                "{fetch: {node: {andSorted: {nodes: ["
+                                                "{ixscan: {filter: null, pattern: {a:1}}},"
+                                                "{ixscan: {filter: null, pattern: {b:1}}}]}}}}}}",
+                                                soln->root())
+               .isOK());
 
     // Restore index intersection force parameter.
     internalQueryForceIntersectionPlans.store(forceIxisectOldValue);
@@ -498,12 +499,8 @@ TEST_F(QueryStageMultiPlanTest, MPSExplainAllPlans) {
         std::make_unique<MultiPlanStage>(_expCtx.get(), ctx.getCollection(), cq.get());
 
     // Put each plan into the MultiPlanStage. Takes ownership of 'firstPlan' and 'secondPlan'.
-    mps->addPlan(std::make_unique<QuerySolution>(QueryPlannerParams::Options::DEFAULT),
-                 std::move(firstPlan),
-                 ws.get());
-    mps->addPlan(std::make_unique<QuerySolution>(QueryPlannerParams::Options::DEFAULT),
-                 std::move(secondPlan),
-                 ws.get());
+    mps->addPlan(std::make_unique<QuerySolution>(), std::move(firstPlan), ws.get());
+    mps->addPlan(std::make_unique<QuerySolution>(), std::move(secondPlan), ws.get());
 
     // Making a PlanExecutor chooses the best plan.
     auto exec = uassertStatusOK(plan_executor_factory::make(_expCtx,
@@ -550,12 +547,8 @@ TEST_F(QueryStageMultiPlanTest, MPSExplainAllPlans) {
 //
 // This is a regression test for SERVER-20111.
 TEST_F(QueryStageMultiPlanTest, MPSSummaryStats) {
-    // Bail out and do not run the tests if using the SBE engine.
-    // TODO: SERVER-55163 once the feature flag is removed we should use the query configuration
-    // knob to force the use of classic engine.
-    if (feature_flags::gSBE.isEnabledAndIgnoreFCV()) {
-        return;
-    }
+    RAIIServerParameterControllerForTest controller("internalQueryEnableSlotBasedExecutionEngine",
+                                                    false);
 
     const int N = 5000;
     for (int i = 0; i < N; ++i) {

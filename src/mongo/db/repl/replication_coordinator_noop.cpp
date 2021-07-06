@@ -37,8 +37,8 @@ namespace repl {
 ReplicationCoordinatorNoOp::ReplicationCoordinatorNoOp(ServiceContext* service)
     : _service(service) {}
 
-void ReplicationCoordinatorNoOp::startup(
-    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {}
+void ReplicationCoordinatorNoOp::startup(OperationContext* opCtx,
+                                         StorageEngine::LastShutdownState lastShutdownState) {}
 
 void ReplicationCoordinatorNoOp::enterTerminalShutdown() {}
 
@@ -173,7 +173,7 @@ Seconds ReplicationCoordinatorNoOp::getSecondaryDelaySecs() const {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::clearSyncSourceBlacklist() {
+void ReplicationCoordinatorNoOp::clearSyncSourceDenylist() {
     MONGO_UNREACHABLE;
 }
 
@@ -298,6 +298,55 @@ ReplSetConfig ReplicationCoordinatorNoOp::getConfig() const {
     MONGO_UNREACHABLE;
 }
 
+ConnectionString ReplicationCoordinatorNoOp::getConfigConnectionString() const {
+    MONGO_UNREACHABLE;
+}
+
+Milliseconds ReplicationCoordinatorNoOp::getConfigElectionTimeoutPeriod() const {
+    MONGO_UNREACHABLE;
+}
+
+std::vector<MemberConfig> ReplicationCoordinatorNoOp::getConfigVotingMembers() const {
+    MONGO_UNREACHABLE;
+}
+
+std::int64_t ReplicationCoordinatorNoOp::getConfigTerm() const {
+    MONGO_UNREACHABLE;
+}
+
+std::int64_t ReplicationCoordinatorNoOp::getConfigVersion() const {
+    MONGO_UNREACHABLE;
+}
+
+ConfigVersionAndTerm ReplicationCoordinatorNoOp::getConfigVersionAndTerm() const {
+    MONGO_UNREACHABLE;
+}
+
+int ReplicationCoordinatorNoOp::getConfigNumMembers() const {
+    MONGO_UNREACHABLE;
+}
+
+Milliseconds ReplicationCoordinatorNoOp::getConfigHeartbeatTimeoutPeriodMillis() const {
+    MONGO_UNREACHABLE;
+}
+
+BSONObj ReplicationCoordinatorNoOp::getConfigBSON() const {
+    MONGO_UNREACHABLE;
+}
+
+const MemberConfig* ReplicationCoordinatorNoOp::findConfigMemberByHostAndPort(
+    const HostAndPort& hap) const {
+    MONGO_UNREACHABLE;
+}
+
+bool ReplicationCoordinatorNoOp::isConfigLocalHostAllowed() const {
+    MONGO_UNREACHABLE;
+}
+
+Milliseconds ReplicationCoordinatorNoOp::getConfigHeartbeatInterval() const {
+    MONGO_UNREACHABLE;
+}
+
 void ReplicationCoordinatorNoOp::processReplSetGetConfig(BSONObjBuilder* result,
                                                          bool commitmentStatus,
                                                          bool includeNewlyAdded) {
@@ -393,7 +442,7 @@ HostAndPort ReplicationCoordinatorNoOp::chooseNewSyncSource(const OpTime&) {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::blacklistSyncSource(const HostAndPort&, Date_t) {
+void ReplicationCoordinatorNoOp::denylistSyncSource(const HostAndPort&, Date_t) {
     MONGO_UNREACHABLE;
 }
 

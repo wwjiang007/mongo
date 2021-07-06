@@ -34,6 +34,7 @@
 #include "mongo/db/service_entry_point_mongod.h"
 
 #include "mongo/db/commands/fsync_locked.h"
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -75,8 +76,10 @@ public:
     void waitForReadConcern(OperationContext* opCtx,
                             const CommandInvocation* invocation,
                             const OpMsgRequest& request) const override {
-        Status rcStatus = mongo::waitForReadConcern(
-            opCtx, repl::ReadConcernArgs::get(opCtx), invocation->allowsAfterClusterTime());
+        Status rcStatus = mongo::waitForReadConcern(opCtx,
+                                                    repl::ReadConcernArgs::get(opCtx),
+                                                    request.getDatabase(),
+                                                    invocation->allowsAfterClusterTime());
 
         if (!rcStatus.isOK()) {
             if (ErrorCodes::isExceededTimeLimitError(rcStatus.code())) {
@@ -239,6 +242,18 @@ public:
             ->catalogCache()
             ->getCollectionRoutingInfo(opCtx, refreshInfo.getNss())
             .isOK();
+    }
+
+    // The refreshDatabase, refreshCollection, and refreshCatalogCache methods may have modified the
+    // locker state, in particular the flags which say if the operation took a write lock or shared
+    // lock.  This will cause mongod to perhaps erroneously check for write concern when no writes
+    // were done, or unnecessarily kill a read operation.  If we re-use the opCtx to retry command
+    // execution, we must reset the locker state.
+    void resetLockerState(OperationContext* opCtx) const noexcept override {
+        // It is necessary to lock the client to change the Locker on the OperationContext.
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        invariant(!opCtx->lockState()->isLocked());
+        opCtx->swapLockState(std::make_unique<LockerImpl>(), lk);
     }
 
     void advanceConfigOpTimeFromRequestMetadata(OperationContext* opCtx) const override {

@@ -141,7 +141,7 @@ selector:
   # ShardingTest is never used, so continuous step down thread never starts
   - jstests/sharding/config_rs_change.js
   - jstests/sharding/empty_cluster_init.js
-  # Temporarily blacklisted until more robust
+  # Temporarily denylisted until more robust
   # Expects same secondaries for entire test
   - jstests/sharding/commands_that_write_accept_wc_configRS.js
   - jstests/sharding/commands_that_write_accept_wc_shards.js
@@ -197,7 +197,7 @@ selector:
   # In this suite the cluster may end up in a state where each shard believes the
   # collection is sharded and the mongos believes it is unsharded. $merge is not
   # prepared to work correctly in this situation. This should be fixed by a future
-  # improvement in sharding infrastructure, and can be unblacklisted by SERVER-40172.
+  # improvement in sharding infrastructure, and can be undenylisted by SERVER-40172.
   - jstests/sharding/query/merge_to_existing.js
   # Sets a failpoint on find commands which can lead to a hang when a config steps down.
   - jstests/sharding/sharding_statistics_server_status.js
@@ -211,6 +211,7 @@ selector:
   - jstests/sharding/refine_collection_shard_key_changelog.js
   # This is expected to fail if the config server steps down during moveChunk.
   - jstests/sharding/index_operations_abort_concurrent_outgoing_migrations.js
+  - jstests/sharding/move_chunk_critical_section_non_internal_client_abort.js
   # Runs commands on mongos which target the primary configsvr, and then checks the outcome using
   # profiling/logging (on the configsvr primary), so cannot tolerate the configsvr primary changing.
   - jstests/sharding/read_write_concern_defaults_application.js
@@ -233,7 +234,7 @@ selector:
   - jstests/sharding/mongos_get_shard_version.js
 
   exclude_with_any_tags:
-  - does_not_support_config_stepdowns
+  - does_not_support_stepdowns
 
 executor:
   config:
@@ -245,4 +246,3 @@ executor:
           skipCheckOrphans: true
       eval: "load('jstests/libs/override_methods/sharding_continuous_config_stepdown.js');"
       nodb: ''
-      readMode: commands

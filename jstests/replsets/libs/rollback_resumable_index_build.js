@@ -41,7 +41,7 @@ const RollbackResumableIndexBuildTest = class {
      *   case all index builds will be expected to resume from that phase, or it must be exactly
      *   the length of 'indexSpecs'.
      *
-     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAferResume' and
+     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAfterResume' and
      *   'skippedPhaseLogID'. The former is used to verify that the index build scanned the expected
      *   number of documents in the collection scan after resuming. The latter is used for phases
      *   which do not perform a collection scan after resuming, to verify that the index build did
@@ -80,11 +80,6 @@ const RollbackResumableIndexBuildTest = class {
                sideWrites = [],
                {shouldComplete = true, skipDataConsistencyChecks = false} = {}) {
         const originalPrimary = rollbackTest.getPrimary();
-
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(originalPrimary)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
 
         rollbackTest.awaitLastOpCommitted();
 
@@ -258,11 +253,6 @@ const RollbackResumableIndexBuildTest = class {
         rollbackTest, dbName, docs, indexSpec, insertsToBeRolledBack, sideWrites = []) {
         const originalPrimary = rollbackTest.getPrimary();
 
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(originalPrimary)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
-
         const fp1 = configureFailPoint(originalPrimary, "hangAfterIndexBuildDumpsInsertsFromBulk");
         const fp2 = configureFailPoint(originalPrimary, "hangAfterIndexBuildFirstDrain");
 
@@ -281,7 +271,7 @@ const RollbackResumableIndexBuildTest = class {
             0,  // rollbackEndFailPointsIteration
             ["setYieldAllLocksHang"],
             ["collection scan"],
-            [{numScannedAferResume: docs.length - 1}],
+            [{numScannedAfterResume: docs.length - 1}],
             insertsToBeRolledBack,
             sideWrites,
             {shouldComplete: false});

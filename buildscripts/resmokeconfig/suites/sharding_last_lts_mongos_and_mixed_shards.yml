@@ -11,6 +11,7 @@ selector:
   - requires_fcv_48
   - requires_fcv_49
   - requires_fcv_50
+  - requires_fcv_51
   - backport_required_multiversion
   - sharding_last_lts_mongos_and_mixed_shards_backport_required_multiversion
   exclude_files:
@@ -25,8 +26,6 @@ selector:
   - jstests/sharding/query/merge_stale_on_fields.js
   - jstests/sharding/refresh_sessions.js
   - jstests/sharding/query/lookup.js
-  # Enable when 5.0 becomes last-lts
-  - jstests/sharding/mongos_dataSize.js
   - jstests/sharding/query/merge_command_options.js
   - jstests/sharding/max_time_ms_enforced_on_shard.js
   # Enable when SERVER-44733 is backported

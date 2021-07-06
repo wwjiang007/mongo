@@ -47,6 +47,7 @@ ReshardingOplogBatchApplier::ReshardingOplogBatchApplier(
     const ReshardingOplogSessionApplication& sessionApplication)
     : _crudApplication(crudApplication), _sessionApplication(sessionApplication) {}
 
+template <bool IsForSessionApplication>
 SemiFuture<void> ReshardingOplogBatchApplier::applyBatch(
     OplogBatch batch,
     std::shared_ptr<executor::TaskExecutor> executor,
@@ -60,26 +61,29 @@ SemiFuture<void> ReshardingOplogBatchApplier::applyBatch(
     auto chainCtx = std::make_shared<ChainContext>();
     chainCtx->batch = std::move(batch);
 
-    return resharding::WithAutomaticRetry([this, chainCtx, factory] {
-               // Writing `auto& i = chainCtx->nextToApply` takes care of incrementing
-               // chainCtx->nextToApply on each loop iteration.
-               for (auto& i = chainCtx->nextToApply; i < chainCtx->batch.size(); ++i) {
-                   const auto& oplogEntry = *chainCtx->batch[i];
-                   auto opCtx = factory.makeOperationContext(&cc());
+    return resharding::WithAutomaticRetry<unique_function<SemiFuture<void>()>>(
+               [this, chainCtx, cancelToken, factory] {
+                   // Writing `auto& i = chainCtx->nextToApply` takes care of incrementing
+                   // chainCtx->nextToApply on each loop iteration.
+                   for (auto& i = chainCtx->nextToApply; i < chainCtx->batch.size(); ++i) {
+                       const auto& oplogEntry = *chainCtx->batch[i];
+                       auto opCtx = factory.makeOperationContext(&cc());
 
-                   if (oplogEntry.isForReshardingSessionApplication()) {
-                       auto hitPreparedTxn =
-                           _sessionApplication.tryApplyOperation(opCtx.get(), oplogEntry);
+                       if constexpr (IsForSessionApplication) {
+                           auto hitPreparedTxn =
+                               _sessionApplication.tryApplyOperation(opCtx.get(), oplogEntry);
 
-                       if (hitPreparedTxn) {
-                           return *hitPreparedTxn;
+                           if (hitPreparedTxn) {
+                               return future_util::withCancellation(std::move(*hitPreparedTxn),
+                                                                    cancelToken);
+                           }
+                       } else {
+                           uassertStatusOK(
+                               _crudApplication.applyOperation(opCtx.get(), oplogEntry));
                        }
-                   } else {
-                       uassertStatusOK(_crudApplication.applyOperation(opCtx.get(), oplogEntry));
                    }
-               }
-               return makeReadyFutureWith([] {}).share();
-           })
+                   return makeReadyFutureWith([] {}).semi();
+               })
         .onTransientError([](const Status& status) {
             LOGV2(5615800,
                   "Transient error while applying oplog entry from donor shard",
@@ -94,8 +98,25 @@ SemiFuture<void> ReshardingOplogBatchApplier::applyBatch(
         .until([chainCtx](const Status& status) {
             return status.isOK() && chainCtx->nextToApply >= chainCtx->batch.size();
         })
-        .on(std::move(executor), std::move(cancelToken))
+        .on(std::move(executor), cancelToken)
+        // There isn't a guarantee that the reference count to `executor` has been decremented after
+        // .on() returns. We schedule a trivial task on the task executor to ensure the callback's
+        // destructor has run. Otherwise `executor` could end up outliving the ServiceContext and
+        // triggering an invariant due to the task executor's thread having a Client still.
+        .onCompletion([](auto x) { return x; })
         .semi();
 }
+
+template SemiFuture<void> ReshardingOplogBatchApplier::applyBatch<false>(
+    OplogBatch batch,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) const;
+
+template SemiFuture<void> ReshardingOplogBatchApplier::applyBatch<true>(
+    OplogBatch batch,
+    std::shared_ptr<executor::TaskExecutor> executor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) const;
 
 }  // namespace mongo

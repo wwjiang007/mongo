@@ -6,16 +6,9 @@
 
 load("jstests/libs/analyze_plan.js");
 load("jstests/libs/storage_engine_utils.js");
+load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
 
 const t = db.getSiblingDB("local").oplog.jstests_query_oplogreplay;
-
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
 
 function dropOplogAndCreateNew(oplog, newCollectionSpec) {
     if (storageEngineIsWiredTigerOrInMemory()) {
@@ -207,9 +200,7 @@ while (res.hasNext()) {
 }
 res = res.explain("executionStats");
 assert.commandWorked(res);
-// In SBE we perform an extra seek to position the cursor and apply the filter, so we will report
-// an extra document examined.
-assert.lte(res.executionStats.totalDocsExamined, isSBEEnabled ? 12 : 11, res);
+assert.lte(res.executionStats.totalDocsExamined, 11, res);
 
 // Oplog replay optimization should work with limit.
 res = t.find({$and: [{ts: {$gte: makeTS(4)}}, {ts: {$lte: makeTS(8)}}]})
@@ -217,8 +208,7 @@ res = t.find({$and: [{ts: {$gte: makeTS(4)}}, {ts: {$lte: makeTS(8)}}]})
           .explain("executionStats");
 assert.commandWorked(res);
 assert.eq(2, res.executionStats.totalDocsExamined);
-collScanStage =
-    getPlanStage(res.executionStats.executionStages, isSBEEnabled ? "seek" : "COLLSCAN");
+collScanStage = getPlanStage(res.executionStats.executionStages, "COLLSCAN");
 assert.eq(2, collScanStage.nReturned, res);
 
 // A query over both 'ts' and '_id' should only pay attention to the 'ts' field for finding

@@ -126,8 +126,8 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Invokes the 'hello' command via it's alias 'ismaster' on each individual node and returns the
-     * current primary, or false if none is found. Populates the following cached values:
+     * Invokes the 'hello' command on each individual node and returns the current primary, or false
+     * if none is found. Populates the following cached values:
      * '_primary': the current primary
      * '_secondaries': all nodes other than '_primary' (note this includes arbiters)
      * '_liveNodes': all currently reachable nodes
@@ -143,7 +143,7 @@ var ReplSetTest = function(opts) {
         self.nodes.forEach(function(node) {
             try {
                 node.setSecondaryOk();
-                var n = node.getDB('admin').runCommand({ismaster: 1});
+                var n = node.getDB('admin')._helloOrLegacyHello();
                 self._liveNodes.push(node);
                 // We verify that the node has a valid config by checking if n.me exists. Then, we
                 // check to see if the node is in primary state.
@@ -152,13 +152,14 @@ var ReplSetTest = function(opts) {
                         twoPrimaries = true;
                     } else {
                         self._primary = node;
-                        canAcceptWrites = n.ismaster;
+                        canAcceptWrites = n.isWritablePrimary || n.ismaster;
                     }
                 } else {
                     self._secondaries.push(node);
                 }
             } catch (err) {
-                print("ReplSetTest Could not call ismaster on node " + node + ": " + tojson(err));
+                print("ReplSetTest Could not call hello/ismaster on node " + node + ": " +
+                      tojson(err));
                 self._secondaries.push(node);
             }
         });
@@ -197,7 +198,25 @@ var ReplSetTest = function(opts) {
             return !connIsAuthenticated;
         });
 
-        if (keyFileParam && unauthenticatedConns.length > 0) {
+        const connOptions = connArray[0].fullOptions || {};
+        const authMode = connOptions.clusterAuthMode || connArray[0].clusterAuthMode ||
+            jsTest.options().clusterAuthMode;
+
+        let needsAuth = (keyFileParam || authMode === "x509" || authMode === "sendX509" ||
+                         authMode === "sendKeyFile") &&
+            unauthenticatedConns.length > 0;
+
+        // There are few cases where we do not auth
+        // 1. When transitioning to auth
+        // 2. When cluster is running in x509 but shell was not started with TLS (i.e. sslSpecial
+        // suite)
+        if (needsAuth &&
+            (connOptions.transitionToAuth !== undefined ||
+             (authMode === "x509" && !connArray[0].isTLS()))) {
+            needsAuth = false;
+        }
+
+        if (needsAuth) {
             return authutil.asCluster(unauthenticatedConns, keyFileParam, fn);
         } else {
             return fn();
@@ -700,9 +719,11 @@ var ReplSetTest = function(opts) {
 
     /**
      * Blocks until the secondary nodes have completed recovery and their roles are known. Blocks on
-     * all secondary nodes or just 'secondaries', if specified.
+     * all secondary nodes or just 'secondaries', if specified. Waits for all 'newlyAdded' fields to
+     * be removed by default.
      */
-    this.awaitSecondaryNodes = function(timeout, secondaries, retryIntervalMS) {
+    this.awaitSecondaryNodes = function(
+        timeout, secondaries, retryIntervalMS, waitForNewlyAddedRemoval) {
         timeout = timeout || self.kDefaultTimeoutMS;
         retryIntervalMS = retryIntervalMS || 200;
 
@@ -715,16 +736,18 @@ var ReplSetTest = function(opts) {
             var ready = true;
 
             for (var i = 0; i < len; i++) {
-                // Our testing framework must be backwards compatible
-                // for multiversion testing, so we are using the 'hello'
-                // command's alias 'ismaster'.
-                var hello = secondariesToCheck[i].adminCommand({ismaster: 1});
+                var hello = secondariesToCheck[i].getDB('admin')._helloOrLegacyHello();
                 var arbiter = (hello.arbiterOnly === undefined ? false : hello.arbiterOnly);
                 ready = ready && (hello.secondary || arbiter);
             }
 
             return ready;
         }, "Awaiting secondaries", timeout, retryIntervalMS);
+
+        // We can only wait for newlyAdded field removal if test commands are enabled.
+        if (waitForNewlyAddedRemoval && jsTest.options().enableTestCommands) {
+            self.waitForAllNewlyAddedRemovals();
+        }
     };
 
     /**
@@ -932,10 +955,7 @@ var ReplSetTest = function(opts) {
             var primary;
 
             for (var i = 0; i < nodes.length; i++) {
-                // Our testing framework must be backwards compatible
-                // for multiversion testing, so we are using the 'hello'
-                // command's alias 'ismaster'.
-                var hello = assert.commandWorked(nodes[i].adminCommand({ismaster: 1}));
+                var hello = assert.commandWorked(nodes[i].getDB('admin')._helloOrLegacyHello());
                 var nodesPrimary = hello.primary;
                 // Node doesn't see a primary.
                 if (!nodesPrimary) {
@@ -990,8 +1010,8 @@ var ReplSetTest = function(opts) {
                         // Node sees two primaries.
                         if (nodesPrimary !== -1) {
                             print("AwaitNodesAgreeOnPrimary: Retrying because " + nodes[i].name +
-                                  " thinks both " + nodes[nodesPrimary].name + " and " +
-                                  nodes[j].name + " are primary.");
+                                  " thinks both " + self.nodes[nodesPrimary].name + " and " +
+                                  self.nodes[j].name + " are primary.");
 
                             return false;
                         }
@@ -1013,13 +1033,13 @@ var ReplSetTest = function(opts) {
                     primary = nodesPrimary;
                 } else if (primary !== nodesPrimary) {
                     print("AwaitNodesAgreeOnPrimary: Retrying because " + nodes[i].name +
-                          " thinks the primary is " + nodes[nodesPrimary].name + " instead of " +
-                          nodes[primary].name);
+                          " thinks the primary is " + self.nodes[nodesPrimary].name +
+                          " instead of " + self.nodes[primary].name);
                     return false;
                 }
             }
 
-            print("AwaitNodesAgreeOnPrimary: Nodes agreed on primary " + nodes[primary].name);
+            print("AwaitNodesAgreeOnPrimary: Nodes agreed on primary " + self.nodes[primary].name);
             return true;
         }, "Awaiting nodes to agree on primary timed out", timeout);
     };
@@ -1068,7 +1088,7 @@ var ReplSetTest = function(opts) {
     };
 
     function isNodeArbiter(node) {
-        return node.getDB('admin').isMaster('admin').arbiterOnly;
+        return node.getDB('admin')._helloOrLegacyHello().arbiterOnly;
     }
 
     this.getArbiters = function() {
@@ -1081,7 +1101,7 @@ var ReplSetTest = function(opts) {
             assert.retryNoExcept(() => {
                 isArbiter = isNodeArbiter(node);
                 return true;
-            }, `Could not call 'isMaster' on ${node}.`, 3, 1000);
+            }, `Could not call hello/isMaster on ${node}.`, 3, 1000);
 
             if (isArbiter) {
                 arbiters.push(node);
@@ -1180,6 +1200,15 @@ var ReplSetTest = function(opts) {
         }
     };
 
+    this._notX509Auth = function(conn) {
+        const nodeId = "n" + self.getNodeId(conn);
+        const nodeOptions = self.nodeOptions[nodeId] || {};
+        const options =
+            (nodeOptions === {} || !self.startOptions) ? nodeOptions : self.startOptions;
+        const authMode = options.clusterAuthMode;
+        return authMode != "sendX509" && authMode != "x509" && authMode != "sendKeyFile";
+    };
+
     function replSetCommandWithRetry(primary, cmd) {
         print("Running command with retry: " + tojson(cmd));
         const cmdName = Object.keys(cmd)[0];
@@ -1200,8 +1229,9 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Wait until the config on the primary becomes committed. Callers specify the primary in case
-     * this must be called when two nodes are expected to be concurrently primary.
+     * Wait until the config on the primary becomes replicated. Callers specify the primary in case
+     * this must be called when two nodes are expected to be concurrently primary. This does not
+     * necessarily wait for the config to be committed.
      */
     this.waitForConfigReplication = function(primary, nodes) {
         const nodeHosts = nodes ? tojson(nodes.map((n) => n.host)) : "all nodes";
@@ -1293,7 +1323,8 @@ var ReplSetTest = function(opts) {
     this.initiateWithAnyNodeAsPrimary = function(cfg, initCmd, {
         doNotWaitForStableRecoveryTimestamp: doNotWaitForStableRecoveryTimestamp = false,
         doNotWaitForReplication: doNotWaitForReplication = false,
-        doNotWaitForNewlyAddedRemovals: doNotWaitForNewlyAddedRemovals = false
+        doNotWaitForNewlyAddedRemovals: doNotWaitForNewlyAddedRemovals = false,
+        doNotWaitForPrimaryOnlyServices: doNotWaitForPrimaryOnlyServices = false
     } = {}) {
         let startTime = new Date();  // Measure the execution time of this function.
         var primary = this.nodes[0].getDB("admin");
@@ -1524,9 +1555,14 @@ var ReplSetTest = function(opts) {
         }
 
         // Setup authentication if running test with authentication
-        if ((jsTestOptions().keyFile) && cmdKey == 'replSetInitiate') {
+        if ((jsTestOptions().keyFile || self.clusterAuthMode === "x509") &&
+            cmdKey === 'replSetInitiate') {
             primary = this.getPrimary();
-            jsTest.authenticateNodes(this.nodes);
+            // The sslSpecial suite sets up cluster with x509 but the shell was not started with TLS
+            // so we need to rely on the test to auth if needed.
+            if (!(self.clusterAuthMode === "x509" && !primary.isTLS())) {
+                jsTest.authenticateNodes(this.nodes);
+            }
         }
 
         // Wait for initial sync to complete on all nodes. Use a faster polling interval so we can
@@ -1574,6 +1610,44 @@ var ReplSetTest = function(opts) {
             });
         }
 
+        // We need to disable the enableDefaultWriteConcernUpdatesForInitiate parameter
+        // to disallow updating the default write concern after initiating is complete.
+        asCluster(self.nodes, () => {
+            for (let node of self.nodes) {
+                // asCluster() currently does not validate connections with X509 authentication.
+                // If the test is using X509, we skip disabling the server parameter as the
+                // 'setParameter' command will fail.
+                // TODO(SERVER-57924): cleanup asCluster() to avoid checking here.
+                if (self._notX509Auth(node) || node.isTLS()) {
+                    const serverStatus =
+                        assert.commandWorked(node.getDB("admin").runCommand({serverStatus: 1}));
+                    const currVersion = serverStatus.version;
+                    const binVersionLatest =
+                        MongoRunner.areBinVersionsTheSame(MongoRunner.getBinVersionFor(currVersion),
+                                                          MongoRunner.getBinVersionFor("latest"));
+
+                    // Only set the following server parameters for nodes running on the latest
+                    // binary version.
+                    if (!binVersionLatest) {
+                        continue;
+                    }
+
+                    assert.commandWorked(node.adminCommand({
+                        setParameter: 1,
+                        enableDefaultWriteConcernUpdatesForInitiate: false,
+                    }));
+
+                    // Re-enable the reconfig check to ensure that committed writes cannot be rolled
+                    // back. We disabled this check during initialization to ensure that replica
+                    // sets will not fail to start up.
+                    if (jsTestOptions().enableTestCommands) {
+                        assert.commandWorked(node.adminCommand(
+                            {setParameter: 1, enableReconfigRollbackCommittedWritesCheck: true}));
+                    }
+                }
+            }
+        });
+
         const awaitTsStart = new Date();  // Measure duration of awaitLastStableRecoveryTimestamp.
         if (!doNotWaitForStableRecoveryTimestamp) {
             // Speed up the polling interval so we can detect recovery timestamps more quickly.
@@ -1590,6 +1664,20 @@ var ReplSetTest = function(opts) {
             asCluster(self.nodes, function() {
                 self.awaitNodesAgreeOnAppliedOpTime();
             });
+        }
+
+        // Waits for the primary only services to finish rebuilding to avoid background writes
+        // after initiation is done. PrimaryOnlyServices wait for the stepup optime to be majority
+        // committed before rebuilding services, so we skip waiting for PrimaryOnlyServices if
+        // we do not wait for replication.
+        if (!doNotWaitForReplication && !doNotWaitForPrimaryOnlyServices) {
+            primary = self.getPrimary();
+            // TODO(SERVER-57924): cleanup asCluster() to avoid checking here.
+            if (self._notX509Auth(primary) || primary.isTLS()) {
+                asCluster(self.nodes, function() {
+                    self.waitForPrimaryOnlyServices(primary);
+                });
+            }
         }
 
         // Turn off the failpoints now that initial sync and initial setup is complete.
@@ -1610,15 +1698,22 @@ var ReplSetTest = function(opts) {
      * This version should be prefered where possible but requires all connections in the
      * ReplSetTest to be authorized to run replSetGetStatus.
      */
-    this.initiateWithNodeZeroAsPrimary = function(cfg, initCmd) {
+    this.initiateWithNodeZeroAsPrimary = function(cfg, initCmd, {
+        doNotWaitForPrimaryOnlyServices: doNotWaitForPrimaryOnlyServices = false,
+    } = {}) {
         let startTime = new Date();  // Measure the execution time of this function.
-        this.initiateWithAnyNodeAsPrimary(cfg, initCmd);
+        this.initiateWithAnyNodeAsPrimary(cfg, initCmd, {doNotWaitForPrimaryOnlyServices: true});
 
         // stepUp() calls awaitReplication() which requires all nodes to be authorized to run
         // replSetGetStatus.
         asCluster(this.nodes, function() {
-            self.stepUp(self.nodes[0]);
+            const newPrimary = self.nodes[0];
+            self.stepUp(newPrimary);
+            if (!doNotWaitForPrimaryOnlyServices) {
+                self.waitForPrimaryOnlyServices(newPrimary);
+            }
         });
+
         print("ReplSetTest initiateWithNodeZeroAsPrimary took " + (new Date() - startTime) +
               "ms for " + this.nodes.length + " nodes.");
     };
@@ -1627,8 +1722,11 @@ var ReplSetTest = function(opts) {
      * Runs replSetInitiate on the replica set and requests the first node to step up as
      * primary.
      */
-    this.initiate = function(cfg, initCmd) {
-        this.initiateWithNodeZeroAsPrimary(cfg, initCmd);
+    this.initiate = function(cfg, initCmd, {
+        doNotWaitForPrimaryOnlyServices: doNotWaitForPrimaryOnlyServices = false,
+    } = {}) {
+        this.initiateWithNodeZeroAsPrimary(
+            cfg, initCmd, {doNotWaitForPrimaryOnlyServices: doNotWaitForPrimaryOnlyServices});
     };
 
     /**
@@ -1697,6 +1795,27 @@ var ReplSetTest = function(opts) {
     };
 
     /**
+     * Waits for primary only services to finish the rebuilding stage after a primary is elected.
+     * This is useful for tests that are expecting particular write timestamps since some primary
+     * only services can do background writes (e.g. build indexes) during rebuilding stage that
+     * could advance the last write timestamp.
+     */
+    this.waitForPrimaryOnlyServices = function(primary) {
+        jsTest.log("Waiting for primary only services to finish rebuilding");
+        primary = primary || self.getPrimary();
+
+        assert.soonNoExcept(function() {
+            const res = assert.commandWorked(primary.adminCommand({serverStatus: 1, repl: 1}));
+            // 'PrimaryOnlyServices' does not exist prior to v5.0, using empty
+            // object to skip waiting in case of multiversion tests.
+            const services = res.repl.primaryOnlyServices || {};
+            return Object.keys(services).every((s) => {
+                return services[s].state === undefined || services[s].state === "running";
+            });
+        }, "Timed out waiting for primary only services to finish rebuilding");
+    };
+
+    /**
      * Gets the current replica set config from the specified node index. If no nodeId is specified,
      * uses the primary node.
      */
@@ -1734,10 +1853,10 @@ var ReplSetTest = function(opts) {
         timeout = timeout || this.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
-            var primaryVersion = self.getPrimary().adminCommand({ismaster: 1}).setVersion;
+            var primaryVersion = self.getPrimary().getDB('admin')._helloOrLegacyHello().setVersion;
 
             for (var i = 0; i < self.nodes.length; i++) {
-                var version = self.nodes[i].adminCommand({ismaster: 1}).setVersion;
+                var version = self.nodes[i].getDB('admin')._helloOrLegacyHello().setVersion;
                 assert.eq(version,
                           primaryVersion,
                           "waiting for secondary node " + self.nodes[i].host +
@@ -1993,16 +2112,13 @@ var ReplSetTest = function(opts) {
             var secondary = secondariesToCheck[index];
             var secondaryName = secondary.host;
 
-            var secondaryConfigVersion =
-                asCluster(secondary,
-                          () => secondary._runWithForcedReadMode(
-                              "commands",
-                              () => secondary.getDB("local")['system.replset']
-                                        .find()
-                                        .readConcern("local")
-                                        .limit(1)
-                                        .next()
-                                        .version));
+            var secondaryConfigVersion = asCluster(secondary,
+                                                   () => secondary.getDB("local")['system.replset']
+                                                             .find()
+                                                             .readConcern("local")
+                                                             .limit(1)
+                                                             .next()
+                                                             .version);
 
             if (primaryConfigVersion != secondaryConfigVersion) {
                 print("ReplSetTest awaitReplication: secondary #" + secondaryCount + ", " +
@@ -2011,14 +2127,12 @@ var ReplSetTest = function(opts) {
 
                 if (secondaryConfigVersion > primaryConfigVersion) {
                     primary = self.getPrimary();
-                    primaryConfigVersion = primary._runWithForcedReadMode(
-                        "commands",
-                        () => primary.getDB("local")['system.replset']
-                                  .find()
-                                  .readConcern("local")
-                                  .limit(1)
-                                  .next()
-                                  .version);
+                    primaryConfigVersion = primary.getDB("local")['system.replset']
+                                               .find()
+                                               .readConcern("local")
+                                               .limit(1)
+                                               .next()
+                                               .version;
                     primaryName = primary.host;
 
                     print("ReplSetTest awaitReplication: optime for primary, " + primaryName +
@@ -2143,7 +2257,6 @@ var ReplSetTest = function(opts) {
     };
 
     this.getHashesUsingSessions = function(sessions, dbName, {
-        filterCapped: filterCapped = true,
         readAtClusterTime,
     } = {}) {
         return sessions.map(session => {
@@ -2154,7 +2267,7 @@ var ReplSetTest = function(opts) {
             if (readAtClusterTime !== undefined) {
                 // TODO (SERVER-48959): Remove 4.4 version check to see which point-in-time read
                 // behavior to use.
-                const version = db.runCommand({buildinfo: 1}).versionArray;
+                const version = assert.commandWorked(db.runCommand({buildinfo: 1})).versionArray;
                 if (jsTest.options().enableMajorityReadConcern !== false &&
                     ((version[0] > 4) || ((version[0] == 4) && (version[1] > 4)))) {
                     commandObj.readConcern = {level: "snapshot", atClusterTime: readAtClusterTime};
@@ -2163,26 +2276,7 @@ var ReplSetTest = function(opts) {
                 }
             }
 
-            const res = assert.commandWorked(db.runCommand(commandObj));
-
-            // The "capped" field in the dbHash command response is new as of MongoDB 4.0.
-            const cappedCollections = new Set(filterCapped ? res.capped : []);
-
-            for (let collName of Object.keys(res.collections)) {
-                // Capped collections are not necessarily truncated at the same points across
-                // replica set members and may therefore not have the same md5sum. We remove them
-                // from the dbHash command response to avoid an already known case of a mismatch.
-                // See SERVER-16049 for more details.
-                if (cappedCollections.has(collName)) {
-                    delete res.collections[collName];
-                    // The "uuids" field in the dbHash command response is new as of MongoDB 4.0.
-                    if (res.hasOwnProperty("uuids")) {
-                        delete res.uuids[collName];
-                    }
-                }
-            }
-
-            return res;
+            return assert.commandWorked(db.runCommand(commandObj));
         });
     };
 
@@ -2198,15 +2292,11 @@ var ReplSetTest = function(opts) {
         const sessions = [
             self._primary,
             ...secondaries.filter(conn => {
-                return !conn.adminCommand({isMaster: 1}).arbiterOnly;
+                return !conn.getDB('admin')._helloOrLegacyHello().arbiterOnly;
             })
         ].map(conn => conn.getDB('test').getSession());
 
-        // getHashes() is sometimes called for versions of MongoDB earlier than 4.0 so we cannot use
-        // the dbHash command directly to filter out capped collections. checkReplicatedDataHashes()
-        // uses the listCollections command after awaiting replication to determine if a collection
-        // is capped.
-        const hashes = this.getHashesUsingSessions(sessions, dbName, {filterCapped: false});
+        const hashes = this.getHashesUsingSessions(sessions, dbName);
         return {primary: hashes[0], secondaries: hashes.slice(1)};
     };
 
@@ -2303,10 +2393,10 @@ var ReplSetTest = function(opts) {
         var collectionPrinted = new Set();
 
         function checkDBHashesForReplSet(
-            rst, dbBlacklist = [], secondaries, msgPrefix, ignoreUUIDs) {
+            rst, dbDenylist = [], secondaries, msgPrefix, ignoreUUIDs) {
             // We don't expect the local database to match because some of its
             // collections are not replicated.
-            dbBlacklist.push('local');
+            dbDenylist.push('local');
             secondaries = secondaries || rst._secondaries;
 
             let success = true;
@@ -2336,13 +2426,18 @@ var ReplSetTest = function(opts) {
             });
 
             for (const dbName of combinedDBs) {
-                if (Array.contains(dbBlacklist, dbName)) {
+                if (Array.contains(dbDenylist, dbName)) {
                     continue;
                 }
 
                 const dbHashes = rst.getHashes(dbName, secondaries);
                 const primaryDBHash = dbHashes.primary;
-                const primaryCollections = Object.keys(primaryDBHash.collections);
+                // The `config.image_collection` is not necessarily consistent after an initial
+                // sync. It's guaranteed to be eventually consistent. However, tests that initial
+                // sync concurrently with retryable findAndModify statements cannot make this
+                // assumption.
+                const primaryCollections = Object.keys(primaryDBHash.collections)
+                                               .filter((x) => x !== "config.image_collection");
                 assert.commandWorked(primaryDBHash);
 
                 // Filter only collections that were retrieved by the dbhash. listCollections
@@ -2424,8 +2519,7 @@ var ReplSetTest = function(opts) {
                 }
 
                 try {
-                    return this.mongo._runWithForcedReadMode("commands",
-                                                             () => operation(this.cursor));
+                    return operation(this.cursor);
                 } catch (err) {
                     print("Error: " + name + " threw '" + err.message + "' on " + this.mongo.host);
                     // Occasionally, the capped collection will get truncated while we are iterating
@@ -2460,22 +2554,17 @@ var ReplSetTest = function(opts) {
                 // to time out since it may take a while to process each batch and a test may have
                 // changed "cursorTimeoutMillis" to a short time period.
                 this._cursorExhausted = false;
-                // Although this line sets the read concern, it does not need to be called via
-                // _runWithForcedReadMode() because it only creates the client-side cursor.  It's
-                // not until next()/hasNext() are called that the find command gets sent to the
-                // server.
                 this.cursor =
                     coll.find(query).sort({$natural: -1}).noCursorTimeout().readConcern("local");
             };
 
             this.getFirstDoc = function() {
-                return this.mongo._runWithForcedReadMode("commands",
-                                                         () => this.getOplogColl()
-                                                                   .find()
-                                                                   .sort({$natural: 1})
-                                                                   .readConcern("local")
-                                                                   .limit(-1)
-                                                                   .next());
+                return this.getOplogColl()
+                    .find()
+                    .sort({$natural: 1})
+                    .readConcern("local")
+                    .limit(-1)
+                    .next();
             };
 
             this.getOplogColl = function() {
@@ -2794,6 +2883,18 @@ var ReplSetTest = function(opts) {
         options.setParameter.shutdownTimeoutMillisForSignaledShutdown =
             options.setParameter.shutdownTimeoutMillisForSignaledShutdown || 100;
 
+        // This parameter is enabled to allow the default write concern to change while
+        // initiating a ReplSetTest. This is due to our testing optimization to initiate
+        // with a single node, and reconfig the full membership set in.
+        // We need to recalculate the DWC after each reconfig until the full set is included.
+        options.setParameter.enableDefaultWriteConcernUpdatesForInitiate = true;
+
+        // Disable a check in reconfig that will prevent certain configs with arbiters from
+        // spinning up. We will re-enable this check after the replica set has finished initiating.
+        if (jsTestOptions().enableTestCommands) {
+            options.setParameter.enableReconfigRollbackCommittedWritesCheck = false;
+        }
+
         if (tojson(options) != tojson({}))
             printjson(options);
 
@@ -2881,7 +2982,10 @@ var ReplSetTest = function(opts) {
 
         var started = this.start(n, options, true, wait);
 
-        if (jsTestOptions().keyFile) {
+        // We should not attempt to reauthenticate the connection if we did not wait for it
+        // to be reestablished in the first place.
+        const skipWaitForConnection = (options && options.waitForConnect === false);
+        if (jsTestOptions().keyFile && !skipWaitForConnection) {
             if (started.length) {
                 // if n was an array of conns, start will return an array of connections
                 for (var i = 0; i < started.length; i++) {
@@ -3038,32 +3142,6 @@ var ReplSetTest = function(opts) {
                   (new Date() - startTime) + "ms for " + this.nodes.length + " nodes.");
         }
 
-        // Make shutdown faster in tests, especially when election handoff has no viable candidate.
-        // Ignore errors from setParameter, since this parameter does not exist before 4.1.10 or
-        // after 4.4.
-        // TODO(SERVER-47797): Remove reference to waitForStepDownOnNonCommandShutdown.
-        if (_callHello()) {
-            asCluster(this._liveNodes, () => {
-                for (let node of this._liveNodes) {
-                    let res;
-                    try {
-                        res = node.adminCommand({
-                            setParameter: 1,
-                            waitForStepDownOnNonCommandShutdown: false,
-                        });
-                    } catch (e) {
-                        print("Failed to set waitForStepDownOnNonCommandShutdown.");
-                        print(e);
-                    }
-                    if (res && res.ok === 0 &&
-                        !res.errmsg.includes("attempted to set unrecognized parameter")) {
-                        print("Failed to set waitForStepDownOnNonCommandShutdown.");
-                        printjson(res);
-                    }
-                }
-            });
-        }
-
         let startTime = new Date();  // Measure the execution time of shutting down nodes.
 
         // Optionally validate collections on all nodes. Parallel validation depends on use of the
@@ -3173,6 +3251,12 @@ var ReplSetTest = function(opts) {
         self.oplogSize = opts.oplogSize || 40;
         self.useSeedList = opts.useSeedList || false;
         self.keyFile = opts.keyFile;
+
+        self.clusterAuthMode = undefined;
+        if (opts.clusterAuthMode) {
+            self.clusterAuthMode = opts.clusterAuthMode;
+        }
+
         self.protocolVersion = opts.protocolVersion;
         self.waitForKeys = opts.waitForKeys;
 
@@ -3195,8 +3279,11 @@ var ReplSetTest = function(opts) {
         if (isObject(opts.nodes)) {
             var len = 0;
             for (var i in opts.nodes) {
+                // opts.nodeOptions and opts.nodes[i] may contain nested objects that have
+                // the same key, e.g. setParameter. So we need to recursively merge them.
+                // Object.assign and Object.merge do not merge nested objects of the same key.
                 var options = self.nodeOptions["n" + len] =
-                    Object.merge(opts.nodeOptions, opts.nodes[i]);
+                    _deepObjectMerge(opts.nodeOptions, opts.nodes[i]);
                 if (i.startsWith("a")) {
                     options.arbiter = true;
                 }
@@ -3217,6 +3304,13 @@ var ReplSetTest = function(opts) {
             }
 
             numNodes = opts.nodes;
+        }
+
+        for (let i = 0; i < numNodes; i++) {
+            if (self.nodeOptions["n" + i] !== undefined &&
+                self.nodeOptions["n" + i].clusterAuthMode == "x509") {
+                self.clusterAuthMode = "x509";
+            }
         }
 
         if (_useBridge) {
@@ -3309,6 +3403,26 @@ var ReplSetTest = function(opts) {
         _constructFromExistingNodes(opts.rstArgs);
     } else {
         _constructStartNewInstances(opts);
+    }
+
+    /**
+     * Recursively merge the target and source object.
+     */
+    function _deepObjectMerge(target, source) {
+        if (!(target instanceof Object)) {
+            return (source === undefined || source === null) ? target : source;
+        }
+
+        if (!(source instanceof Object)) {
+            return target;
+        }
+
+        let res = Object.assign({}, target);
+        Object.keys(source).forEach(k => {
+            res[k] = _deepObjectMerge(target[k], source[k]);
+        });
+
+        return res;
     }
 };
 

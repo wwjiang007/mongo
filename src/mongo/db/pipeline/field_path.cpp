@@ -29,10 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/field_path.h"
-
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
@@ -95,14 +97,25 @@ FieldPath::FieldPath(std::string inputPath)
 void FieldPath::uassertValidFieldName(StringData fieldName) {
     uassert(15998, "FieldPath field names may not be empty strings.", !fieldName.empty());
 
+    const auto dotsAndDollarsHint =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                FeatureCompatibilityParams::Version::kVersion50)
+        ? " Consider using $getField or $setField."
+        : "";
+
     if (fieldName[0] == '$' && !kAllowedDollarPrefixedFields.count(fieldName)) {
-        uasserted(16410, "FieldPath field names may not start with '$'.");
+        uasserted(16410,
+                  str::stream() << "FieldPath field names may not start with '$'."
+                                << dotsAndDollarsHint);
     }
 
     uassert(
         16411, "FieldPath field names may not contain '\0'.", fieldName.find('\0') == string::npos);
-    uassert(
-        16412, "FieldPath field names may not contain '.'.", fieldName.find('.') == string::npos);
+
+    uassert(16412,
+            str::stream() << "FieldPath field names may not contain '.'." << dotsAndDollarsHint,
+            fieldName.find('.') == string::npos);
 }
 
 FieldPath FieldPath::concat(const FieldPath& tail) const {

@@ -41,6 +41,7 @@
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/cluster_auth_mode_option_gen.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/keyfile_option_gen.h"
@@ -463,15 +464,15 @@ Status storeMongodOptions(const moe::Environment& params) {
         mongodGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
 
-    if (params.count("security.clusterIpSourceWhitelist")) {
-        mongodGlobalParams.whitelistedClusterNetwork = std::vector<std::string>();
-        for (const std::string& whitelistEntry :
-             params["security.clusterIpSourceWhitelist"].as<std::vector<std::string>>()) {
+    if (params.count("security.clusterIpSourceAllowlist")) {
+        mongodGlobalParams.allowlistedClusterNetwork = std::vector<std::string>();
+        for (const std::string& allowlistEntry :
+             params["security.clusterIpSourceAllowlist"].as<std::vector<std::string>>()) {
             std::vector<std::string> intermediates;
-            str::splitStringDelim(whitelistEntry, &intermediates, ',');
+            str::splitStringDelim(allowlistEntry, &intermediates, ',');
             std::copy(intermediates.begin(),
                       intermediates.end(),
-                      std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
+                      std::back_inserter(*mongodGlobalParams.allowlistedClusterNetwork));
         }
     }
 
@@ -485,11 +486,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("notablescan")) {
         storageGlobalParams.noTableScan.store(params["notablescan"].as<bool>());
     }
-
-    // Initialize lock-free reads support from feature flag. This may be adjusted later based on
-    // replica set config.
-    storageGlobalParams.disableLockFreeReads =
-        !feature_flags::gLockFreeReads.isEnabledAndIgnoreFCV();
 
     repl::ReplSettings replSettings;
     if (params.count("replication.replSet")) {
@@ -520,8 +516,8 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (!replSettings.getReplSetString().empty() &&
         (params.count("security.authorization") &&
          params["security.authorization"].as<std::string>() == "enabled") &&
-        serverGlobalParams.clusterAuthMode.load() != ServerGlobalParams::ClusterAuthMode_x509 &&
-        !params.count("security.keyFile")) {
+        !serverGlobalParams.startupClusterAuthMode.x509Only() &&
+        serverGlobalParams.keyFile.empty()) {
         return Status(
             ErrorCodes::BadValue,
             str::stream()
@@ -541,10 +537,7 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     if (!serverGlobalParams.enableMajorityReadConcern) {
-        // Lock-free reads are not supported with enableMajorityReadConcern=false, so we disable
-        // them. If the user tries to explicitly enable lock-free reads by specifying
-        // disableLockFreeReads=false, log a warning so that the user knows these are not
-        // compatible settings.
+        // Lock-free reads is not supported with enableMajorityReadConcern=false, so we disable it.
         if (!storageGlobalParams.disableLockFreeReads) {
             LOGV2_WARNING(4788401,
                           "Lock-free reads is not compatible with "
@@ -628,6 +621,13 @@ Status storeMongodOptions(const moe::Environment& params) {
                 storageGlobalParams.dbpath = storageGlobalParams.kDefaultConfigDbPath;
             }
         } else if (clusterRoleParam == "shardsvr") {
+            // Force to set up the node as a replica set, unless we're using queryable backup mode.
+            if (!params.count("storage.queryableBackupMode") &&
+                !params.count("replication.replSet") && !params.count("replication.replSetName")) {
+                return Status(ErrorCodes::BadValue,
+                              "Cannot start a shard as a standalone server. Please use the option "
+                              "--replset to start the node as a replica set.");
+            }
             serverGlobalParams.clusterRole = ClusterRole::ShardServer;
         }
     }

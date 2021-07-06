@@ -31,9 +31,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <fmt/format.h>
+
 #include <memory>
 #include <string>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -46,6 +49,7 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
@@ -61,6 +65,7 @@
 #include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -69,6 +74,8 @@
 namespace mongo {
 
 namespace {
+
+using namespace fmt::literals;
 
 MONGO_FAIL_POINT_DEFINE(rsStopGetMoreCmd);
 MONGO_FAIL_POINT_DEFINE(getMoreHangAfterPinCursor);
@@ -218,7 +225,14 @@ void setUpOperationContextStateForGetMore(OperationContext* opCtx,
                                           bool disableAwaitDataFailpointActive) {
     applyCursorReadConcern(opCtx, cursor.getReadConcernArgs());
     opCtx->setWriteConcern(cursor.getWriteConcernOptions());
-    APIParameters::get(opCtx) = cursor.getAPIParameters();
+
+    auto apiParamsFromClient = APIParameters::get(opCtx);
+    uassert(
+        ErrorCodes::APIMismatchError,
+        "API parameter mismatch: getMore used params {}, the cursor-creating command used {}"_format(
+            apiParamsFromClient.toBSON().toString(), cursor.getAPIParameters().toBSON().toString()),
+        apiParamsFromClient == cursor.getAPIParameters());
+
     setUpOperationDeadline(opCtx, cursor, cmd, disableAwaitDataFailpointActive);
 
     // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
@@ -240,8 +254,6 @@ class GetMoreCmd final : public Command {
 public:
     GetMoreCmd() : Command("getMore") {}
 
-    // Do not currently use apiVersions because clients are prohibited from calling
-    // getMore with apiVersion.
     const std::set<std::string>& apiVersions() const {
         return kApiVersions1;
     }
@@ -260,8 +272,6 @@ public:
             uassert(ErrorCodes::InvalidNamespace,
                     str::stream() << "Invalid namespace for getMore: " << nss.ns(),
                     nss.isValid());
-
-            APIParameters::uassertNoApiParameters(request.body);
         }
 
     private:
@@ -269,7 +279,8 @@ public:
             return false;
         }
 
-        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const override {
             return kSupportsReadConcernResult;
         }
 
@@ -338,6 +349,16 @@ public:
             } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
                 // This exception indicates that we should close the cursor without reporting an
                 // error.
+                return false;
+            } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+                // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+                // to the resume token of the invalidating event, and mark the cursor response as
+                // invalidated. We always expect to have ExtraInfo for this error code.
+                const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+                tassert(5493700, "Missing ChangeStreamInvalidationInfo on exception", extraInfo);
+
+                nextBatch->setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+                nextBatch->setInvalidated();
                 return false;
             } catch (DBException& exception) {
                 nextBatch->abandon();
@@ -548,7 +569,8 @@ public:
             // If the 'failGetMoreAfterCursorCheckout' failpoint is enabled, throw an exception with
             // the given 'errorCode' value, or ErrorCodes::InternalError if 'errorCode' is omitted.
             failGetMoreAfterCursorCheckout.executeIf(
-                [](const BSONObj& data) {
+                [&](const BSONObj& data) {
+                    rpc::RewriteStateChangeErrors::onActiveFailCommand(opCtx, data);
                     auto errorCode = (data["errorCode"] ? data["errorCode"].safeNumberLong()
                                                         : ErrorCodes::InternalError);
                     uasserted(errorCode, "Hit the 'failGetMoreAfterCursorCheckout' failpoint");

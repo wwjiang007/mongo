@@ -145,7 +145,7 @@ SemiFuture<void> checkIfCanReadOrBlock(OperationContext* opCtx, const OpMsgReque
     // Source to cancel the timeout if the operation completed in time.
     CancellationSource cancelTimeoutSource;
     // Source to cancel waiting on the 'canReadFutures'.
-    CancellationSource cancelCanReadSource;
+    CancellationSource cancelCanReadSource(opCtx->getCancellationToken());
     const auto donorMtab = mtabPair->getAccessBlocker(MtabType::kDonor);
     const auto recipientMtab = mtabPair->getAccessBlocker(MtabType::kRecipient);
     // A vector of futures where the donor access blocker's 'getCanReadFuture' will always precede
@@ -208,18 +208,24 @@ SemiFuture<void> checkIfCanReadOrBlock(OperationContext* opCtx, const OpMsgReque
             return donorMtabStatus;
         })
         .onError<ErrorCodes::CallbackCanceled>(
-            [cancelCanReadSource, donorMtab, recipientMtab, opCtx](Status status) mutable {
-                cancelCanReadSource.cancel();
-                // At least one of 'donorMtab' or 'recipientMtab' must exist if we timed out here.
-                BSONObj info =
-                    donorMtab ? donorMtab->getDebugInfo() : recipientMtab->getDebugInfo();
-                if (recipientMtab) {
-                    info = info.addField(
-                        recipientMtab->getDebugInfo().getField("donorConnectionString"));
+            [cancelTimeoutSource,
+             cancelCanReadSource,
+             donorMtab,
+             recipientMtab,
+             timeoutError = opCtx->getTimeoutError()](Status status) mutable {
+                auto isCanceledDueToTimeout = cancelTimeoutSource.token().isCanceled();
+
+                if (!isCanceledDueToTimeout) {
+                    cancelTimeoutSource.cancel();
                 }
-                return Status(opCtx->getTimeoutError(),
-                              "Read timed out waiting for tenant migration blocker",
-                              info);
+
+                if (isCanceledDueToTimeout) {
+                    return Status(
+                        timeoutError,
+                        "Blocked read timed out waiting for tenant migration to commit or abort");
+                }
+
+                return status.withContext("Canceled read blocked by tenant migration");
             })
         .semi();  // To require continuation in the user executor.
 }
@@ -237,14 +243,14 @@ void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringDat
     }
 }
 
-void checkIfCanWriteOrThrow(OperationContext* opCtx, StringData dbName) {
+void checkIfCanWriteOrThrow(OperationContext* opCtx, StringData dbName, Timestamp writeTs) {
     // The migration protocol guarantees the recipient will not get writes until the migration
     // is committed.
     auto mtab = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
                     .getTenantMigrationAccessBlockerForDbName(dbName, MtabType::kDonor);
 
     if (mtab) {
-        auto status = mtab->checkIfCanWrite();
+        auto status = mtab->checkIfCanWrite(writeTs);
         mtab->recordTenantMigrationError(status);
         uassertStatusOK(status);
     }
@@ -267,6 +273,15 @@ Status checkIfCanBuildIndex(OperationContext* opCtx, StringData dbName) {
         return status;
     }
     return Status::OK();
+}
+
+bool hasActiveTenantMigration(OperationContext* opCtx, StringData dbName) {
+    if (dbName.empty()) {
+        return false;
+    }
+
+    return bool(TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                    .getTenantMigrationAccessBlockerForDbName(dbName));
 }
 
 void recoverTenantMigrationAccessBlockers(OperationContext* opCtx) {
@@ -368,8 +383,7 @@ void handleTenantMigrationConflict(OperationContext* opCtx, Status status) {
     invariant(migrationConflictInfo);
     auto mtab = migrationConflictInfo->getTenantMigrationAccessBlocker();
     invariant(mtab);
-    auto migrationStatus =
-        mtab->waitUntilCommittedOrAborted(opCtx, migrationConflictInfo->getOperationType());
+    auto migrationStatus = mtab->waitUntilCommittedOrAborted(opCtx);
     mtab->recordTenantMigrationError(migrationStatus);
     uassertStatusOK(migrationStatus);
 }

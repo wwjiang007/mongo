@@ -40,6 +40,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/cloner_utils.h"
@@ -410,6 +411,14 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     // All other oplog entries.
     std::vector<TenantNoOpEntry> nonSessionOps;
 
+    // The 'opCtx' must be interruptible on stepdown and stepup to avoid a deadlock situation with
+    // the RSTL.
+    opCtx->setAlwaysInterruptAtStepDownOrUp();
+
+    // Prevent the node from being able to change state when reserving oplog slots and writing
+    // entries.
+    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+
     // We start WriteUnitOfWork only to reserve oplog slots. So, it's ok to abort the
     // WriteUnitOfWork when it goes out of scope.
     WriteUnitOfWork wuow(opCtx);
@@ -435,7 +444,7 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
         greatestOplogSlotUsed = *slotIter++;
     }
 
-    const size_t numOplogThreads = _writerPool->getStats().numThreads;
+    const size_t numOplogThreads = _writerPool->getStats().options.maxThreads;
     const size_t numOpsPerThread = std::max(std::size_t(minOplogEntriesPerThread.load()),
                                             (nonSessionOps.size() / numOplogThreads));
     LOGV2_DEBUG(4886003,
@@ -526,6 +535,8 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
     // forward.
     repl::ReplClientInfo::forClient(opCtx->getClient()).clearLastOp();
 
+    opCtx->setAlwaysInterruptAtStepDownOrUp();
+
     // All the ops will have the same session, so we can retain the scopedSession throughout
     // the loop, except when invalidated by multi-document transactions. This allows us to
     // track the statements in a retryable write.
@@ -600,6 +611,12 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
             noopEntry.setSessionId(sessionId);
             noopEntry.setTxnNumber(txnNumber);
 
+            // Write a fake applyOps with the tenantId as the namespace so that this will be picked
+            // up by the committed transaction prefetch pipeline in subsequent migrations.
+            noopEntry.setObject(
+                BSON("applyOps" << BSON_ARRAY(BSON(OplogEntry::kNssFieldName
+                                                   << NamespaceString(_tenantId + "_", "").ns()))));
+
             // Use the same wallclock time as the noop entry.
             sessionTxnRecord.emplace(sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime());
             sessionTxnRecord->setState(DurableTxnStateEnum::kCommitted);
@@ -656,19 +673,24 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                         opCtx->getServiceContext()->getFastClockSource()->now());
                     // Clear the old tenant migration UUID.
                     noopEntry.setFromTenantMigration(boost::none);
+
+                    // Set the inner 'o2' optime to the donor entry's optime because the recipient
+                    // uses the timestamp in 'o2' to determine where to resume applying from.
+                    auto o2Entry = uassertStatusOK(MutableOplogEntry::parse(*entry.getObject2()));
+                    o2Entry.setOpTime(entry.getOpTime());
+                    o2Entry.setWallClockTime(entry.getWallClockTime());
+                    noopEntry.setObject2(o2Entry.toBSON());
                 }
             }
             stmtIds.insert(stmtIds.end(), entryStmtIds.begin(), entryStmtIds.end());
 
-            if (entry.getPreImageOpTime()) {
-                uassert(
-                    5351005,
-                    str::stream()
-                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
-                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
-                        << sessionId << " because the preImage is missing",
-                    prePostImageEntry);
-
+            if (!prePostImageEntry && (entry.getPreImageOpTime() || entry.getPostImageOpTime())) {
+                LOGV2(5535302,
+                      "Tenant Oplog Applier omitting pre- or post- image for findAndModify",
+                      "entry"_attr = redact(entry.toBSONForLogging()),
+                      "tenant"_attr = _tenantId,
+                      "migrationUuid"_attr = _migrationUuid);
+            } else if (entry.getPreImageOpTime()) {
                 uassert(
                     5351002,
                     str::stream()
@@ -681,14 +703,6 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                     originalPrePostImageOpTime == entry.getPreImageOpTime());
                 noopEntry.setPreImageOpTime(prePostImageEntry->getOpTime());
             } else if (entry.getPostImageOpTime()) {
-                uassert(
-                    5351006,
-                    str::stream()
-                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
-                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
-                        << sessionId << " because the postImage is missing",
-                    prePostImageEntry);
-
                 uassert(
                     5351007,
                     str::stream()
@@ -723,15 +737,6 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                                            boost::none /* autocommit */,
                                            boost::none /* startTransaction */);
 
-            // We should never process the same donor statement twice, except in failover
-            // cases where we'll also have "forgotten" the statement was executed.
-            uassert(5350902,
-                    str::stream() << "Tenant oplog application processed same retryable write "
-                                     "twice for transaction "
-                                  << txnNumber << " statement " << entryStmtIds.front()
-                                  << " on session " << sessionId,
-                    !txnParticipant.checkStatementExecutedNoOplogEntryFetch(entryStmtIds.front()));
-
             // We could have an existing lastWriteOpTime for the same retryable write chain from a
             // previously aborted migration. This could also happen if the tenant being migrated has
             // previously resided in this replica set. So we want to start a new history chain
@@ -742,7 +747,36 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                 prevWriteOpTime = txnParticipant.getLastWriteOpTime();
             } else {
                 prevWriteOpTime = OpTime();
+
+                // Before we start a new history chain, reset the in-memory retryable write
+                // state in the txnParticipant so it can be built up from scratch again with
+                // the new chain.
+                LOGV2_DEBUG(5709800,
+                            2,
+                            "Tenant oplog applier resetting existing retryable write state",
+                            "lastWriteOpTime"_attr = txnParticipant.getLastWriteOpTime(),
+                            "_cloneFinishedRecipientOpTime"_attr = _cloneFinishedRecipientOpTime,
+                            "sessionId"_attr = sessionId,
+                            "txnNumber"_attr = txnNumber,
+                            "statementIds"_attr = entryStmtIds,
+                            "tenant"_attr = _tenantId,
+                            "migrationUuid"_attr = _migrationUuid);
+                txnParticipant.invalidate(opCtx.get());
+                txnParticipant.refreshFromStorageIfNeededNoOplogEntryFetch(opCtx.get());
+                txnParticipant.beginOrContinue(opCtx.get(),
+                                               txnNumber,
+                                               boost::none /* autocommit */,
+                                               boost::none /* startTransaction */);
             }
+
+            // We should never process the same donor statement twice, except in failover
+            // cases where we'll also have "forgotten" the statement was executed.
+            uassert(5350902,
+                    str::stream() << "Tenant oplog application processed same retryable write "
+                                     "twice for transaction "
+                                  << txnNumber << " statement " << entryStmtIds.front()
+                                  << " on session " << sessionId,
+                    !txnParticipant.checkStatementExecutedNoOplogEntryFetch(entryStmtIds.front()));
 
             // Set sessionId, txnNumber, and statementId for all ops in a retryable write.
             noopEntry.setSessionId(sessionId);
@@ -783,11 +817,7 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                 // Write the noop entry and update config.transactions.
                 auto oplogOpTime = repl::logOp(opCtx.get(), &noopEntry);
                 if (sessionTxnRecord) {
-                    // We do not need to record the last write op time for migrated transactions, so
-                    // we leave it null for consistency with transactions completed before the
-                    // migration..
-                    if (!opCtx->inMultiDocumentTransaction())
-                        sessionTxnRecord->setLastWriteOpTime(oplogOpTime);
+                    sessionTxnRecord->setLastWriteOpTime(oplogOpTime);
                     TransactionParticipant::get(opCtx.get())
                         .onWriteOpCompletedOnPrimary(opCtx.get(), {stmtIds}, *sessionTxnRecord);
                 }
@@ -820,6 +850,8 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
     // with the client to avoid the invariant in replClientInfo::setLastOp that the optime only goes
     // forward.
     repl::ReplClientInfo::forClient(opCtx->getClient()).clearLastOp();
+
+    opCtx->setAlwaysInterruptAtStepDownOrUp();
 
     AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
     writeConflictRetry(
@@ -856,7 +888,8 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
 
 std::vector<std::vector<const OplogEntry*>> TenantOplogApplier::_fillWriterVectors(
     OperationContext* opCtx, TenantOplogBatch* batch) {
-    std::vector<std::vector<const OplogEntry*>> writerVectors(_writerPool->getStats().numThreads);
+    std::vector<std::vector<const OplogEntry*>> writerVectors(
+        _writerPool->getStats().options.maxThreads);
     CachedCollectionProperties collPropertiesCache;
 
     for (auto&& op : batch->ops) {
@@ -905,7 +938,8 @@ std::vector<std::vector<const OplogEntry*>> TenantOplogApplier::_fillWriterVecto
 Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
     OperationContext* opCtx,
     const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
-    OplogApplication::Mode oplogApplicationMode) {
+    OplogApplication::Mode oplogApplicationMode,
+    const bool isDataConsistent) {
     // We must ensure the opCtx uses replicated writes, because that will ensure we get a
     // NotWritablePrimary error if a stepdown occurs.
     invariant(opCtx->writesAreReplicated());
@@ -927,14 +961,41 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
                   "Index creation, except createIndex on empty collections, is not supported in "
                   "tenant migration");
     }
+    if (op.getCommandType() == OplogEntry::CommandType::kCreateIndexes) {
+        auto uuid = op.getUuid();
+        uassert(5652700, "Missing UUID from createIndex oplog entry", uuid);
+        try {
+            AutoGetCollectionForRead autoColl(opCtx, {op.getNss().db().toString(), *uuid});
+            uassert(ErrorCodes::NamespaceNotFound, "Collection does not exist", autoColl);
+            // During tenant migration oplog application, we only need to apply createIndex on empty
+            // collections. Otherwise, the index is guaranteed to be dropped after. This is because
+            // we block index builds on the donor for the duration of the tenant migration.
+            if (!Helpers::findOne(
+                     opCtx, autoColl.getCollection(), BSONObj(), false /* requireIndex */)
+                     .isNull()) {
+                LOGV2_DEBUG(5652701,
+                            2,
+                            "Tenant migration ignoring createIndex for non-empty collection",
+                            "op"_attr = redact(op.toBSONForLogging()),
+                            "tenant"_attr = _tenantId,
+                            "migrationUuid"_attr = _migrationUuid);
+                return Status::OK();
+            }
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            // If the collection doesn't exist, it is safe to ignore.
+            return Status::OK();
+        }
+    }
     // We don't count tenant application in the ops applied stats.
     auto incrementOpsAppliedStats = [] {};
-    // We always use oplog application mode 'kInitialSync', because we're applying oplog entries to
-    // a cloned database the way initial sync does.
+    // We always use oplog application mode 'kInitialSync' and isDataConsistent 'false', because
+    // we're applying oplog entries to a cloned database the way initial sync does.
+    invariant(isDataConsistent == false);
     auto status = OplogApplierUtils::applyOplogEntryOrGroupedInsertsCommon(
         opCtx,
         entryOrGroupedInserts,
         OplogApplication::Mode::kInitialSync,
+        isDataConsistent,
         incrementOpsAppliedStats,
         nullptr /* opCounters*/);
     LOGV2_DEBUG(4886009,
@@ -957,15 +1018,18 @@ Status TenantOplogApplier::_applyOplogBatchPerWorker(std::vector<const OplogEntr
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
     const bool allowNamespaceNotFoundErrorsOnCrudOps(true);
+    const bool isDataConsistent = false;
     auto status = OplogApplierUtils::applyOplogBatchCommon(
         opCtx.get(),
         ops,
         OplogApplication::Mode::kInitialSync,
         allowNamespaceNotFoundErrorsOnCrudOps,
+        isDataConsistent,
         [this](OperationContext* opCtx,
                const OplogEntryOrGroupedInserts& opOrInserts,
-               OplogApplication::Mode mode) {
-            return _applyOplogEntryOrGroupedInserts(opCtx, opOrInserts, mode);
+               OplogApplication::Mode mode,
+               const bool isDataConsistent) {
+            return _applyOplogEntryOrGroupedInserts(opCtx, opOrInserts, mode, isDataConsistent);
         });
     if (!status.isOK()) {
         LOGV2_ERROR(4886008,

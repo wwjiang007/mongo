@@ -18,21 +18,6 @@ env.Library(
 )
 
 env.Library(
-    target='local_oplog_info',
-    source=[
-        'local_oplog_info.cpp',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/collection',
-        '$BUILD_DIR/mongo/db/logical_time',
-        '$BUILD_DIR/mongo/db/storage/flow_control',
-        '$BUILD_DIR/mongo/db/vector_clock_mutable',
-        'optime',
-        'repl_coordinator_interface',
-    ],
-)
-
-env.Library(
     target='tenant_migration_decoration',
     source=[
         'tenant_migration_decoration.cpp',
@@ -57,20 +42,20 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/catalog/import_collection_oplog_entry',
         '$BUILD_DIR/mongo/db/catalog/index_build_oplog_entry',
+        '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
         '$BUILD_DIR/mongo/db/catalog/multi_index_block',
         '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/op_observer',
-        '$BUILD_DIR/mongo/db/s/resharding_util',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         'dbcheck',
-        'local_oplog_info',
+        'image_collection_entry',
         'repl_coordinator_interface',
         'repl_server_parameters',
         'repl_settings',
@@ -295,6 +280,7 @@ env.Library(
         'oplog',
         'oplog_application',
         'oplog_interface_local',
+        'repl_server_parameters',
     ],
 )
 
@@ -708,11 +694,11 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/journal_flusher',
         '$BUILD_DIR/mongo/idl/server_parameter',
-        'local_oplog_info',
         'repl_server_parameters',
         'replica_set_aware_service',
         'split_horizon',
@@ -738,6 +724,9 @@ env.Library(
         'topology_coordinator',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/read_write_concern_defaults',
+        '$BUILD_DIR/mongo/db/read_write_concern_defaults_mock',
+        '$BUILD_DIR/mongo/db/repl/repl_server_parameters',
         '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
     ],
@@ -1380,12 +1369,14 @@ env.Library(
         '$BUILD_DIR/mongo/executor/network_interface_factory',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         '$BUILD_DIR/mongo/util/future_util',
-        'local_oplog_info',
         'optime',
         'repl_coordinator_interface',
         'tenant_migration_decoration',
         'tenant_migration_errors',
         'tenant_migration_state_machine_idl'
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
     ],
 )
 
@@ -1402,6 +1393,7 @@ env.Library(
         'tenant_migration_utils',
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/catalog/local_oplog_info",
         "$BUILD_DIR/mongo/db/index_builds_coordinator_interface",
     ],
 )
@@ -1453,12 +1445,12 @@ env.Library(
         'tenant_migration_access_blocker',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/storage/flow_control',
         '$BUILD_DIR/mongo/db/storage/storage_control',
-        'local_oplog_info',
         'repl_server_parameters',
     ],
 )
@@ -1590,6 +1582,7 @@ if wiredtiger:
             'tenant_oplog_batcher_test.cpp',
             'vote_requester_test.cpp',
             'wait_for_majority_service_test.cpp',
+            'tenant_migration_access_blocker_util_test.cpp',
             'tenant_migration_recipient_access_blocker_test.cpp',
             'tenant_migration_recipient_entry_helpers_test.cpp',
             'tenant_migration_recipient_service_test.cpp',
@@ -1610,9 +1603,9 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
             '$BUILD_DIR/mongo/db/logical_session_id_helpers',
             '$BUILD_DIR/mongo/db/logical_time',
-            '$BUILD_DIR/mongo/db/op_observer',
+            '$BUILD_DIR/mongo/db/op_observer_impl',
             '$BUILD_DIR/mongo/db/query/command_request_response',
-            '$BUILD_DIR/mongo/db/service_context_d',
+            '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
             '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
             '$BUILD_DIR/mongo/db/service_context_test_fixture',
             '$BUILD_DIR/mongo/db/stats/counters',
@@ -1693,6 +1686,7 @@ env.CppUnitTest(
         'topology_coordinator_v1_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/read_write_concern_defaults_mock',
         'isself',
         'repl_coordinator_impl',
         'repl_coordinator_test_fixture',
@@ -1878,5 +1872,18 @@ env.Library(
         'oplog_application',
         'oplog_application_interface',
         'repl_server_parameters'
+    ],
+)
+
+env.Library(
+    target='image_collection_entry',
+    source=[
+        'image_collection_entry.idl',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/logical_session_id',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        'oplog_entry',
     ],
 )

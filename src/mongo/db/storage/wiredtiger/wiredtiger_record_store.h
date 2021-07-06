@@ -112,6 +112,7 @@ public:
         WiredTigerSizeStorer* sizeStorer;
         bool isReadOnly;
         bool tracksSizeAdjustments;
+        bool forceUpdateWithFullDocument;
     };
 
     WiredTigerRecordStore(WiredTigerKVEngine* kvEngine, OperationContext* opCtx, Params params);
@@ -168,9 +169,6 @@ public:
                                                             bool forward) const = 0;
 
     std::unique_ptr<RecordCursor> getRandomCursor(OperationContext* opCtx) const final;
-
-    virtual std::unique_ptr<RecordCursor> getRandomCursorWithOptions(
-        OperationContext* opCtx, StringData extraConfig) const = 0;
 
     virtual Status truncate(OperationContext* opCtx);
 
@@ -337,6 +335,9 @@ private:
     const bool _isLogged;
     // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
+    // TODO (SERVER-57482): Remove special handling of skipping "wiredtiger_calc_modify()".
+    // True if force to update with the full document, and false otherwise.
+    const bool _forceUpdateWithFullDocument;
     boost::optional<int64_t> _oplogMaxSize;
     RecordId _oplogFirstRecord;
 
@@ -372,9 +373,6 @@ public:
 
     virtual std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                             bool forward) const override;
-
-    virtual std::unique_ptr<RecordCursor> getRandomCursorWithOptions(
-        OperationContext* opCtx, StringData extraConfig) const override;
 
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const override;

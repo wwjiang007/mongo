@@ -33,6 +33,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
     ],
     LIBDEPS_PRIVATE=[
+        'auth_options',
+        'cluster_auth_mode',
         'sasl_options',
     ],
 )
@@ -131,6 +133,16 @@ env.Library(
 )
 
 env.Library(
+    target='cluster_auth_mode',
+    source=[
+        'cluster_auth_mode.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
     target='auth_options',
     source=[
         "auth_options.idl",
@@ -143,7 +155,6 @@ env.Library(
 env.Library(
     target='auth_impl_internal',
     source=[
-        'authorization_contract.idl',
         'authorization_manager_impl.cpp',
         'authorization_session_impl.cpp',
         'authz_manager_external_state.cpp',
@@ -156,6 +167,7 @@ env.Library(
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/global_settings',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/idl/feature_flag',
@@ -173,6 +185,7 @@ env.Library(
         'user_document_parser',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/api_parameters',
         '$BUILD_DIR/mongo/db/audit', # audit:logLogout in AuthZSession.
         '$BUILD_DIR/mongo/db/commands/create_command',
         '$BUILD_DIR/mongo/db/stats/counters',
@@ -265,7 +278,12 @@ env.Library(
         'authorization_manager_global_parameters.idl',
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/client/authentication",
         '$BUILD_DIR/mongo/idl/server_parameter',
+        "$BUILD_DIR/mongo/util/net/ssl_manager",
+        "$BUILD_DIR/mongo/util/net/ssl_parameters_auth",
+        'cluster_auth_mode',
+        'security_key'
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/server_options_core',
@@ -289,6 +307,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/md5',
         'auth',
+        'cluster_auth_mode',
         'sasl_options',
         'security_file',
         'user',
@@ -395,6 +414,9 @@ env.Library(
         'sasl_options',
         'user',
     ],
+    LIBDEPS_PRIVATE=[
+        'cluster_auth_mode',
+    ],
 )
 
 env.Library(
@@ -460,6 +482,17 @@ env.Library(
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/util/net/network',
         'authentication_restriction',
+    ],
+)
+
+env.Library(
+    target='user_cache_acquisition_stats',
+    source=[
+        'user_cache_acquisition_stats.cpp'
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        'auth',
     ],
 )
 

@@ -58,9 +58,10 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
-#include "mongo/db/timeseries/timeseries_lookup.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
@@ -219,7 +220,7 @@ std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* o
     auto normalSpecs = IndexBuildsCoordinator::normalizeIndexSpecs(opCtx, collection, indexSpecs);
 
     return collection->getIndexCatalog()->removeExistingIndexes(
-        opCtx, normalSpecs, false /*removeIndexBuildsToo*/);
+        opCtx, collection, normalSpecs, false /*removeIndexBuildsToo*/);
 }
 
 /**
@@ -294,7 +295,7 @@ CreateIndexesReply runCreateIndexesOnNewCollection(
     auto db = databaseHolder->getDb(opCtx, ns.db());
     uassert(ErrorCodes::CommandNotSupportedOnView,
             "Cannot create indexes on a view",
-            !db || !ViewCatalog::get(db)->lookup(opCtx, ns.ns()));
+            !db || !ViewCatalog::get(db)->lookup(opCtx, ns));
 
     if (createCollImplicitly) {
         // We need to create the collection.
@@ -336,7 +337,7 @@ CreateIndexesReply runCreateIndexesOnNewCollection(
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot create new indexes on non-empty collection " << ns
                           << " in a multi-document transaction.",
-            collection->numRecords(opCtx) == 0);
+            collection->isEmpty(opCtx));
 
     const int numIndexesBefore =
         IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection.get());
@@ -411,6 +412,7 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
         bool indexExists = writeConflictRetry(opCtx, "createCollectionWithIndexes", ns.ns(), [&] {
             AutoGetCollection collection(opCtx, ns, MODE_IS);
+            CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx);
 
             // Before potentially taking an exclusive collection lock, check if all indexes already
             // exist while holding an intent lock.

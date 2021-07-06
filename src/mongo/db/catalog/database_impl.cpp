@@ -230,9 +230,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
     };
 
     CollectionCatalog::CollectionInfoFn predicate = [&](const CollectionPtr& collection) {
-        return DurableCatalog::get(opCtx)
-            ->getCollectionOptions(opCtx, collection->getCatalogId())
-            .temp;
+        return collection->getCollectionOptions().temp;
     };
 
     catalog::forEachCollectionFromDb(opCtx, name(), MODE_X, callback, predicate);
@@ -363,7 +361,8 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
 
 Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
                                                 NamespaceString nss,
-                                                repl::OpTime dropOpTime) const {
+                                                repl::OpTime dropOpTime,
+                                                bool markFromMigrate) const {
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
 
     LOGV2_DEBUG(20313, 1, "dropCollection: {namespace}", "dropCollection", "namespace"_attr = nss);
@@ -405,8 +404,12 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     auto isOplogDisabledForNamespace = replCoord->isOplogDisabledFor(opCtx, nss);
     if (dropOpTime.isNull() && isOplogDisabledForNamespace) {
         _dropCollectionIndexes(opCtx, nss, collection.getWritableCollection());
-        opObserver->onDropCollection(
-            opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
+        opObserver->onDropCollection(opCtx,
+                                     nss,
+                                     uuid,
+                                     numRecords,
+                                     OpObserver::CollectionDropType::kOnePhase,
+                                     markFromMigrate);
         return _finishDropCollection(opCtx, nss, collection.getWritableCollection());
     }
 
@@ -431,14 +434,22 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
               "commitTimestamp"_attr = commitTimestamp);
         if (dropOpTime.isNull()) {
             // Log oplog entry for collection drop and remove the UUID.
-            dropOpTime = opObserver->onDropCollection(
-                opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
+            dropOpTime = opObserver->onDropCollection(opCtx,
+                                                      nss,
+                                                      uuid,
+                                                      numRecords,
+                                                      OpObserver::CollectionDropType::kOnePhase,
+                                                      markFromMigrate);
             invariant(!dropOpTime.isNull());
         } else {
             // If we are provided with a valid 'dropOpTime', it means we are dropping this
             // collection in the context of applying an oplog entry on a secondary.
-            auto opTime = opObserver->onDropCollection(
-                opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kOnePhase);
+            auto opTime = opObserver->onDropCollection(opCtx,
+                                                       nss,
+                                                       uuid,
+                                                       numRecords,
+                                                       OpObserver::CollectionDropType::kOnePhase,
+                                                       markFromMigrate);
             // OpObserver::onDropCollection should not be writing to the oplog on the secondary.
             invariant(opTime.isNull(),
                       str::stream() << "OpTime is not null. OpTime: " << opTime.toString());
@@ -452,14 +463,22 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     if (dropOpTime.isNull()) {
         // Log oplog entry for collection drop.
-        dropOpTime = opObserver->onDropCollection(
-            opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kTwoPhase);
+        dropOpTime = opObserver->onDropCollection(opCtx,
+                                                  nss,
+                                                  uuid,
+                                                  numRecords,
+                                                  OpObserver::CollectionDropType::kTwoPhase,
+                                                  markFromMigrate);
         invariant(!dropOpTime.isNull());
     } else {
         // If we are provided with a valid 'dropOpTime', it means we are dropping this
         // collection in the context of applying an oplog entry on a secondary.
-        auto opTime = opObserver->onDropCollection(
-            opCtx, nss, uuid, numRecords, OpObserver::CollectionDropType::kTwoPhase);
+        auto opTime = opObserver->onDropCollection(opCtx,
+                                                   nss,
+                                                   uuid,
+                                                   numRecords,
+                                                   OpObserver::CollectionDropType::kTwoPhase,
+                                                   markFromMigrate);
         // OpObserver::onDropCollection should not be writing to the oplog on the secondary.
         invariant(opTime.isNull());
     }
@@ -494,10 +513,9 @@ void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
     invariant(_name == nss.db());
     LOGV2_DEBUG(
         20316, 1, "dropCollection: {namespace} - dropAllIndexes start", "namespace"_attr = nss);
-    collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
+    collection->getIndexCatalog()->dropAllIndexes(opCtx, collection, true);
 
-    invariant(DurableCatalog::get(opCtx)->getTotalIndexCount(opCtx, collection->getCatalogId()) ==
-              0);
+    invariant(collection->getTotalIndexCount() == 0);
     LOGV2_DEBUG(
         20317, 1, "dropCollection: {namespace} - dropAllIndexes done", "namespace"_attr = nss);
 }
@@ -556,16 +574,15 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
 
     Top::get(opCtx->getServiceContext()).collectionDropped(fromNss);
 
-    Status status = DurableCatalog::get(opCtx)->renameCollection(
-        opCtx, collToRename->getCatalogId(), toNss, stayTemp);
-
     // Set the namespace of 'collToRename' from within the CollectionCatalog. This is necessary
-    // because the CollectionCatalog mutex synchronizes concurrent access to the collection's
-    // namespace for callers that may not hold a collection lock.
+    // because the CollectionCatalog manages the necessary isolation for this Collection until the
+    // WUOW commits.
     auto writableCollection = collToRename.getWritableCollection();
+    Status status = writableCollection->rename(opCtx, toNss, stayTemp);
+    if (!status.isOK())
+        return status;
 
-    CollectionCatalog::get(opCtx)->setCollectionNamespace(
-        opCtx, writableCollection, fromNss, toNss);
+    CollectionCatalog::get(opCtx)->onCollectionRename(opCtx, writableCollection, fromNss);
 
     opCtx->recoveryUnit()->onCommit([writableCollection](boost::optional<Timestamp> commitTime) {
         // Ban reading from this collection on committed reads on snapshots before now.
@@ -725,7 +742,9 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
                 // initialized, so use the unsafe fCV getter here.
                 IndexCatalog* ic = collection->getIndexCatalog();
                 fullIdIndexSpec = uassertStatusOK(ic->createIndexOnEmptyCollection(
-                    opCtx, !idIndex.isEmpty() ? idIndex : ic->getDefaultIdIndexSpec()));
+                    opCtx,
+                    collection,
+                    !idIndex.isEmpty() ? idIndex : ic->getDefaultIdIndexSpec(collection)));
             } else {
                 // autoIndexId: false is only allowed on unreplicated collections.
                 uassert(50001,

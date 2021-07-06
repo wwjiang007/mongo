@@ -74,7 +74,7 @@ Document GroupFromFirstDocumentTransformation::applyTransformation(const Documen
 
     for (auto&& expr : _accumulatorExprs) {
         auto value = expr.second->evaluate(input, &expr.second->getExpressionContext()->variables);
-        output.addField(expr.first, value.missing() ? Value(BSONNULL) : value);
+        output.addField(expr.first, value.missing() ? Value(BSONNULL) : std::move(value));
     }
 
     return output.freeze();
@@ -127,45 +127,45 @@ constexpr StringData DocumentSourceGroup::kStageName;
 REGISTER_DOCUMENT_SOURCE(group,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceGroup::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
+                         AllowedWithApiStrict::kAlways);
 
 const char* DocumentSourceGroup::getSourceName() const {
     return kStageName.rawData();
 }
 
-bool DocumentSourceGroup::shouldSpillWithAttemptToSaveMemory(std::function<int()> saveMemory) {
-    if (!_memoryTracker.allowDiskUse &&
-        (_memoryTracker.memoryUsageBytes > _memoryTracker.maxMemoryUsageBytes)) {
-        _memoryTracker.memoryUsageBytes -= saveMemory();
+bool DocumentSourceGroup::shouldSpillWithAttemptToSaveMemory() {
+    if (!_memoryTracker._allowDiskUse &&
+        (_memoryTracker.currentMemoryBytes() >
+         static_cast<long long>(_memoryTracker._maxAllowedMemoryUsageBytes))) {
+        freeMemory();
     }
 
-    if (_memoryTracker.memoryUsageBytes > _memoryTracker.maxMemoryUsageBytes) {
+    if (_memoryTracker.currentMemoryBytes() >
+        static_cast<long long>(_memoryTracker._maxAllowedMemoryUsageBytes)) {
         uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
                 "Exceeded memory limit for $group, but didn't allow external sort."
                 " Pass allowDiskUse:true to opt in.",
-                _memoryTracker.allowDiskUse);
-        _memoryTracker.memoryUsageBytes = 0;
+                _memoryTracker._allowDiskUse);
+        _memoryTracker.resetCurrent();
         return true;
     }
     return false;
 }
 
-int DocumentSourceGroup::freeMemory() {
+void DocumentSourceGroup::freeMemory() {
     invariant(_groups);
-    int totalMemorySaved = 0;
     for (auto&& group : *_groups) {
         for (size_t i = 0; i < group.second.size(); i++) {
-            auto prevMemUsage = group.second[i]->getMemUsage();
+            // Subtract the current usage.
+            _memoryTracker.update(_accumulatedFields[i].fieldName,
+                                  -1 * group.second[i]->getMemUsage());
+
             group.second[i]->reduceMemoryConsumptionIfAble();
 
-            auto memorySaved = prevMemUsage - group.second[i]->getMemUsage();
             // Update the memory usage for this AccumulationStatement.
-            _memoryTracker.accumStatementMemoryBytes[i].currentMemoryBytes -= memorySaved;
-            // Update the memory usage for this group.
-            totalMemorySaved += memorySaved;
+            _memoryTracker.update(_accumulatedFields[i].fieldName, group.second[i]->getMemUsage());
         }
     }
-    return totalMemorySaved;
 }
 
 DocumentSource::GetNextResult DocumentSourceGroup::doGetNext() {
@@ -306,22 +306,19 @@ Value DocumentSourceGroup::serialize(boost::optional<ExplainOptions::Verbosity> 
     MutableDocument out;
     out[getSourceName()] = Value(insides.freeze());
 
-    if (explain >= ExplainOptions::Verbosity::kExecStats) {
+    if (explain && *explain >= ExplainOptions::Verbosity::kExecStats) {
         MutableDocument md;
-        invariant(_accumulatedFields.size() == _memoryTracker.accumStatementMemoryBytes.size());
 
         for (size_t i = 0; i < _accumulatedFields.size(); i++) {
-            md[_accumulatedFields[i].fieldName] = _stats.usedDisk
-                ? Value(static_cast<long long>(
-                      _memoryTracker.accumStatementMemoryBytes[i].maxMemoryBytes))
-                : Value(static_cast<long long>(
-                      _memoryTracker.accumStatementMemoryBytes[i].currentMemoryBytes));
+            md[_accumulatedFields[i].fieldName] = Value(static_cast<long long>(
+                _memoryTracker[_accumulatedFields[i].fieldName].maxMemoryBytes()));
         }
 
         out["maxAccumulatorMemoryUsageBytes"] = Value(md.freezeToValue());
         out["totalOutputDataSizeBytes"] =
             Value(static_cast<long long>(_stats.totalOutputDataSizeBytes));
-        out["usedDisk"] = Value(_stats.usedDisk);
+        out["usedDisk"] = Value(_stats.spills > 0);
+        out["spills"] = Value(static_cast<long long>(_stats.spills));
     }
 
     return Value(out.freezeToValue());
@@ -384,15 +381,13 @@ intrusive_ptr<DocumentSourceGroup> DocumentSourceGroup::create(
     const boost::intrusive_ptr<Expression>& groupByExpression,
     std::vector<AccumulationStatement> accumulationStatements,
     boost::optional<size_t> maxMemoryUsageBytes) {
-    size_t memoryBytes = maxMemoryUsageBytes ? *maxMemoryUsageBytes
-                                             : internalDocumentSourceGroupMaxMemoryBytes.load();
-    intrusive_ptr<DocumentSourceGroup> groupStage(new DocumentSourceGroup(expCtx, memoryBytes));
+    intrusive_ptr<DocumentSourceGroup> groupStage(
+        new DocumentSourceGroup(expCtx, maxMemoryUsageBytes));
     groupStage->setIdExpression(groupByExpression);
     for (auto&& statement : accumulationStatements) {
         groupStage->addAccumulator(statement);
+        groupStage->_memoryTracker.set(statement.fieldName, 0);
     }
-    groupStage->_memoryTracker.accumStatementMemoryBytes.resize(accumulationStatements.size(),
-                                                                {0, 0});
 
     return groupStage;
 }
@@ -402,8 +397,9 @@ DocumentSourceGroup::DocumentSourceGroup(const intrusive_ptr<ExpressionContext>&
     : DocumentSource(kStageName, expCtx),
       _doingMerge(false),
       _memoryTracker{expCtx->allowDiskUse && !expCtx->inMongos,
-                     maxMemoryUsageBytes ? *maxMemoryUsageBytes
-                                         : internalDocumentSourceGroupMaxMemoryBytes.load()},
+                     maxMemoryUsageBytes
+                         ? *maxMemoryUsageBytes
+                         : static_cast<size_t>(internalDocumentSourceGroupMaxMemoryBytes.load())},
       _initialized(false),
       _groups(expCtx->getValueComparator().makeUnorderedValueMap<Accumulators>()),
       _spilled(false) {
@@ -498,10 +494,9 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::createFromBson(
             // Any other field will be treated as an accumulator specification.
             groupStage->addAccumulator(
                 AccumulationStatement::parseAccumulationStatement(expCtx.get(), groupField, vps));
+            groupStage->_memoryTracker.set(pFieldName, 0);
         }
     }
-    groupStage->_memoryTracker.accumStatementMemoryBytes.resize(
-        groupStage->getAccumulatedFields().size(), {0, 0});
 
     uassert(
         15955, "a group specification must include an _id", !groupStage->_idExpressions.empty());
@@ -546,7 +541,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
     GetNextResult input = pSource->getNext();
 
     for (; input.isAdvanced(); input = pSource->getNext()) {
-        if (shouldSpillWithAttemptToSaveMemory([this]() { return freeMemory(); })) {
+        if (shouldSpillWithAttemptToSaveMemory()) {
             _sortedFiles.push_back(spill());
         }
 
@@ -564,7 +559,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
 
         vector<uint64_t> oldAccumMemUsage(numAccumulators, 0);
         if (inserted) {
-            _memoryTracker.memoryUsageBytes += id.getApproximateSize();
+            _memoryTracker.set(_memoryTracker.currentMemoryBytes() + id.getApproximateSize());
 
             // Initialize and add the accumulators
             Value expandedId = expandId(id);
@@ -581,8 +576,8 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
         } else {
             for (size_t i = 0; i < group.size(); i++) {
                 // subtract old mem usage. New usage added back after processing.
-                _memoryTracker.memoryUsageBytes -= group[i]->getMemUsage();
-                oldAccumMemUsage[i] = group[i]->getMemUsage();
+                _memoryTracker.update(_accumulatedFields[i].fieldName,
+                                      -1 * group[i]->getMemUsage());
             }
         }
 
@@ -593,18 +588,16 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
             group[i]->process(
                 _accumulatedFields[i].expr.argument->evaluate(rootDocument, &pExpCtx->variables),
                 _doingMerge);
-
-            _memoryTracker.memoryUsageBytes += group[i]->getMemUsage();
-            _memoryTracker.accumStatementMemoryBytes[i].currentMemoryBytes +=
-                group[i]->getMemUsage() - oldAccumMemUsage[i];
+            _memoryTracker.update(_accumulatedFields[i].fieldName, group[i]->getMemUsage());
         }
 
         if (kDebugBuild && !storageGlobalParams.readOnly) {
             // In debug mode, spill every time we have a duplicate id to stress merge logic.
-            if (!inserted &&                     // is a dup
-                !pExpCtx->inMongos &&            // can't spill to disk in mongos
-                !_memoryTracker.allowDiskUse &&  // don't change behavior when testing external sort
-                _sortedFiles.size() < 20) {      // don't open too many FDs
+            if (!inserted &&           // is a dup
+                !pExpCtx->inMongos &&  // can't spill to disk in mongos
+                !_memoryTracker
+                     ._allowDiskUse &&       // don't change behavior when testing external sort
+                _sortedFiles.size() < 20) {  // don't open too many FDs
 
                 _sortedFiles.push_back(spill());
             }
@@ -656,7 +649,8 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
 }
 
 shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
-    _stats.usedDisk = true;
+    _stats.spills++;
+
     vector<const GroupsMap::value_type*> ptrs;  // using pointers to speed sorting
     ptrs.reserve(_groups->size());
     for (GroupsMap::const_iterator it = _groups->begin(), end = _groups->end(); it != end; ++it) {
@@ -697,14 +691,10 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
     metricsCollector.incrementSorterSpills(1);
 
     _groups->clear();
-    // Update the max memory consumption per accumulation statement if the previous max was exceeded
-    // prior to spilling. Then zero out the current per-accumulation statement memory consumption,
-    // as the memory has been freed by spilling.
-    for (size_t i = 0; i < _memoryTracker.accumStatementMemoryBytes.size(); i++) {
-        _memoryTracker.accumStatementMemoryBytes[i].maxMemoryBytes =
-            std::max(_memoryTracker.accumStatementMemoryBytes[i].maxMemoryBytes,
-                     _memoryTracker.accumStatementMemoryBytes[i].currentMemoryBytes);
-        _memoryTracker.accumStatementMemoryBytes[i].currentMemoryBytes = 0;
+    // Zero out the current per-accumulation statement memory consumption, as the memory has been
+    // freed by spilling.
+    for (auto accum : _accumulatedFields) {
+        _memoryTracker.set(accum.fieldName, 0);
     }
 
     Sorter<Value, Value>::Iterator* iteratorPtr = writer.done();
@@ -763,7 +753,7 @@ Document DocumentSourceGroup::makeDocument(const Value& id,
             // we return null in this case so return objects are predictable
             out.addField(_accumulatedFields[i].fieldName, Value(BSONNULL));
         } else {
-            out.addField(_accumulatedFields[i].fieldName, val);
+            out.addField(_accumulatedFields[i].fieldName, std::move(val));
         }
     }
 
@@ -788,9 +778,8 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceGroup::distr
         copiedAccumulatedField.expr.argument = ExpressionFieldPath::parse(
             pExpCtx.get(), "$$ROOT." + copiedAccumulatedField.fieldName, vps);
         mergingGroup->addAccumulator(copiedAccumulatedField);
+        mergingGroup->_memoryTracker.set(copiedAccumulatedField.fieldName, 0);
     }
-    mergingGroup->_memoryTracker.accumStatementMemoryBytes.resize(_accumulatedFields.size(),
-                                                                  {0, 0});
 
     // {shardsStage, mergingStage, sortPattern}
     return DistributedPlanLogic{this, mergingGroup, boost::none};
@@ -886,6 +875,10 @@ DocumentSourceGroup::rewriteGroupAsTransformOnFirstDocument() const {
     }
 
     return GroupFromFirstDocumentTransformation::create(pExpCtx, groupId, std::move(fields));
+}
+
+size_t DocumentSourceGroup::getMaxMemoryUsageBytes() const {
+    return _memoryTracker._maxAllowedMemoryUsageBytes;
 }
 
 }  // namespace mongo

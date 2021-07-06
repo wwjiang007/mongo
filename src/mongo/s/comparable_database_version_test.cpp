@@ -77,7 +77,6 @@ TEST(ComparableDatabaseVersionTest, CompareVersionDifferentTimestamps) {
     ASSERT_FALSE(version2 > version1);
 }
 
-
 TEST(ComparableDatabaseVersionTest, CompareEpochBasedVersionAgainstEpochAndTimestampBasedVersion) {
     {
         auto equalVersions = [](const DatabaseVersion& v1, const DatabaseVersion& v2) {
@@ -219,41 +218,12 @@ TEST(ComparableDatabaseVersionTest, CompareTwoForcedRefreshVersions) {
     ASSERT_FALSE(forcedRefreshVersion1 > forcedRefreshVersion2);
 }
 
-TEST(ComparableDatabaseVersionTest, CompareTwoVersionsWithVersionedForcedRefresh) {
-    auto compareTwoVersionsWithVersionedForcedRefresh = [](const DatabaseVersion& oldV,
-                                                           const DatabaseVersion& newV) {
-        const auto newVersionBeforeForce =
-            ComparableDatabaseVersion::makeComparableDatabaseVersion(newV);
-        const auto oldVersionBeforeForce =
-            ComparableDatabaseVersion::makeComparableDatabaseVersion(oldV);
-        ASSERT(oldVersionBeforeForce < newVersionBeforeForce);
+TEST(ComparableDatabaseVersionTest, CompareTwoComparableChunkVersionsWithBoostNone) {
+    const auto version1 = ComparableDatabaseVersion::makeComparableDatabaseVersion(boost::none);
+    const auto version2 = ComparableDatabaseVersion::makeComparableDatabaseVersion(boost::none);
 
-        const auto oldVersionWithForce =
-            ComparableDatabaseVersion::makeComparableDatabaseVersionForForcedRefresh(oldV);
-        ASSERT(oldVersionBeforeForce < oldVersionWithForce);
-        ASSERT(newVersionBeforeForce < oldVersionWithForce);
-
-        const auto newVersionAfterForce =
-            ComparableDatabaseVersion::makeComparableDatabaseVersion(newV);
-        const auto oldVersionAfterForce =
-            ComparableDatabaseVersion::makeComparableDatabaseVersion(oldV);
-        ASSERT(oldVersionAfterForce < newVersionAfterForce);
-
-        ASSERT(newVersionBeforeForce != newVersionAfterForce);
-        ASSERT(oldVersionBeforeForce != oldVersionAfterForce);
-
-        ASSERT(oldVersionWithForce < newVersionAfterForce);
-        ASSERT_FALSE(oldVersionWithForce < oldVersionAfterForce);
-        ASSERT_FALSE(oldVersionWithForce > oldVersionAfterForce);
-        ASSERT(oldVersionWithForce == oldVersionAfterForce);
-    };
-
-    const auto epoch = UUID::gen();
-    const DatabaseVersion v1(epoch);
-    compareTwoVersionsWithVersionedForcedRefresh(v1, v1.makeUpdated());
-
-    const DatabaseVersion v2(epoch, Timestamp(1));
-    compareTwoVersionsWithVersionedForcedRefresh(v2, v2.makeUpdated());
+    ASSERT_TRUE(version1 < version2);
+    ASSERT_FALSE(version1 > version2);
 }
 
 }  // namespace

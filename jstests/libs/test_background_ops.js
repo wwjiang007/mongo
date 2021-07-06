@@ -18,17 +18,16 @@ var waitForLock = function(mongo, name) {
     var startTime = new Date().getTime();
 
     assert.soon(function() {
-        lockColl.update({_id: name, state: 0}, {$set: {ts: ts, state: 1}});
-        var gleObj = lockColl.getDB().getLastErrorObj();
+        let res = lockColl.update({_id: name, state: 0}, {$set: {ts: ts, state: 1}});
 
         if (new Date().getTime() - startTime > 20 * 1000) {
             print("Waiting for...");
-            printjson(gleObj);
+            printjson(res);
             printjson(lockColl.findOne());
             printjson(ts);
         }
 
-        return gleObj.n == 1 || gleObj.updatedExisting;
+        return res.nModified == 1;
     }, "could not acquire lock", 30 * 1000, 100);
 
     print("Acquired lock " + tojson({_id: name, ts: ts}) +
@@ -171,16 +170,14 @@ startParallelOps = function(mongo, proc, args, context) {
 
     var testDataColl = mongo.getCollection("config.parallelTest");
 
-    testDataColl.insert({
+    assert.commandWorked(testDataColl.insert({
         _id: procName,
         bootstrapper: tojson(bootstrapper),
         operation: tojson(proc),
         args: tojson(args),
         procContext: tojson(procContext),
         contexts: tojson(contexts)
-    });
-
-    assert.eq(null, testDataColl.getDB().getLastError());
+    }));
 
     var bootstrapStartup = "{ var procName = '" + procName + "'; " +
         "var stored = db.getMongo().getCollection( '" + testDataColl + "' )" +

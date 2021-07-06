@@ -33,6 +33,7 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
@@ -47,7 +48,34 @@
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(reshardCollectionJoinedExistingOperation);
+
 namespace {
+
+// Returns a resharding instance if one exists for the same collection and shard key already.
+boost::optional<std::shared_ptr<ReshardingCoordinatorService::ReshardingCoordinator>>
+getExistingInstanceToJoin(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          const BSONObj& newShardKey) {
+    auto reshardingCoordinatorService = checked_cast<ReshardingCoordinatorService*>(
+        repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
+            ->lookupServiceByName(ReshardingCoordinatorService::kServiceName));
+    auto instances = reshardingCoordinatorService->getAllReshardingInstances(opCtx);
+    for (auto& instance : instances) {
+        auto reshardingCoordinator =
+            checked_pointer_cast<ReshardingCoordinatorService::ReshardingCoordinator>(instance);
+
+        auto instanceMetadata = reshardingCoordinator->getMetadata();
+        if (SimpleBSONObjComparator::kInstance.evaluate(
+                instanceMetadata.getReshardingKey().toBSON() == newShardKey) &&
+            instanceMetadata.getSourceNss() == nss) {
+            return reshardingCoordinator;
+        };
+    }
+
+    return boost::none;
+}
 
 class ConfigsvrReshardCollectionCommand final
     : public TypedCommand<ConfigsvrReshardCollectionCommand> {
@@ -59,18 +87,12 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandNotSupported,
-                    "reshardCollection command not enabled",
-                    resharding::gFeatureFlagResharding.isEnabled(
-                        serverGlobalParams.featureCompatibility));
-
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrReshardCollection can only be run on config servers",
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
             uassert(ErrorCodes::InvalidOptions,
                     "_configsvrReshardCollection must be called with majority writeConcern",
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
@@ -98,10 +120,9 @@ public:
                 uassert(ErrorCodes::BadValue,
                         "Must specify value for zones field",
                         request().getZones());
-                validateZones(request().getZones().get(), authoritativeTags);
             }
 
-            if (request().get_presetReshardedChunks()) {
+            if (const auto& presetChunks = request().get_presetReshardedChunks()) {
                 uassert(ErrorCodes::BadValue,
                         "Test commands must be enabled when a value is provided for field: "
                         "_presetReshardedChunks",
@@ -111,43 +132,85 @@ public:
                         "Must specify only one of _presetReshardedChunks or numInitialChunks",
                         !(bool(request().getNumInitialChunks())));
 
-                validateReshardedChunks(request().get_presetReshardedChunks().get(),
-                                        opCtx,
-                                        ShardKeyPattern(request().getKey()).getKeyPattern());
+                validateReshardedChunks(
+                    *presetChunks, opCtx, ShardKeyPattern(request().getKey()).getKeyPattern());
             }
 
-            const auto cm = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                             nss));
+            // Returns boost::none if there isn't any work to be done by the resharding operation.
+            auto instance = ([&]() -> boost::optional<std::shared_ptr<
+                                       ReshardingCoordinatorService::ReshardingCoordinator>> {
+                FixedFCVRegion fixedFcv(opCtx);
 
-            auto tempReshardingNss = constructTemporaryReshardingNss(
-                nss.db(), getCollectionUUIDFromChunkManger(nss, cm));
+                uassert(ErrorCodes::CommandNotSupported,
+                        "reshardCollection command not enabled",
+                        resharding::gFeatureFlagResharding.isEnabled(
+                            serverGlobalParams.featureCompatibility));
 
-            auto coordinatorDoc =
-                ReshardingCoordinatorDocument(std::move(CoordinatorStateEnum::kUnused),
-                                              {},   // donorShards
-                                              {});  // recipientShards
+                if (auto existingInstance =
+                        getExistingInstanceToJoin(opCtx, nss, request().getKey())) {
+                    // Join the existing resharding operation to prevent generating a new resharding
+                    // instance if the same command is issued consecutively due to client disconnect
+                    // etc.
+                    reshardCollectionJoinedExistingOperation.pauseWhileSet(opCtx);
+                    existingInstance.get()->getCoordinatorDocWrittenFuture().get(opCtx);
+                    return existingInstance;
+                }
 
-            // Generate the resharding metadata for the ReshardingCoordinatorDocument.
-            auto reshardingUUID = UUID::gen();
-            auto existingUUID = getCollectionUUIDFromChunkManger(ns(), cm);
-            auto commonMetadata = CommonReshardingMetadata(std::move(reshardingUUID),
-                                                           ns(),
-                                                           std::move(existingUUID),
-                                                           std::move(tempReshardingNss),
-                                                           request().getKey());
-            coordinatorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
-            coordinatorDoc.setZones(request().getZones());
-            coordinatorDoc.setPresetReshardedChunks(request().get_presetReshardedChunks());
-            coordinatorDoc.setNumInitialChunks(request().getNumInitialChunks());
+                const auto cm = uassertStatusOK(
+                    Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+                        opCtx, nss));
 
-            auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
-            auto service =
-                registry->lookupServiceByName(ReshardingCoordinatorService::kServiceName);
-            auto instance = ReshardingCoordinatorService::ReshardingCoordinator::getOrCreate(
-                opCtx, service, coordinatorDoc.toBSON());
+                const auto currentShardKey = cm.getShardKeyPattern().getKeyPattern();
+                if (SimpleBSONObjComparator::kInstance.evaluate(currentShardKey.toBSON() ==
+                                                                request().getKey())) {
+                    // There isn't any work to be done by the resharding operation since the
+                    // existing shard key matches the desired new shard key.
+                    return boost::none;
+                }
 
-            instance->getCompletionFuture().get(opCtx);
+                auto tempReshardingNss = constructTemporaryReshardingNss(
+                    nss.db(), getCollectionUUIDFromChunkManger(nss, cm));
+
+
+                if (auto zones = request().getZones()) {
+                    checkForOverlappingZones(*zones);
+                }
+
+                auto coordinatorDoc =
+                    ReshardingCoordinatorDocument(std::move(CoordinatorStateEnum::kUnused),
+                                                  {},  // donorShards
+                                                  {},  // recipientShards
+                                                  ReshardingCoordinatorMetrics());
+
+                // Generate the resharding metadata for the ReshardingCoordinatorDocument.
+                auto reshardingUUID = UUID::gen();
+                auto existingUUID = getCollectionUUIDFromChunkManger(ns(), cm);
+                auto commonMetadata = CommonReshardingMetadata(std::move(reshardingUUID),
+                                                               ns(),
+                                                               std::move(existingUUID),
+                                                               std::move(tempReshardingNss),
+                                                               request().getKey());
+                coordinatorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
+                coordinatorDoc.setZones(request().getZones());
+                coordinatorDoc.setPresetReshardedChunks(request().get_presetReshardedChunks());
+                coordinatorDoc.setNumInitialChunks(request().getNumInitialChunks());
+
+                opCtx->setAlwaysInterruptAtStepDownOrUp();
+                auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
+                auto service =
+                    registry->lookupServiceByName(ReshardingCoordinatorService::kServiceName);
+                auto instance = ReshardingCoordinatorService::ReshardingCoordinator::getOrCreate(
+                    opCtx, service, coordinatorDoc.toBSON());
+
+                instance->getCoordinatorDocWrittenFuture().get(opCtx);
+                return instance;
+            })();
+
+            if (instance) {
+                // There is work to be done in order to have the collection's shard key match the
+                // requested shard key. Wait until the work is complete.
+                instance.get()->getCompletionFuture().get(opCtx);
+            }
         }
 
     private:

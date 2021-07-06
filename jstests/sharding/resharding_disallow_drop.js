@@ -25,13 +25,7 @@ var st = new ShardingTest({
     config: 1,
     mongos: 1,
     other: {
-        mongosOptions: {setParameter: {featureFlagResharding: true}},
-        configOptions: {
-            setParameter: {
-                featureFlagResharding: true,
-                reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000
-            }
-        }
+        configOptions: {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}}
     }
 });
 
@@ -39,8 +33,6 @@ const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 const db = st.s.getDB(dbName);
-
-configureFailPoint(st.configRS.getPrimary(), "reshardingCoordinatorCanEnterCriticalImplicitly");
 
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
@@ -55,8 +47,8 @@ const awaitReshardResult = startParallelShell(
 
 awaitReshardingStarted();
 
-assert.commandFailedWithCode(db.runCommand({drop: collName, maxTimeMS: 5000}),
-                             ErrorCodes.MaxTimeMSExpired);
+let res = db.runCommand({drop: collName, maxTimeMS: 5000});
+assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
 pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
 awaitReshardResult();

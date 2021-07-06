@@ -49,8 +49,7 @@ IndexScanStage::IndexScanStage(CollectionUUID collUuid,
                                boost::optional<value::SlotId> seekKeySlotLow,
                                boost::optional<value::SlotId> seekKeySlotHigh,
                                PlanYieldPolicy* yieldPolicy,
-                               PlanNodeId nodeId,
-                               LockAcquisitionCallback lockAcquisitionCallback)
+                               PlanNodeId nodeId)
     : PlanStage(seekKeySlotLow ? "ixseek"_sd : "ixscan"_sd, yieldPolicy, nodeId),
       _collUuid(collUuid),
       _indexName(indexName),
@@ -61,8 +60,7 @@ IndexScanStage::IndexScanStage(CollectionUUID collUuid,
       _indexKeysToInclude(indexKeysToInclude),
       _vars(std::move(vars)),
       _seekKeySlotLow(seekKeySlotLow),
-      _seekKeySlotHigh(seekKeySlotHigh),
-      _lockAcquisitionCallback(std::move(lockAcquisitionCallback)) {
+      _seekKeySlotHigh(seekKeySlotHigh) {
     // The valid state is when both boundaries, or none is set, or only low key is set.
     invariant((_seekKeySlotLow && _seekKeySlotHigh) || (!_seekKeySlotLow && !_seekKeySlotHigh) ||
               (_seekKeySlotLow && !_seekKeySlotHigh));
@@ -82,17 +80,16 @@ std::unique_ptr<PlanStage> IndexScanStage::clone() const {
                                             _seekKeySlotLow,
                                             _seekKeySlotHigh,
                                             _yieldPolicy,
-                                            _commonStats.nodeId,
-                                            _lockAcquisitionCallback);
+                                            _commonStats.nodeId);
 }
 
 void IndexScanStage::prepare(CompileCtx& ctx) {
     if (_recordSlot) {
-        _recordAccessor = std::make_unique<value::ViewOfValueAccessor>();
+        _recordAccessor = std::make_unique<value::OwnedValueAccessor>();
     }
 
     if (_recordIdSlot) {
-        _recordIdAccessor = std::make_unique<value::ViewOfValueAccessor>();
+        _recordIdAccessor = std::make_unique<value::OwnedValueAccessor>();
     }
 
     if (_snapshotIdSlot) {
@@ -110,12 +107,14 @@ void IndexScanStage::prepare(CompileCtx& ctx) {
     }
     if (_seekKeySlotHigh) {
         _seekKeyHiAccessor = ctx.getAccessor(*_seekKeySlotHigh);
+        _seekKeyHighHolder = std::make_unique<value::OwnedValueAccessor>();
     }
+    _seekKeyLowHolder = std::make_unique<value::OwnedValueAccessor>();
 
-    std::tie(_collName, _catalogEpoch) =
-        acquireCollection(_opCtx, _collUuid, _lockAcquisitionCallback, _coll);
+    tassert(5709602, "'_coll' should not be initialized prior to 'acquireCollection()'", !_coll);
+    std::tie(_coll, _collName, _catalogEpoch) = acquireCollection(_opCtx, _collUuid);
 
-    auto indexCatalog = _coll->getCollection()->getIndexCatalog();
+    auto indexCatalog = _coll->getIndexCatalog();
     auto indexDesc = indexCatalog->findIndexByName(_opCtx, _indexName);
     tassert(4938500,
             str::stream() << "could not find index named '" << _indexName << "' in collection '"
@@ -156,6 +155,29 @@ value::SlotAccessor* IndexScanStage::getAccessor(CompileCtx& ctx, value::SlotId 
 }
 
 void IndexScanStage::doSaveState() {
+    if (slotsAccessible()) {
+        if (_recordAccessor) {
+            _recordAccessor->makeOwned();
+        }
+        if (_recordIdAccessor) {
+            _recordIdAccessor->makeOwned();
+        }
+        for (auto& accessor : _accessors) {
+            accessor.makeOwned();
+        }
+    }
+
+    // Seek points are external to the index scan and must be accessible no matter what as long as
+    // the index scan is opened.
+    if (_open) {
+        if (_seekKeyLowHolder) {
+            _seekKeyLowHolder->makeOwned();
+        }
+        if (_seekKeyHighHolder) {
+            _seekKeyHighHolder->makeOwned();
+        }
+    }
+
     if (_cursor) {
         _cursor->save();
     }
@@ -164,7 +186,9 @@ void IndexScanStage::doSaveState() {
 }
 
 void IndexScanStage::restoreCollectionAndIndex() {
-    restoreCollection(_opCtx, _collName, _collUuid, _catalogEpoch, _lockAcquisitionCallback, _coll);
+    tassert(5777406, "Collection name should be initialized", _collName);
+    tassert(5777407, "Catalog epoch should be initialized", _catalogEpoch);
+    _coll = restoreCollection(_opCtx, *_collName, _collUuid, *_catalogEpoch);
     auto indexCatalogEntry = _weakIndexCatalogEntry.lock();
     uassert(ErrorCodes::QueryPlanKilled,
             str::stream() << "query plan killed :: index '" << _indexName << "' dropped",
@@ -175,15 +199,22 @@ void IndexScanStage::doRestoreState() {
     invariant(_opCtx);
     invariant(!_coll);
 
-    // If this stage is not currently open, then there is nothing to restore.
-    if (!_open) {
+    // If this stage has not been prepared, then yield recovery is a no-op.
+    if (!_collName) {
         return;
     }
-
     restoreCollectionAndIndex();
 
     if (_cursor) {
         _cursor->restore();
+    }
+
+    // Yield is the only time during plan execution that the snapshotId can change. As such, we
+    // update it accordingly as part of yield recovery.
+    if (_snapshotIdAccessor) {
+        _snapshotIdAccessor->reset(
+            value::TypeTags::NumberInt64,
+            value::bitcastFrom<uint64_t>(_opCtx->recoveryUnit()->getSnapshotId().toNumber()));
     }
 }
 
@@ -215,7 +246,7 @@ void IndexScanStage::open(bool reOpen) {
 
     if (_open) {
         tassert(5071006, "reopened IndexScanStage but reOpen=false", reOpen);
-        tassert(5071007, "IndexScanStage is open but _coll is not held", _coll);
+        tassert(5071007, "IndexScanStage is open but _coll is null", _coll);
         tassert(5071008, "IndexScanStage is open but don't have _cursor", _cursor);
     } else {
         tassert(5071009, "first open to IndexScanStage but reOpen=true", !reOpen);
@@ -244,38 +275,53 @@ void IndexScanStage::open(bool reOpen) {
         uassert(4822851,
                 str::stream() << "seek key is wrong type: " << msgTagLow,
                 tagLow == value::TypeTags::ksValue);
-        _seekKeyLow = value::getKeyStringView(valLow);
+        _seekKeyLowHolder->reset(false, tagLow, valLow);
 
         auto [tagHi, valHi] = _seekKeyHiAccessor->getViewOfValue();
         const auto msgTagHi = tagHi;
         uassert(4822852,
                 str::stream() << "seek key is wrong type: " << msgTagHi,
                 tagHi == value::TypeTags::ksValue);
-        _seekKeyHi = value::getKeyStringView(valHi);
+
+        _seekKeyHighHolder->reset(false, tagHi, valHi);
     } else if (_seekKeyLowAccessor) {
         auto [tagLow, valLow] = _seekKeyLowAccessor->getViewOfValue();
         const auto msgTagLow = tagLow;
         uassert(4822853,
                 str::stream() << "seek key is wrong type: " << msgTagLow,
                 tagLow == value::TypeTags::ksValue);
-        _seekKeyLow = value::getKeyStringView(valLow);
-        _seekKeyHi = nullptr;
+        _seekKeyLowHolder->reset(false, tagLow, valLow);
     } else {
         auto sdi = entry->accessMethod()->getSortedDataInterface();
         KeyString::Builder kb(sdi->getKeyStringVersion(),
                               sdi->getOrdering(),
                               KeyString::Discriminator::kExclusiveBefore);
         kb.appendDiscriminator(KeyString::Discriminator::kExclusiveBefore);
-        _startPoint = kb.getValueCopy();
 
-        _seekKeyLow = &_startPoint;
-        _seekKeyHi = nullptr;
+        auto [copyTag, copyVal] = value::makeCopyKeyString(kb.getValueCopy());
+        _seekKeyLowHolder->reset(true, copyTag, copyVal);
     }
-    ++_specificStats.seeks;
+}
+
+const KeyString::Value& IndexScanStage::getSeekKeyLow() const {
+    auto [tag, value] = _seekKeyLowHolder->getViewOfValue();
+    return *value::getKeyStringView(value);
+}
+
+const KeyString::Value* IndexScanStage::getSeekKeyHigh() const {
+    if (!_seekKeyHighHolder) {
+        return nullptr;
+    }
+    auto [tag, value] = _seekKeyHighHolder->getViewOfValue();
+    return value::getKeyStringView(value);
 }
 
 PlanState IndexScanStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
+
+    // We are about to get next record from a storage cursor so do not bother saving our internal
+    // state in case it yields as the state will be completely overwritten after the call.
+    disableSlotAccess();
 
     if (!_cursor) {
         return trackPlanState(PlanState::IS_EOF);
@@ -285,17 +331,29 @@ PlanState IndexScanStage::getNext() {
 
     if (_firstGetNext) {
         _firstGetNext = false;
-        _nextRecord = _cursor->seekForKeyString(*_seekKeyLow);
+        _nextRecord = _cursor->seekForKeyString(getSeekKeyLow());
+        ++_specificStats.seeks;
     } else {
         _nextRecord = _cursor->nextKeyString();
+    }
+
+    ++_specificStats.numReads;
+    if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumReads>(1)) {
+        // If we're collecting execution stats during multi-planning and reached the end of the
+        // trial period because we've performed enough physical reads, bail out from the trial run
+        // by raising a special exception to signal a runtime planner that this candidate plan has
+        // completed its trial run early. Note that a trial period is executed only once per a
+        // PlanStage tree, and once completed never run again on the same tree.
+        _tracker = nullptr;
+        uasserted(ErrorCodes::QueryTrialRunCompleted, "Trial run early exit in ixscan");
     }
 
     if (!_nextRecord) {
         return trackPlanState(PlanState::IS_EOF);
     }
 
-    if (_seekKeyHi) {
-        auto cmp = _nextRecord->keyString.compare(*_seekKeyHi);
+    if (auto seekKeyHigh = getSeekKeyHigh(); seekKeyHigh) {
+        auto cmp = _nextRecord->keyString.compare(*seekKeyHigh);
 
         if (_forward) {
             if (cmp > 0) {
@@ -308,13 +366,18 @@ PlanState IndexScanStage::getNext() {
         }
     }
 
+    // Note: we may in the future want to bump 'keysExamined' for comparisons to a key that result
+    // in the stage returning EOF.
+    ++_specificStats.keysExamined;
     if (_recordAccessor) {
-        _recordAccessor->reset(value::TypeTags::ksValue,
+        _recordAccessor->reset(false,
+                               value::TypeTags::ksValue,
                                value::bitcastFrom<KeyString::Value*>(&_nextRecord->keyString));
     }
 
     if (_recordIdAccessor) {
-        _recordIdAccessor->reset(value::TypeTags::RecordId,
+        _recordIdAccessor->reset(false,
+                                 value::TypeTags::RecordId,
                                  value::bitcastFrom<int64_t>(_nextRecord->loc.getLong()));
     }
 
@@ -324,21 +387,13 @@ PlanState IndexScanStage::getNext() {
             _nextRecord->keyString, *_ordering, &_valuesBuffer, &_accessors, _indexKeysToInclude);
     }
 
-    if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumReads>(1)) {
-        // If we're collecting execution stats during multi-planning and reached the end of the
-        // trial period (trackProgress() will return 'true' in this case), then we can reset the
-        // tracker. Note that a trial period is executed only once per a PlanStge tree, and once
-        // completed never run again on the same tree.
-        _tracker = nullptr;
-    }
-    ++_specificStats.numReads;
     return trackPlanState(PlanState::ADVANCED);
 }
 
 void IndexScanStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 
     _cursor.reset();
     _coll.reset();
@@ -351,8 +406,9 @@ std::unique_ptr<PlanStageStats> IndexScanStage::getStats(bool includeDebugInfo) 
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
+        bob.appendNumber("keysExamined", static_cast<long long>(_specificStats.keysExamined));
         bob.appendNumber("seeks", static_cast<long long>(_specificStats.seeks));
+        bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
         if (_recordSlot) {
             bob.appendNumber("recordSlot", static_cast<long long>(*_recordSlot));
         }

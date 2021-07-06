@@ -28,6 +28,8 @@
 
 global:
     cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/s/catalog/type_collection.h"
 
 imports:
     - "mongo/db/commands/rename_collection.idl"
@@ -36,6 +38,16 @@ imports:
     - "mongo/idl/basic_types.idl"
     - "mongo/s/chunk_version.idl"
     - "mongo/s/database_version.idl"
+    - "mongo/s/resharding/common_types.idl"
+    - "mongo/db/timeseries/timeseries.idl"
+
+types:
+    CollectionType:
+        description: "Information of a sharded collection."
+        bson_serialization_type: object
+        cpp_type: CollectionType
+        serializer: "mongo::CollectionType::toBSON"
+        deserializer: "mongo::CollectionType"
 
 structs:
 
@@ -106,6 +118,10 @@ structs:
                     A specific set of points to create initial splits at, currently used only by
                     mapReduce.
                 optional: true
+            timeseries:
+                description: "The options to create the time-series collection with."
+                type: TimeseriesOptions
+                optional: true
             collation:
                 type: object_owned
                 description: "The collation to use for the shard key index."
@@ -122,6 +138,15 @@ structs:
             collectionVersion:
                 type: ChunkVersion
                 description: "Latest version of the collection"
+                optional: false
+
+    RefineCollectionShardKeyRequest:
+        description: "Parameters sent by the router"
+        strict: false
+        fields:
+            newShardKey:
+                type: KeyPattern
+                description: "The index specification document to use as the new shard key."
                 optional: false
 
 commands:
@@ -199,27 +224,21 @@ commands:
         chained_structs:
             RenameCollectionRequest: RenameCollectionRequest
 
-    _shardsvrRenameCollectionParticipant:
-        command_name: _shardsvrRenameCollectionParticipant
-        cpp_name: ShardsvrRenameCollectionParticipant
-        description: "Internal command sent to shard participating in a rename collection procedure"
+    _configsvrRenameCollectionMetadata:
+        command_name: _configsvrRenameCollectionMetadata
+        cpp_name: ConfigsvrRenameCollectionMetadata
+        description: "Internal command for renaming collection metadata on the CSRS"
         strict: false
-        api_version: ""
         namespace: concatenate_with_db
-        chained_structs:
-            RenameCollectionRequest: RenameCollectionRequest
-
-    _shardsvrRenameCollectionUnblockParticipant:
-        command_name: _shardsvrRenameCollectionUnblockParticipant
-        cpp_name: ShardsvrRenameCollectionUnblockParticipant
-        description: "Parser for the _shardsvrRenameCollectionUnblockParticipant command"
-        strict: false
         api_version: ""
-        namespace: concatenate_with_db
         fields:
             to:
                 type: namespacestring
                 description: "The new namespace for the collection being renamed."
+            optFromCollection:
+                description: "Information of the source collection to rename, used only for sharded collection."
+                type: CollectionType
+                optional: true
 
     _shardsvrReshardCollection:
         command_name: _shardsvrReshardCollection
@@ -247,11 +266,11 @@ commands:
                 description: "The collation to use for the shard key index."
                 optional: true
             zones:
-                type: array<object>
+                type: array<ReshardingZoneType>
                 description: "The zones associated with the new shard key."
                 optional: true
             _presetReshardedChunks:
-                type: array<object>
+                type: array<ReshardedChunk>
                 description: >-
                     "Mapping of chunk ranges to be used as the initial split output. This is only for 
                     testing purposes."
@@ -264,11 +283,8 @@ commands:
         namespace: concatenate_with_db
         api_version: ""
         strict: false
-        fields:
-            newShardKey:
-                type: KeyPattern
-                description: "The index specification document to use as the new shard key."
-                optional: false
+        chained_structs: 
+            RefineCollectionShardKeyRequest: RefineCollectionShardKeyRequest
 
     _configsvrCreateDatabase:
         description: "The internal createDatabase command on the config server"

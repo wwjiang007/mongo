@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/drop_collection_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 
@@ -39,7 +42,7 @@ public:
     using StateDoc = DropCollectionCoordinatorDocument;
     using Phase = DropCollectionCoordinatorPhaseEnum;
 
-    DropCollectionCoordinator(const BSONObj& initialState);
+    DropCollectionCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState);
     ~DropCollectionCoordinator() = default;
 
     void checkIfOptionsConflict(const BSONObj& doc) const override {}
@@ -48,7 +51,17 @@ public:
         MongoProcessInterface::CurrentOpConnectionsMode connMode,
         MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
+    /**
+     * Locally drops a collection, cleans its CollectionShardingRuntime metadata and refreshes the
+     * catalog cache.
+     */
+    static DropReply dropCollectionLocally(OperationContext* opCtx, const NamespaceString& nss);
+
 private:
+    ShardingDDLCoordinatorMetadata const& metadata() const override {
+        return _doc.getShardingDDLCoordinatorMetadata();
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
@@ -69,9 +82,10 @@ private:
         };
     }
 
-    void _insertStateDocument(StateDoc&& doc);
-    void _updateStateDocument(StateDoc&& newStateDoc);
     void _enterPhase(Phase newPhase);
+
+    void _performNoopRetryableWriteOnParticipants(
+        OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor);
 
     DropCollectionCoordinatorDocument _doc;
 };

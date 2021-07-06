@@ -12,7 +12,9 @@
  * sharded. If not sharded then the primary shard can perform the rewrite locally and execute
  * without having to round-trip back to mongos.
  *
- * @tags: [requires_find_command, requires_fcv_49]
+ * @tags: [
+ *   requires_fcv_49,
+ * ]
  */
 (function() {
 "use strict";
@@ -57,8 +59,8 @@ assertReadOnView(mongosDB.getCollection(viewName));
 // View read with sharded collection on the primary shard is rejected. This mimics what happens
 // when mongos sends the equivalent read, with the caveat that mongos will use the view definition
 // returned to rewrite the query and execute against the underlying collection.
-const result = assert.throws(() => shardDB.getCollection(viewName).findOne({}));
-assert.eq(result.code, ErrorCodes.CommandOnShardedViewNotSupportedOnMongod);
+assert.throwsWithCode(() => shardDB.getCollection(viewName).findOne({}),
+                      ErrorCodes.CommandOnShardedViewNotSupportedOnMongod);
 
 st.stop();
 })();

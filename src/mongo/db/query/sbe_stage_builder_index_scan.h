@@ -34,6 +34,7 @@
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/sbe_stage_builder_helpers.h"
 
 namespace mongo::stage_builder {
 
@@ -51,25 +52,22 @@ class PlanStageSlots;
  * the specified slot with the rehydrated index key for each record.
  */
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateIndexScan(
-    OperationContext* opCtx,
+    StageBuilderState& state,
     const CollectionPtr& collection,
     const IndexScanNode* ixn,
     const sbe::IndexKeysInclusionSet& indexKeyBitset,
-    sbe::value::SlotIdGenerator* slotIdGenerator,
-    sbe::value::SlotIdGenerator* frameIdGenerator,
-    sbe::value::SpoolIdGenerator* spoolIdGenerator,
     PlanYieldPolicy* yieldPolicy,
-    sbe::RuntimeEnvironment* env,
-    sbe::LockAcquisitionCallback lockAcquisitionCallback,
-    StringMap<const IndexAccessMethod*>* iamMap);
+    StringMap<const IndexAccessMethod*>* iamMap,
+    bool needsCorruptionCheck);
 
 /**
  * Constructs the most simple version of an index scan from the single interval index bounds. The
  * generated subtree will have the following form:
  *
- *         nlj [indexIdSlot] [lowKeySlot, highKeySlot]
+ *         nlj [indexIdSlot, keyPatternSlot] [lowKeySlot, highKeySlot]
  *              left
- *                  project [indexIdSlot = <indexName>, lowKeySlot = KS(...), highKeySlot = KS(...)]
+ *                  project [indexIdSlot = <indexName>, keyPatternSlot = <index key pattern>,
+ *                          lowKeySlot =  KS(...), highKeySlot = KS(...)]
  *                  limit 1
  *                  coscan
  *               right
@@ -84,16 +82,18 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateIndexScan(
 std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateSingleIntervalIndexScan(
     const CollectionPtr& collection,
     const std::string& indexName,
+    const BSONObj& keyPattern,
     bool forward,
     std::unique_ptr<KeyString::Value> lowKey,
     std::unique_ptr<KeyString::Value> highKey,
     sbe::IndexKeysInclusionSet indexKeysToInclude,
     sbe::value::SlotVector vars,
-    boost::optional<sbe::value::SlotId> recordSlot,
     boost::optional<sbe::value::SlotId> snapshotIdSlot,
+    boost::optional<sbe::value::SlotId> indexIdSlot,
+    boost::optional<sbe::value::SlotId> recordSlot,
+    boost::optional<sbe::value::SlotId> keyPatternSlot,
     sbe::value::SlotIdGenerator* slotIdGenerator,
     PlanYieldPolicy* yieldPolicy,
-    PlanNodeId nodeId,
-    sbe::LockAcquisitionCallback lockAcquisitionCallback);
+    PlanNodeId nodeId);
 
 }  // namespace mongo::stage_builder

@@ -19,7 +19,6 @@ class MongoDFixture(interface.Fixture):
             self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
             dbpath_prefix=None, preserve_dbpath=False):
         """Initialize MongoDFixture with different options for the mongod process."""
-
         interface.Fixture.__init__(self, logger, job_num, fixturelib, dbpath_prefix=dbpath_prefix)
         self.mongod_options = self.fixturelib.make_historic(
             self.fixturelib.default_if_none(mongod_options, {}))
@@ -49,7 +48,8 @@ class MongoDFixture(interface.Fixture):
             self.preserve_dbpath = preserve_dbpath
 
         self.mongod = None
-        self.port = None
+        self.port = fixturelib.get_next_port(job_num)
+        self.mongod_options["port"] = self.port
 
     def setup(self):
         """Set up the mongod."""
@@ -63,10 +63,11 @@ class MongoDFixture(interface.Fixture):
             pass
 
         launcher = MongodLauncher(self.fixturelib)
-        mongod, self.port = launcher.launch_mongod_program(self.logger, self.job_num,
-                                                           executable=self.mongod_executable,
-                                                           mongod_options=self.mongod_options)
-        self.mongod_options["port"] = self.port
+        # Second return val is the port, which we ignore because we explicitly created the port above.
+        # The port is used to set other mongod_option's here: https://github.com/mongodb/mongo/blob/532a6a8ae7b8e7ab5939e900759c00794862963d/buildscripts/resmokelib/testing/fixtures/replicaset.py#L136
+        mongod, _ = launcher.launch_mongod_program(self.logger, self.job_num,
+                                                   executable=self.mongod_executable,
+                                                   mongod_options=self.mongod_options)
         try:
             self.logger.info("Starting mongod on port %d...\n%s", self.port, mongod.as_command())
             mongod.start()
@@ -166,9 +167,6 @@ class MongoDFixture(interface.Fixture):
 
     def get_internal_connection_string(self):
         """Return the internal connection string."""
-        if self.mongod is None:
-            raise ValueError("Must call setup() before calling get_internal_connection_string()")
-
         return "localhost:%d" % self.port
 
     def get_driver_connection_url(self):
@@ -226,18 +224,15 @@ class MongodLauncher(object):
         """
         executable = self.fixturelib.default_if_none(executable,
                                                      self.config.DEFAULT_MONGOD_EXECUTABLE)
-        mongod_options = self.fixturelib.default_if_none(mongod_options,
-                                                         self.fixturelib.make_historic({})).copy()
+        mongod_options = self.fixturelib.default_if_none(mongod_options, {}).copy()
 
         # Apply the --setParameter command line argument. Command line options to resmoke.py override
         # the YAML configuration.
         # We leave the parameters attached for now so the top-level dict tracks its history.
-        suite_set_parameters = mongod_options.setdefault("set_parameters",
-                                                         self.fixturelib.make_historic({}))
+        suite_set_parameters = mongod_options.setdefault("set_parameters", {})
 
         if self.config.MONGOD_SET_PARAMETERS is not None:
-            suite_set_parameters.update(
-                self.fixturelib.make_historic(yaml.safe_load(self.config.MONGOD_SET_PARAMETERS)))
+            suite_set_parameters.update(yaml.safe_load(self.config.MONGOD_SET_PARAMETERS))
 
         # Set default log verbosity levels if none were specified.
         if "logComponentVerbosity" not in suite_set_parameters:
@@ -312,23 +307,19 @@ class MongodLauncher(object):
         # The default time for stepdown and quiesce mode in response to SIGTERM is 15 seconds. Reduce
         # this to 100ms for faster shutdown. On branches 4.4 and earlier, there is no quiesce mode, but
         # the default time for stepdown is 10 seconds.
-        # TODO(SERVER-47797): Remove reference to waitForStepDownOnNonCommandShutdown.
         if ("replSet" in mongod_options
-                and "waitForStepDownOnNonCommandShutdown" not in suite_set_parameters
-                and "shutdownTimeoutMillisForSignaledShutdown" not in suite_set_parameters):
-            if executable == self.config.LAST_LTS_MONGOD_BINARY:
-                suite_set_parameters["waitForStepDownOnNonCommandShutdown"] = False
-            else:
-                suite_set_parameters["shutdownTimeoutMillisForSignaledShutdown"] = 100
+                and "shutdownTimeoutMillisForSignaledShutdown" not in suite_set_parameters
+                and executable != self.config.LAST_LTS_MONGOD_BINARY):
+            suite_set_parameters["shutdownTimeoutMillisForSignaledShutdown"] = 100
 
         if "enableFlowControl" not in suite_set_parameters and self.config.FLOW_CONTROL is not None:
             suite_set_parameters["enableFlowControl"] = (self.config.FLOW_CONTROL == "on")
 
         if ("failpoint.flowControlTicketOverride" not in suite_set_parameters
                 and self.config.FLOW_CONTROL_TICKETS is not None):
-            suite_set_parameters[
-                "failpoint.flowControlTicketOverride"] = self.fixturelib.make_historic(
-                    {"mode": "alwaysOn", "data": {"numTickets": self.config.FLOW_CONTROL_TICKETS}})
+            suite_set_parameters["failpoint.flowControlTicketOverride"] = {
+                "mode": "alwaysOn", "data": {"numTickets": self.config.FLOW_CONTROL_TICKETS}
+            }
 
         _add_testing_set_parameters(suite_set_parameters)
 
@@ -392,15 +383,14 @@ class MongodLauncher(object):
     def default_mongod_log_component_verbosity(self):
         """Return the default 'logComponentVerbosity' value to use for mongod processes."""
         if self.config.EVERGREEN_TASK_ID:
-            return self.fixturelib.make_historic(DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY)
-        return self.fixturelib.make_historic(DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY)
+            return DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY
+        return DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY
 
     def default_last_lts_mongod_log_component_verbosity(self):
         """Return the default 'logComponentVerbosity' value to use for last-lts mongod processes."""
         if self.config.EVERGREEN_TASK_ID:
-            return self.fixturelib.make_historic(
-                DEFAULT_EVERGREEN_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY)
-        return self.fixturelib.make_historic(DEFAULT_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY)
+            return DEFAULT_EVERGREEN_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY
+        return DEFAULT_LAST_LTS_MONGOD_LOG_COMPONENT_VERBOSITY
 
 
 def _add_testing_set_parameters(suite_set_parameters):

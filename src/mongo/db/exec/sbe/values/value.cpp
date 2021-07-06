@@ -50,6 +50,8 @@ template <typename T>
 auto abslHash(const T& val) {
     if constexpr (std::is_same_v<T, StringData>) {
         return absl::Hash<absl::string_view>{}(absl::string_view{val.rawData(), val.size()});
+    } else if constexpr (IsEndian<T>::value) {
+        return abslHash(val.value);
     } else {
         return absl::Hash<T>{}(val);
     }
@@ -78,8 +80,8 @@ std::pair<TypeTags, Value> makeCopyBsonJavascript(StringData code) {
 }
 
 std::pair<TypeTags, Value> makeNewBsonDBPointer(StringData ns, const uint8_t* id) {
-    auto const nsLen = ns.size();
-    auto const nsLenWithNull = nsLen + sizeof(char);
+    const auto nsLen = ns.size();
+    const auto nsLenWithNull = nsLen + sizeof(char);
     auto buffer = std::make_unique<char[]>(sizeof(uint32_t) + nsLenWithNull + sizeof(ObjectIdType));
     char* ptr = buffer.get();
 
@@ -98,6 +100,33 @@ std::pair<TypeTags, Value> makeNewBsonDBPointer(StringData ns, const uint8_t* id
     return {TypeTags::bsonDBPointer, bitcastFrom<char*>(buffer.release())};
 }
 
+std::pair<TypeTags, Value> makeNewBsonCodeWScope(StringData code, const char* scope) {
+    const auto codeLen = code.size();
+    const auto codeLenWithNull = codeLen + sizeof(char);
+    const auto scopeLen = ConstDataView(scope).read<LittleEndian<uint32_t>>();
+    const auto numBytes = 2 * sizeof(uint32_t) + codeLenWithNull + scopeLen;
+    auto buffer = std::make_unique<char[]>(numBytes);
+    char* ptr = buffer.get();
+
+    // Write length of 'numBytes' as a little-endian uint32_t.
+    DataView(ptr).write<LittleEndian<uint32_t>>(numBytes);
+    ptr += sizeof(uint32_t);
+
+    // Write length of 'code' as a little-endian uint32_t.
+    DataView(ptr).write<LittleEndian<uint32_t>>(codeLenWithNull);
+    ptr += sizeof(uint32_t);
+
+    // Write 'code' followed by a null terminator.
+    memcpy(ptr, code.rawData(), codeLen);
+    ptr[codeLen] = '\0';
+    ptr += codeLenWithNull;
+
+    // Write 'scope'.
+    memcpy(ptr, scope, scopeLen);
+
+    return {TypeTags::bsonCodeWScope, bitcastFrom<char*>(buffer.release())};
+}
+
 std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey) {
     auto k = new KeyString::Value(inKey);
     return {TypeTags::ksValue, bitcastFrom<KeyString::Value*>(k)};
@@ -114,7 +143,7 @@ std::pair<TypeTags, Value> makeCopyPcreRegex(const PcreRegex& regex) {
 }
 
 void PcreRegex::_compile() {
-    const auto pcreOptions = regex_util::flagsToPcreOptions(_options.c_str(), false).all_options();
+    const auto pcreOptions = regex_util::flagsToPcreOptions(_options.c_str()).all_options();
     const char* compile_error;
     int eoffset;
     _pcrePtr = pcre_compile(_pattern.c_str(), pcreOptions, &compile_error, &eoffset, nullptr);
@@ -223,14 +252,13 @@ void releaseValue(TypeTags tag, Value val) noexcept {
         case TypeTags::bsonRegex:
         case TypeTags::bsonJavascript:
         case TypeTags::bsonDBPointer:
+        case TypeTags::bsonCodeWScope:
             delete[] getRawPointerView(val);
             break;
-
         case TypeTags::bsonArray:
-        case TypeTags::bsonObject: {
+        case TypeTags::bsonObject:
             UniqueBuffer::reclaim(getRawPointerView(val));
             break;
-        }
         case TypeTags::ksValue:
             delete getKeyStringView(val);
             break;
@@ -359,6 +387,9 @@ void writeTagToStream(T& stream, const TypeTags tag) {
         case TypeTags::bsonDBPointer:
             stream << "bsonDBPointer";
             break;
+        case TypeTags::bsonCodeWScope:
+            stream << "bsonCodeWScope";
+            break;
         case TypeTags::ftsMatcher:
             stream << "ftsMatcher";
             break;
@@ -373,49 +404,77 @@ void writeTagToStream(T& stream, const TypeTags tag) {
 
 namespace {
 template <typename T>
-void writeStringDataToStream(T& stream, StringData sd) {
-    stream << '"';
+void writeStringDataToStream(T& stream, StringData sd, bool isJavaScript = false) {
+    if (!isJavaScript) {
+        stream << '"';
+    }
     if (sd.size() <= kStringMaxDisplayLength) {
-        stream << sd << '"';
+        stream << sd;
+        if (!isJavaScript) {
+            stream << '"';
+        }
     } else {
-        stream << sd.substr(0, kStringMaxDisplayLength) << "\"...";
+        stream << sd.substr(0, kStringMaxDisplayLength);
+        if (!isJavaScript) {
+            stream << "\"...";
+        } else {
+            stream << "...";
+        }
     }
 }
 
 template <typename T>
-void writeArrayToStream(T& stream, TypeTags tag, Value val) {
+void writeArrayToStream(T& stream, TypeTags tag, Value val, size_t depth = 1) {
     stream << '[';
+    auto shouldTruncate = true;
+    size_t iter = 0;
     if (auto ae = ArrayEnumerator{tag, val}; !ae.atEnd()) {
-        for (;;) {
-            auto [tag, val] = ae.getViewOfValue();
-            writeValueToStream(stream, tag, val);
-
+        while (iter < kArrayObjectOrNestingMaxDepth && depth < kArrayObjectOrNestingMaxDepth) {
+            auto [aeTag, aeVal] = ae.getViewOfValue();
+            if (aeTag == TypeTags::Array || aeTag == TypeTags::Object) {
+                ++depth;
+            }
+            writeValueToStream(stream, aeTag, aeVal, depth);
             ae.advance();
             if (ae.atEnd()) {
+                shouldTruncate = false;
                 break;
             }
-
             stream << ", ";
+            ++iter;
+        }
+        if (shouldTruncate || depth > kArrayObjectOrNestingMaxDepth) {
+            stream << "...";
         }
     }
     stream << ']';
 }
 
 template <typename T>
-void writeObjectToStream(T& stream, TypeTags tag, Value val) {
+void writeObjectToStream(T& stream, TypeTags tag, Value val, size_t depth = 1) {
     stream << '{';
+    auto shouldTruncate = true;
+    size_t iter = 0;
     if (auto oe = ObjectEnumerator{tag, val}; !oe.atEnd()) {
-        for (;;) {
+        while (iter < kArrayObjectOrNestingMaxDepth && depth < kArrayObjectOrNestingMaxDepth) {
             stream << "\"" << oe.getFieldName() << "\" : ";
-            auto [tag, val] = oe.getViewOfValue();
-            writeValueToStream(stream, tag, val);
+            auto [oeTag, oeVal] = oe.getViewOfValue();
+            if (oeTag == TypeTags::Array || oeTag == TypeTags::Object) {
+                ++depth;
+            }
+            writeValueToStream(stream, oeTag, oeVal, depth);
 
             oe.advance();
             if (oe.atEnd()) {
+                shouldTruncate = false;
                 break;
             }
 
             stream << ", ";
+            ++iter;
+        }
+        if (shouldTruncate || depth > kArrayObjectOrNestingMaxDepth) {
+            stream << "...";
         }
     }
     stream << '}';
@@ -445,10 +504,22 @@ void writeCollatorToStream(T& stream, const CollatorInterface* collator) {
         stream << "null";
     }
 }
+
+template <typename T>
+void writeBsonRegexToStream(T& stream, const BsonRegex& regex) {
+    stream << '/';
+    if (regex.pattern.size() <= kStringMaxDisplayLength) {
+        stream << regex.pattern;
+    } else {
+        stream << regex.pattern.substr(0, kStringMaxDisplayLength) << " ... ";
+    }
+    stream << '/' << regex.flags;
+}
+
 }  // namespace
 
 template <typename T>
-void writeValueToStream(T& stream, TypeTags tag, Value val) {
+void writeValueToStream(T& stream, TypeTags tag, Value val, size_t depth = 1) {
     switch (tag) {
         case TypeTags::NumberInt32:
             stream << bitcastTo<int32_t>(val);
@@ -484,11 +555,11 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
         case TypeTags::Array:
         case TypeTags::ArraySet:
         case TypeTags::bsonArray:
-            writeArrayToStream(stream, tag, val);
+            writeArrayToStream(stream, tag, val, depth);
             break;
         case TypeTags::Object:
         case TypeTags::bsonObject:
-            writeObjectToStream(stream, tag, val);
+            writeObjectToStream(stream, tag, val, depth);
             break;
         case TypeTags::ObjectId:
         case TypeTags::bsonObjectId:
@@ -565,12 +636,13 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
             writeCollatorToStream(stream, getCollatorView(val));
             break;
         case TypeTags::bsonRegex: {
-            const auto regex = getBsonRegexView(val);
-            stream << '/' << regex.pattern << '/' << regex.flags;
+            writeBsonRegexToStream(stream, getBsonRegexView(val));
             break;
         }
         case TypeTags::bsonJavascript:
-            stream << "Javascript(" << getBsonJavascriptView(val) << ")";
+            stream << "Javascript(";
+            writeStringDataToStream(stream, getStringView(TypeTags::StringBig, val), true);
+            stream << ")";
             break;
         case TypeTags::bsonDBPointer: {
             const auto dbptr = getBsonDBPointerView(val);
@@ -579,6 +651,13 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
             stream << ", ";
             writeObjectIdToStream(
                 stream, TypeTags::bsonObjectId, bitcastFrom<const uint8_t*>(dbptr.id));
+            stream << ')';
+            break;
+        }
+        case TypeTags::bsonCodeWScope: {
+            const auto cws = getBsonCodeWScopeView(val);
+            stream << "CodeWScope(" << cws.code << ", ";
+            writeObjectToStream(stream, TypeTags::bsonObject, bitcastFrom<const char*>(cws.scope));
             stream << ')';
             break;
         }
@@ -681,6 +760,8 @@ BSONType tagToType(TypeTags tag) noexcept {
             return BSONType::Code;
         case TypeTags::bsonDBPointer:
             return BSONType::DBRef;
+        case TypeTags::bsonCodeWScope:
+            return BSONType::CodeWScope;
         default:
             MONGO_UNREACHABLE;
     }
@@ -725,8 +806,9 @@ bool isShallowType(TypeTags tag) noexcept {
 }
 
 inline std::size_t hashObjectId(const uint8_t* objId) noexcept {
-    return abslHash(readFromMemory<uint64_t>(objId)) ^
-        abslHash(readFromMemory<uint32_t>(objId + 8));
+    auto dataView = ConstDataView(reinterpret_cast<const char*>(objId));
+    return abslHash(dataView.read<LittleEndian<uint64_t>>()) ^
+        abslHash(dataView.read<LittleEndian<uint32_t>>(sizeof(uint64_t)));
 }
 
 std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator) noexcept {
@@ -741,6 +823,8 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
             auto dbl = bitcastTo<double>(val);
             if (auto asInt = representAs<int64_t>(dbl); asInt) {
                 return abslHash(*asInt);
+            } else if (std::isnan(dbl)) {
+                return abslHash(std::numeric_limits<double>::quiet_NaN());
             } else {
                 // Doubles not representable as int64_t will hash as doubles.
                 return abslHash(dbl);
@@ -751,6 +835,8 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
             auto dec = bitcastTo<Decimal128>(val);
             if (auto asInt = representAs<int64_t>(dec); asInt) {
                 return abslHash(*asInt);
+            } else if (dec.isNaN()) {
+                return abslHash(std::numeric_limits<double>::quiet_NaN());
             } else if (auto asDbl = representAs<double>(dec); asDbl) {
                 return abslHash(*asDbl);
             } else {
@@ -824,11 +910,11 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
                 memcpy(buffer, getRawPointerView(val), size);
 
                 // Hash as if it is 64bit integer.
-                return abslHash(readFromMemory<uint64_t>(buffer));
+                return abslHash(ConstDataView(buffer).read<LittleEndian<uint64_t>>());
             } else {
                 // Hash only the first 8 bytes. It should be enough.
-                return abslHash(
-                    readFromMemory<uint64_t>(getRawPointerView(val) + sizeof(uint32_t)));
+                auto dataView = ConstDataView(getRawPointerView(val) + sizeof(uint32_t));
+                return abslHash(dataView.read<LittleEndian<uint64_t>>());
             }
         }
         case TypeTags::bsonRegex: {
@@ -841,6 +927,16 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
         case TypeTags::bsonDBPointer: {
             auto dbptr = getBsonDBPointerView(val);
             return hashCombine(hashCombine(hashInit(), abslHash(dbptr.ns)), hashObjectId(dbptr.id));
+        }
+        case TypeTags::bsonCodeWScope: {
+            auto cws = getBsonCodeWScopeView(val);
+
+            // Collation semantics do not apply to strings nested inside the CodeWScope scope
+            // object, so we do not pass through the collator when computing the hash of the
+            // scope object.
+            return hashCombine(
+                hashCombine(hashInit(), abslHash(cws.code)),
+                hashValue(TypeTags::bsonObject, bitcastFrom<const char*>(cws.scope)));
         }
         default:
             break;
@@ -1040,6 +1136,19 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
 
         auto result = memcmp(lhsDBPtr.id, rhsDBPtr.id, sizeof(ObjectIdType));
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(compareHelper(result, 0))};
+    } else if (lhsTag == TypeTags::bsonCodeWScope && rhsTag == TypeTags::bsonCodeWScope) {
+        auto lhsCws = getBsonCodeWScopeView(lhsValue);
+        auto rhsCws = getBsonCodeWScopeView(rhsValue);
+        if (auto result = lhsCws.code.compare(rhsCws.code); result != 0) {
+            return {TypeTags::NumberInt32, bitcastFrom<int32_t>(compareHelper(result, 0))};
+        }
+
+        // Special string comparison semantics do not apply to strings nested inside the
+        // CodeWScope scope object, so we do not pass through the string comparator.
+        return compareValue(TypeTags::bsonObject,
+                            bitcastFrom<const char*>(lhsCws.scope),
+                            TypeTags::bsonObject,
+                            bitcastFrom<const char*>(rhsCws.scope));
     } else {
         // Different types.
         auto lhsType = tagToType(lhsTag);
@@ -1073,7 +1182,7 @@ std::pair<TypeTags, Value> ArrayEnumerator::getViewOfValue() const {
         return {_iter->first, _iter->second};
     } else {
         auto sv = bson::fieldNameView(_arrayCurrent);
-        return bson::convertFrom(true, _arrayCurrent, _arrayEnd, sv.size());
+        return bson::convertFrom<true>(_arrayCurrent, _arrayEnd, sv.size());
     }
 }
 
@@ -1105,7 +1214,7 @@ std::pair<TypeTags, Value> ObjectEnumerator::getViewOfValue() const {
         return _object->getAt(_index);
     } else {
         auto sv = bson::fieldNameView(_objectCurrent);
-        return bson::convertFrom(true, _objectCurrent, _objectEnd, sv.size());
+        return bson::convertFrom<true>(_objectCurrent, _objectEnd, sv.size());
     }
 }
 
@@ -1146,7 +1255,7 @@ StringData ObjectEnumerator::getFieldName() const {
 void readKeyStringValueIntoAccessors(const KeyString::Value& keyString,
                                      const Ordering& ordering,
                                      BufBuilder* valueBufferBuilder,
-                                     std::vector<ViewOfValueAccessor>* accessors,
+                                     std::vector<OwnedValueAccessor>* accessors,
                                      boost::optional<IndexKeysInclusionSet> indexKeysToInclude) {
     ValueBuilder valBuilder(valueBufferBuilder);
     invariant(!indexKeysToInclude || indexKeysToInclude->count() == accessors->size());

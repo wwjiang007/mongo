@@ -107,6 +107,9 @@ const NamespaceString NamespaceString::kRecipientReshardingOperationsNamespace(
 const NamespaceString NamespaceString::kShardingDDLCoordinatorsNamespace(
     NamespaceString::kConfigDb, "system.sharding_ddl_coordinators");
 
+const NamespaceString NamespaceString::kShardingRenameParticipantsNamespace(
+    NamespaceString::kConfigDb, "localRenameParticipants");
+
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
 const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
@@ -123,6 +126,9 @@ const NamespaceString NamespaceString::kCollectionCriticalSectionsNamespace(
 
 const NamespaceString NamespaceString::kForceOplogBatchBoundaryNamespace(
     NamespaceString::kConfigDb, "system.forceOplogBatchBoundary");
+
+const NamespaceString NamespaceString::kConfigImagesNamespace(NamespaceString::kConfigDb,
+                                                              "image_collection");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -189,6 +195,7 @@ bool NamespaceString::isLegalClientSystemNS(
  */
 bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
     return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection() ||
+        _ns == kDonorReshardingOperationsNamespace.ns() ||
         _ns == kForceOplogBatchBoundaryNamespace.ns();
 }
 
@@ -322,6 +329,11 @@ bool NamespaceString::isTimeseriesBucketsCollection() const {
 
 NamespaceString NamespaceString::makeTimeseriesBucketsNamespace() const {
     return {db(), kTimeseriesBucketsCollectionPrefix.toString() + coll()};
+}
+
+NamespaceString NamespaceString::getTimeseriesViewNamespace() const {
+    invariant(isTimeseriesBucketsCollection(), ns());
+    return {db(), coll().substr(kTimeseriesBucketsCollectionPrefix.size())};
 }
 
 bool NamespaceString::isReplicated() const {

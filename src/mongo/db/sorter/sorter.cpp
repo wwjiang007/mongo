@@ -159,6 +159,8 @@ public:
     template <typename Container>
     InMemIterator(const Container& input) : _data(input.begin(), input.end()) {}
 
+    InMemIterator(std::deque<Data> data) : _data(std::move(data)) {}
+
     void openSource() {}
     void closeSource() {}
 
@@ -559,7 +561,7 @@ public:
     }
 
     NoLimitSorter(const std::string& fileName,
-                  const std::vector<SorterRange> ranges,
+                  const std::vector<SorterRange>& ranges,
                   const SortOptions& opts,
                   const Comparator& comp,
                   const Settings& settings = Settings())
@@ -569,7 +571,7 @@ public:
           _nextSortedFileWriterOffset(!ranges.empty() ? ranges.back().getEndOffset() : 0) {
         invariant(opts.extSortAllowed);
 
-        this->_numSpills += ranges.size();
+        this->_iters.reserve(ranges.size());
         std::transform(ranges.begin(),
                        ranges.end(),
                        std::back_inserter(this->_iters),
@@ -622,6 +624,9 @@ public:
 
         if (this->_iters.empty()) {
             sort();
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return new InMemIterator<Key, Value>(std::move(_data));
+            }
             return new InMemIterator<Key, Value>(_data);
         }
 
@@ -649,7 +654,6 @@ private:
     }
 
     void spill() {
-        this->_numSpills++;
         if (_data.empty())
             return;
 
@@ -717,6 +721,9 @@ public:
 
     Iterator* done() {
         if (_haveData) {
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return new InMemIterator<Key, Value>(std::move(_best));
+            }
             return new InMemIterator<Key, Value>(_best);
         } else {
             return new InMemIterator<Key, Value>();
@@ -823,6 +830,9 @@ public:
     Iterator* done() {
         if (this->_iters.empty()) {
             sort();
+            if (this->_opts.moveSortedDataIntoIterator) {
+                return new InMemIterator<Key, Value>(std::move(_data));
+            }
             return new InMemIterator<Key, Value>(_data);
         }
 
@@ -936,7 +946,6 @@ private:
     void spill() {
         invariant(!_done);
 
-        this->_numSpills += 1;
         if (_data.empty())
             return;
 
@@ -1121,6 +1130,14 @@ void SortedFileWriter<Key, Value>::spill() {
     try {
         _file.write(reinterpret_cast<const char*>(&size), sizeof(size));
         _file.write(outBuffer, std::abs(size));
+    } catch (const std::system_error& ex) {
+        if (ex.code() == std::errc::no_space_on_device) {
+            msgasserted(ErrorCodes::OutOfDiskSpace,
+                        str::stream() << ex.what() << ": " << _fileFullPath);
+        }
+        msgasserted(5642403,
+                    str::stream() << "error writing to file \"" << _fileFullPath
+                                  << "\": " << sorter::myErrnoWithDescription());
     } catch (const std::exception&) {
         msgasserted(16821,
                     str::stream() << "error writing to file \"" << _fileFullPath
@@ -1185,7 +1202,7 @@ template <typename Key, typename Value>
 template <typename Comparator>
 Sorter<Key, Value>* Sorter<Key, Value>::makeFromExistingRanges(
     const std::string& fileName,
-    const std::vector<SorterRange> ranges,
+    const std::vector<SorterRange>& ranges,
     const SortOptions& opts,
     const Comparator& comp,
     const Settings& settings) {

@@ -38,12 +38,18 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace {
+
+void normalizeArray(BSONArrayBuilder* builder, const BSONObj& obj);
+void normalizeObject(BSONObjBuilder* builder, const BSONObj& obj);
+
 const auto getBucketCatalog = ServiceContext::declareDecoration<BucketCatalog>();
 MONGO_FAIL_POINT_DEFINE(hangTimeseriesDirectModificationBeforeWriteConflict);
 
@@ -54,6 +60,20 @@ uint8_t numDigits(uint32_t num) {
         ++numDigits;
     }
     return numDigits;
+}
+
+void normalizeArray(BSONArrayBuilder* builder, const BSONObj& obj) {
+    for (auto& arrayElem : obj) {
+        if (arrayElem.type() == BSONType::Array) {
+            BSONArrayBuilder subArray = builder->subarrayStart();
+            normalizeArray(&subArray, arrayElem.Obj());
+        } else if (arrayElem.type() == BSONType::Object) {
+            BSONObjBuilder subObject = builder->subobjStart();
+            normalizeObject(&subObject, arrayElem.Obj());
+        } else {
+            builder->append(arrayElem);
+        }
+    }
 }
 
 void normalizeObject(BSONObjBuilder* builder, const BSONObj& obj) {
@@ -94,24 +114,53 @@ void normalizeObject(BSONObjBuilder* builder, const BSONObj& obj) {
     std::sort(it, end);
     for (; it != end; ++it) {
         auto elem = it->element();
-        if (elem.type() != BSONType::Object) {
-            builder->append(elem);
-        } else {
+        if (elem.type() == BSONType::Array) {
+            BSONArrayBuilder subArray(builder->subarrayStart(elem.fieldNameStringData()));
+            normalizeArray(&subArray, elem.Obj());
+        } else if (elem.type() == BSONType::Object) {
             BSONObjBuilder subObject(builder->subobjStart(elem.fieldNameStringData()));
             normalizeObject(&subObject, elem.Obj());
+        } else {
+            builder->append(elem);
         }
     }
 }
 
-UUID getLsid(OperationContext* opCtx, BucketCatalog::CombineWithInsertsFromOtherClients combine) {
-    static const UUID common{UUID::gen()};
+void normalizeTopLevel(BSONObjBuilder* builder, const BSONElement& elem) {
+    if (elem.type() == BSONType::Array) {
+        BSONArrayBuilder subArray(builder->subarrayStart(elem.fieldNameStringData()));
+        normalizeArray(&subArray, elem.Obj());
+    } else if (elem.type() == BSONType::Object) {
+        BSONObjBuilder subObject(builder->subobjStart(elem.fieldNameStringData()));
+        normalizeObject(&subObject, elem.Obj());
+    } else {
+        builder->append(elem);
+    }
+}
+
+OperationId getOpId(OperationContext* opCtx,
+                    BucketCatalog::CombineWithInsertsFromOtherClients combine) {
     switch (combine) {
         case BucketCatalog::CombineWithInsertsFromOtherClients::kAllow:
-            return common;
+            return 0;
         case BucketCatalog::CombineWithInsertsFromOtherClients::kDisallow:
-            return opCtx->getLogicalSessionId()->getId();
+            invariant(opCtx->getOpID());
+            return opCtx->getOpID();
     }
     MONGO_UNREACHABLE;
+}
+
+long long roundTimestampDown(const Date_t& time, const TimeseriesOptions& options) {
+    int roundingSeconds =
+        timeseries::getBucketRoundingSecondsFromGranularity(options.getGranularity());
+    long long seconds = durationCount<Seconds>(time.toDurationSinceEpoch());
+    return (seconds - (seconds % roundingSeconds));
+}
+
+BSONObj buildControlMinTimestampDoc(StringData timeField, long long roundedSeconds) {
+    BSONObjBuilder builder;
+    builder.append(timeField, Date_t::fromMillisSinceEpoch(1000 * roundedSeconds));
+    return builder.obj();
 }
 }  // namespace
 
@@ -143,15 +192,12 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
     const BSONObj& doc,
     CombineWithInsertsFromOtherClients combine) {
 
-    BSONObjBuilder metadata;
-    if (auto metaField = options.getMetaField()) {
-        if (auto elem = doc[*metaField]) {
-            metadata.append(elem);
-        } else {
-            metadata.appendNull(*metaField);
-        }
+    BSONElement metadata;
+    auto metaFieldName = options.getMetaField();
+    if (metaFieldName) {
+        metadata = doc[*metaFieldName];
     }
-    auto key = std::make_tuple(ns, BucketMetadata{metadata.obj(), comparator});
+    auto key = BucketKey{ns, BucketMetadata{metadata, comparator}};
 
     auto stats = _getExecutionStats(ns);
     invariant(stats);
@@ -165,7 +211,7 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
 
     auto time = timeElem.Date();
 
-    BucketAccess bucket{this, key, stats.get(), time};
+    BucketAccess bucket{this, key, options, stats.get(), time};
     invariant(bucket);
 
     NewFieldNames newFieldNamesToBeInserted;
@@ -188,18 +234,13 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
             return true;
         }
         auto bucketTime = (*bucket).getTime();
-        if (time - bucketTime >= Seconds(options.getBucketMaxSpanSeconds())) {
+        if (time - bucketTime >= Seconds(*options.getBucketMaxSpanSeconds())) {
             stats->numBucketsClosedDueToTimeForward.fetchAndAddRelaxed(1);
             return true;
         }
         if (time < bucketTime) {
-            if (!(*bucket)->_hasBeenCommitted() &&
-                (*bucket)->_latestTime - time < Seconds(options.getBucketMaxSpanSeconds())) {
-                (*bucket).setTime();
-            } else {
-                stats->numBucketsClosedDueToTimeBackward.fetchAndAddRelaxed(1);
-                return true;
-            }
+            stats->numBucketsClosedDueToTimeBackward.fetchAndAddRelaxed(1);
+            return true;
         }
         return false;
     };
@@ -213,7 +254,7 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
                                                     &sizeToBeAdded);
     }
 
-    auto batch = bucket->_activeBatch(getLsid(opCtx, combine), stats);
+    auto batch = bucket->_activeBatch(getOpId(opCtx, combine), stats);
     batch->_addMeasurement(doc);
     batch->_recordNewFields(std::move(newFieldNamesToBeInserted));
 
@@ -225,14 +266,15 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
     if (bucket->_ns.isEmpty()) {
         // The namespace and metadata only need to be set if this bucket was newly created.
         bucket->_ns = ns;
-        bucket->_metadata = std::get<BucketMetadata>(key);
+        key.metadata.normalize();
+        bucket->_metadata = key.metadata;
 
         // The namespace is stored two times: the bucket itself and _openBuckets.
-        // The metadata is stored two times: the bucket itself and _openBuckets.
-        // A unique pointer to the bucket is stored once: _allBuckets.
-        // A raw pointer to the bucket is stored at most twice: _openBuckets, _idleBuckets.
+        // The metadata is stored two times, normalized and un-normalized. A unique pointer to the
+        // bucket is stored once: _allBuckets. A raw pointer to the bucket is stored at most twice:
+        // _openBuckets, _idleBuckets.
         bucket->_memoryUsage += (ns.size() * 2) + (bucket->_metadata.toBSON().objsize() * 2) +
-            sizeof(std::unique_ptr<Bucket>) + (sizeof(Bucket*) * 2);
+            sizeof(Bucket) + sizeof(std::unique_ptr<Bucket>) + (sizeof(Bucket*) * 2);
     } else {
         _memoryUsage.fetchAndSubtract(bucket->_memoryUsage);
     }
@@ -249,19 +291,20 @@ bool BucketCatalog::prepareCommit(std::shared_ptr<WriteBatch> batch) {
 
     _waitToCommitBatch(batch);
 
-    BucketAccess bucket(this, batch->bucket());
-    if (!bucket) {
+    BucketAccess bucket(this, batch->bucket(), BucketState::kPrepared);
+    if (batch->finished()) {
+        // Someone may have aborted it while we were waiting.
+        return false;
+    } else if (!bucket) {
         abort(batch);
         return false;
     }
-
-    invariant(_setBucketState(bucket->_id, BucketState::kPrepared));
 
     auto prevMemoryUsage = bucket->_memoryUsage;
     batch->_prepareCommit();
     _memoryUsage.fetchAndAdd(bucket->_memoryUsage - prevMemoryUsage);
 
-    bucket->_batches.erase(batch->_lsid);
+    bucket->_batches.erase(batch->_opId);
 
     return true;
 }
@@ -270,11 +313,11 @@ void BucketCatalog::finish(std::shared_ptr<WriteBatch> batch, const CommitInfo& 
     invariant(!batch->finished());
     invariant(!batch->active());
 
-    BucketAccess bucket(this, batch->bucket());
-
+    Bucket* ptr(batch->bucket());
     batch->_finish(info);
+
+    BucketAccess bucket(this, ptr, BucketState::kNormal);
     if (bucket) {
-        invariant(_setBucketState(bucket->_id, BucketState::kNormal));
         bucket->_preparedBatch.reset();
     }
 
@@ -291,13 +334,22 @@ void BucketCatalog::finish(std::shared_ptr<WriteBatch> batch, const CommitInfo& 
         bucket->_numCommittedMeasurements += batch->measurements().size();
     }
 
-    if (bucket && bucket->allCommitted()) {
+    if (!bucket) {
+        // It's possible that we cleared the bucket in between preparing the commit and finishing
+        // here. In this case, we should abort any other ongoing batches and clear the bucket from
+        // the catalog so it's not hanging around idle.
+        auto lk = _lockExclusive();
+        if (_allBuckets.contains(ptr)) {
+            stdx::unique_lock blk{ptr->_mutex};
+            ptr->_preparedBatch.reset();
+            _abort(blk, ptr, nullptr, boost::none);
+        }
+    } else if (bucket->allCommitted()) {
         if (bucket->_full) {
             // Everything in the bucket has been committed, and nothing more will be added since the
             // bucket is full. Thus, we can remove it.
             _memoryUsage.fetchAndSubtract(bucket->_memoryUsage);
 
-            Bucket* ptr(bucket);
             bucket.release();
             auto lk = _lockExclusive();
 
@@ -348,13 +400,9 @@ void BucketCatalog::clear(const OID& oid) {
     }
 }
 
-void BucketCatalog::clear(const NamespaceString& ns) {
+void BucketCatalog::clear(const std::function<bool(const NamespaceString&)>& shouldClear) {
     auto lk = _lockExclusive();
     auto statsLk = _statsMutex.lockExclusive();
-
-    auto shouldClear = [&ns](const NamespaceString& bucketNs) {
-        return ns.coll().empty() ? ns.db() == bucketNs.db() : ns == bucketNs;
-    };
 
     for (auto it = _allBuckets.begin(); it != _allBuckets.end();) {
         auto nextIt = std::next(it);
@@ -370,8 +418,12 @@ void BucketCatalog::clear(const NamespaceString& ns) {
     }
 }
 
+void BucketCatalog::clear(const NamespaceString& ns) {
+    clear([&ns](const NamespaceString& bucketNs) { return bucketNs == ns; });
+}
+
 void BucketCatalog::clear(StringData dbName) {
-    clear(NamespaceString(dbName, ""));
+    clear([&dbName](const NamespaceString& bucketNs) { return bucketNs.db() == dbName; });
 }
 
 void BucketCatalog::appendExecutionStats(const NamespaceString& ns, BSONObjBuilder* builder) const {
@@ -454,7 +506,8 @@ bool BucketCatalog::_removeBucket(Bucket* bucket, bool expiringBuckets) {
 
     _memoryUsage.fetchAndSubtract(bucket->_memoryUsage);
     _markBucketNotIdle(bucket, expiringBuckets /* locked */);
-    _openBuckets.erase({std::move(bucket->_ns), std::move(bucket->_metadata)});
+    _removeNonNormalizedKeysForBucket(bucket);
+    _openBuckets.erase({bucket->_ns, bucket->_metadata});
     {
         stdx::lock_guard statesLk{_statesMutex};
         _bucketStates.erase(bucket->_id);
@@ -462,6 +515,13 @@ bool BucketCatalog::_removeBucket(Bucket* bucket, bool expiringBuckets) {
     _allBuckets.erase(it);
 
     return true;
+}
+
+void BucketCatalog::_removeNonNormalizedKeysForBucket(Bucket* bucket) {
+    auto comparator = bucket->_metadata.getComparator();
+    for (auto&& metadata : bucket->_nonNormalizedKeyMetadatas) {
+        _openBuckets.erase({bucket->_ns, {metadata.firstElement(), metadata, comparator}});
+    }
 }
 
 void BucketCatalog::_abort(stdx::unique_lock<Mutex>& lk,
@@ -476,15 +536,23 @@ void BucketCatalog::_abort(stdx::unique_lock<Mutex>& lk,
     }
     bucket->_batches.clear();
 
+    bool doRemove = true;  // We shouldn't remove the bucket if there's a prepared batch outstanding
+                           // and it's not the on we manage. In that case, we don't know what the
+                           // user is doing with it, but we need to keep the bucket around until
+                           // that batch is finished.
     if (auto& prepared = bucket->_preparedBatch) {
         if (prepared == batch) {
             prepared->_abort(status, true);
+            prepared.reset();
+        } else {
+            doRemove = false;
         }
-        prepared.reset();
     }
 
     lk.unlock();
-    [[maybe_unused]] bool removed = _removeBucket(bucket, false /* expiringBuckets */);
+    if (doRemove) {
+        [[maybe_unused]] bool removed = _removeBucket(bucket, false /* expiringBuckets */);
+    }
 }
 
 void BucketCatalog::_markBucketIdle(Bucket* bucket) {
@@ -534,17 +602,16 @@ std::size_t BucketCatalog::_numberOfIdleBuckets() const {
     return _idleBuckets.size();
 }
 
-BucketCatalog::Bucket* BucketCatalog::_allocateBucket(
-    const std::tuple<NamespaceString, BucketMetadata>& key,
-    const Date_t& time,
-    ExecutionStats* stats,
-    bool openedDuetoMetadata) {
+BucketCatalog::Bucket* BucketCatalog::_allocateBucket(const BucketKey& key,
+                                                      const Date_t& time,
+                                                      const TimeseriesOptions& options,
+                                                      ExecutionStats* stats,
+                                                      bool openedDuetoMetadata) {
     _expireIdleBuckets(stats);
 
     auto [it, inserted] = _allBuckets.insert(std::make_unique<Bucket>());
     Bucket* bucket = it->get();
-    _setIdTimestamp(bucket, time);
-    _bucketStates.emplace(bucket->_id, BucketState::kNormal);
+    _setIdTimestamp(bucket, time, options);
     _openBuckets[key] = bucket;
 
     if (openedDuetoMetadata) {
@@ -580,11 +647,18 @@ const std::shared_ptr<BucketCatalog::ExecutionStats> BucketCatalog::_getExecutio
     return kEmptyStats;
 }
 
-void BucketCatalog::_setIdTimestamp(Bucket* bucket, const Date_t& time) {
-    auto oldId = bucket->_id;
-    bucket->_id.setTimestamp(durationCount<Seconds>(time.toDurationSinceEpoch()));
+void BucketCatalog::_setIdTimestamp(Bucket* bucket,
+                                    const Date_t& time,
+                                    const TimeseriesOptions& options) {
+    auto const roundedSeconds = roundTimestampDown(time, options);
+    bucket->_id.setTimestamp(roundedSeconds);
+
+    // Make sure we set the control.min time field to match the rounded _id timestamp.
+    auto controlDoc = buildControlMinTimestampDoc(options.getTimeField(), roundedSeconds);
+    bucket->_minmax.update(
+        controlDoc, bucket->_metadata.getMetaField(), bucket->_metadata.getComparator());
+
     stdx::lock_guard statesLk{_statesMutex};
-    _bucketStates.erase(oldId);
     _bucketStates.emplace(bucket->_id, BucketState::kNormal);
 }
 
@@ -603,14 +677,13 @@ boost::optional<BucketCatalog::BucketState> BucketCatalog::_setBucketState(const
                 state = BucketState::kNormal;
             } else if (state == BucketState::kPreparedAndCleared) {
                 state = BucketState::kCleared;
-            } else {
-                invariant(state != BucketState::kCleared);
             }
             break;
         }
         case BucketState::kPrepared: {
-            invariant(state == BucketState::kNormal);
-            state = BucketState::kPrepared;
+            if (state == BucketState::kNormal) {
+                state = BucketState::kPrepared;
+            }
             break;
         }
         case BucketState::kCleared: {
@@ -629,26 +702,54 @@ boost::optional<BucketCatalog::BucketState> BucketCatalog::_setBucketState(const
     return state;
 }
 
-BucketCatalog::BucketMetadata::BucketMetadata(BSONObj&& obj,
+BucketCatalog::BucketMetadata::BucketMetadata(BSONElement elem,
                                               const StringData::ComparatorInterface* comparator)
-    : _metadata(obj), _comparator(comparator) {
-    BSONObjBuilder objBuilder;
-    // We will get an object of equal size, just with reordered fields.
-    objBuilder.bb().reserveBytes(obj.objsize());
-    normalizeObject(&objBuilder, _metadata);
-    _sorted = objBuilder.obj();
+    : _metadataElement(elem), _comparator(comparator) {}
+
+BucketCatalog::BucketMetadata::BucketMetadata(BSONElement elem,
+                                              BSONObj obj,
+                                              const StringData::ComparatorInterface* comparator,
+                                              bool normalized,
+                                              bool copied)
+    : _metadataElement(elem),
+      _metadata(obj),
+      _comparator(comparator),
+      _normalized(normalized),
+      _copied(copied) {}
+
+
+void BucketCatalog::BucketMetadata::normalize() {
+    if (!_normalized) {
+        if (_metadataElement) {
+            BSONObjBuilder objBuilder;
+            // We will get an object of equal size, just with reordered fields.
+            objBuilder.bb().reserveBytes(_metadataElement.size());
+            normalizeTopLevel(&objBuilder, _metadataElement);
+            _metadata = objBuilder.obj();
+        }
+        // Updates the BSONElement to refer to the copied BSONObj.
+        _metadataElement = _metadata.firstElement();
+        _normalized = true;
+        _copied = true;
+    }
 }
 
 bool BucketCatalog::BucketMetadata::operator==(const BucketMetadata& other) const {
-    return _sorted.binaryEqual(other._sorted);
+    return _metadataElement.binaryEqualValues(other._metadataElement);
 }
 
 const BSONObj& BucketCatalog::BucketMetadata::toBSON() const {
+    // Should only be called after the metadata is owned.
+    invariant(_copied);
     return _metadata;
 }
 
+const BSONElement BucketCatalog::BucketMetadata::getMetaElement() const {
+    return _metadataElement;
+}
+
 StringData BucketCatalog::BucketMetadata::getMetaField() const {
-    return _metadata.firstElementFieldNameStringData();
+    return StringData(_metadataElement.fieldName());
 }
 
 const StringData::ComparatorInterface* BucketCatalog::BucketMetadata::getComparator() const {
@@ -706,51 +807,104 @@ bool BucketCatalog::Bucket::allCommitted() const {
 }
 
 std::shared_ptr<BucketCatalog::WriteBatch> BucketCatalog::Bucket::_activeBatch(
-    const UUID& lsid, const std::shared_ptr<ExecutionStats>& stats) {
-    auto it = _batches.find(lsid);
+    OperationId opId, const std::shared_ptr<ExecutionStats>& stats) {
+    auto it = _batches.find(opId);
     if (it == _batches.end()) {
-        it = _batches.try_emplace(lsid, std::make_shared<WriteBatch>(this, lsid, stats)).first;
+        it = _batches.try_emplace(opId, std::make_shared<WriteBatch>(this, opId, stats)).first;
     }
     return it->second;
 }
 
 BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
-                                          const std::tuple<NamespaceString, BucketMetadata>& key,
+                                          BucketKey& key,
+                                          const TimeseriesOptions& options,
                                           ExecutionStats* stats,
                                           const Date_t& time)
-    : _catalog(catalog), _key(&key), _stats(stats), _time(&time) {
-    // precompute the hash outside the lock, since it's expensive
-    const auto& hasher = _catalog->_openBuckets.hash_function();
-    auto hash = hasher(*_key);
+    : _catalog(catalog), _key(&key), _options(&options), _stats(stats), _time(&time) {
 
-    {
-        auto lk = _catalog->_lockShared();
-        auto bucketState = _findOpenBucketAndLock(hash);
-        if (bucketState == BucketState::kNormal || bucketState == BucketState::kPrepared) {
+    auto bucketFound = [](BucketState bucketState) {
+        return bucketState == BucketState::kNormal || bucketState == BucketState::kPrepared;
+    };
+
+    // First we try to find the bucket without normalizing the key as the normalization is an
+    // expensive operation.
+    auto hashedKey = BucketHasher{}.hashed_key(key);
+    if (bucketFound(_findOpenBucketThenLock(hashedKey))) {
+        return;
+    }
+
+    // If not found, we normalize the metadata object and try to find it again.
+    // Save a copy of the non-normalized metadata before normalizing so we can add this key if the
+    // bucket was found for the normalized metadata. The BSON element is still refering to that of
+    // the document in current scope at this point. We will only make a copy of it when we decide to
+    // store it.
+    BSONElement nonNormalizedMetadata = key.metadata.getMetaElement();
+    key.metadata.normalize();
+    HashedBucketKey hashedNormalizedKey = BucketHasher{}.hashed_key(key);
+
+    if (bucketFound(_findOpenBucketThenLock(hashedNormalizedKey))) {
+        // Bucket found, check if we have available slots to store the non-normalized key
+        if (_bucket->_nonNormalizedKeyMetadatas.size() ==
+            _bucket->_nonNormalizedKeyMetadatas.capacity()) {
+            return;
+        }
+
+        // Release the bucket as we need to acquire the exclusive lock for the catalog.
+        release();
+
+        // Re-construct the key as it were before normalization.
+        auto originalBucketKey = nonNormalizedMetadata
+            ? key.withCopiedMetadata(nonNormalizedMetadata.wrap())
+            : key.withCopiedMetadata(BSONObj());
+        hashedKey.key = &originalBucketKey;
+
+        // Find the bucket under a catalog exclusive lock for the catalog. It may have been modified
+        // since we released our locks. If found we store the key to avoid the need to normalize for
+        // future lookups with this incoming field order.
+        BSONObj nonNormalizedMetadataObj =
+            nonNormalizedMetadata ? nonNormalizedMetadata.wrap() : BSONObj();
+        if (bucketFound(_findOpenBucketThenLockAndStoreKey(
+                hashedNormalizedKey, hashedKey, nonNormalizedMetadataObj))) {
             return;
         }
     }
 
+    // Bucket not found, grab exclusive lock and create bucket with the key before normalization.
+    auto originalBucketKey = nonNormalizedMetadata
+        ? key.withCopiedMetadata(nonNormalizedMetadata.wrap())
+        : key.withCopiedMetadata(BSONObj());
+    hashedKey.key = &originalBucketKey;
     auto lk = _catalog->_lockExclusive();
-    _findOrCreateOpenBucketAndLock(hash);
+    _findOrCreateOpenBucketThenLock(hashedNormalizedKey, hashedKey);
 }
 
-BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog, Bucket* bucket)
+BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
+                                          Bucket* bucket,
+                                          boost::optional<BucketState> targetState)
     : _catalog(catalog) {
-    auto lk = _catalog->_lockShared();
-    auto bucketIt = _catalog->_allBuckets.find(bucket);
-    if (bucketIt == _catalog->_allBuckets.end()) {
-        return;
+    {
+        auto lk = _catalog->_lockShared();
+        auto bucketIt = _catalog->_allBuckets.find(bucket);
+        if (bucketIt == _catalog->_allBuckets.end()) {
+            return;
+        }
+
+        _bucket = bucket;
+        _acquire();
     }
 
-    _bucket = bucket;
-    _acquire();
-
-    stdx::lock_guard statesLk{_catalog->_statesMutex};
-    auto statesIt = _catalog->_bucketStates.find(_bucket->_id);
-    invariant(statesIt != _catalog->_bucketStates.end());
-    auto& [_, state] = *statesIt;
-    if (state == BucketState::kCleared) {
+    boost::optional<BucketState> state{BucketState::kCleared};
+    if (targetState) {
+        invariant(*targetState == BucketState::kNormal || *targetState == BucketState::kPrepared);
+        state = _catalog->_setBucketState(_bucket->_id, *targetState);
+    } else {
+        stdx::lock_guard statesLk{_catalog->_statesMutex};
+        auto statesIt = _catalog->_bucketStates.find(_bucket->_id);
+        if (statesIt != _catalog->_bucketStates.end()) {
+            state = statesIt->second;
+        }
+    }
+    if (!state || state == BucketState::kCleared || state == BucketState::kPreparedAndCleared) {
         release();
     }
 }
@@ -761,16 +915,57 @@ BucketCatalog::BucketAccess::~BucketAccess() {
     }
 }
 
-BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketAndLock(std::size_t hash) {
-    auto it = _catalog->_openBuckets.find(*_key, hash);
-    if (it == _catalog->_openBuckets.end()) {
-        // Bucket does not exist.
-        return BucketState::kCleared;
+BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketThenLock(
+    const HashedBucketKey& key) {
+    {
+        auto lk = _catalog->_lockShared();
+        auto it = _catalog->_openBuckets.find(key);
+        if (it == _catalog->_openBuckets.end()) {
+            // Bucket does not exist.
+            return BucketState::kCleared;
+        }
+
+        _bucket = it->second;
+        _acquire();
     }
 
-    _bucket = it->second;
-    _acquire();
+    return _confirmStateForAcquiredBucket();
+}
 
+BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketThenLockAndStoreKey(
+    const HashedBucketKey& normalizedKey,
+    const HashedBucketKey& nonNormalizedKey,
+    BSONObj nonNormalizedMetadata) {
+    invariant(!isLocked());
+    {
+        auto lk = _catalog->_lockExclusive();
+        auto it = _catalog->_openBuckets.find(normalizedKey);
+        if (it == _catalog->_openBuckets.end()) {
+            // Bucket does not exist.
+            return BucketState::kCleared;
+        }
+
+        _bucket = it->second;
+        _acquire();
+
+        // Store the non-normalized key if we still have free slots
+        if (_bucket->_nonNormalizedKeyMetadatas.size() <
+            _bucket->_nonNormalizedKeyMetadatas.capacity()) {
+            auto [_, inserted] =
+                _catalog->_openBuckets.insert(std::make_pair(nonNormalizedKey, _bucket));
+            if (inserted) {
+                _bucket->_nonNormalizedKeyMetadatas.push_back(nonNormalizedMetadata);
+                // Increment the memory usage to store this key and value in _openBuckets
+                _bucket->_memoryUsage += nonNormalizedKey.key->ns.size() +
+                    nonNormalizedMetadata.objsize() + sizeof(_bucket);
+            }
+        }
+    }
+
+    return _confirmStateForAcquiredBucket();
+}
+
+BucketCatalog::BucketState BucketCatalog::BucketAccess::_confirmStateForAcquiredBucket() {
     stdx::lock_guard statesLk{_catalog->_statesMutex};
     auto statesIt = _catalog->_bucketStates.find(_bucket->_id);
     invariant(statesIt != _catalog->_bucketStates.end());
@@ -784,11 +979,12 @@ BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketAndLock(s
     return state;
 }
 
-void BucketCatalog::BucketAccess::_findOrCreateOpenBucketAndLock(std::size_t hash) {
-    auto it = _catalog->_openBuckets.find(*_key, hash);
+void BucketCatalog::BucketAccess::_findOrCreateOpenBucketThenLock(
+    const HashedBucketKey& normalizedKey, const HashedBucketKey& nonNormalizedKey) {
+    auto it = _catalog->_openBuckets.find(normalizedKey);
     if (it == _catalog->_openBuckets.end()) {
         // No open bucket for this metadata.
-        _create();
+        _create(normalizedKey, nonNormalizedKey);
         return;
     }
 
@@ -807,7 +1003,7 @@ void BucketCatalog::BucketAccess::_findOrCreateOpenBucketAndLock(std::size_t has
     }
 
     _catalog->_abort(_guard, _bucket, nullptr, boost::none);
-    _create();
+    _create(normalizedKey, nonNormalizedKey);
 }
 
 void BucketCatalog::BucketAccess::_acquire() {
@@ -815,8 +1011,14 @@ void BucketCatalog::BucketAccess::_acquire() {
     _guard = stdx::unique_lock<Mutex>(_bucket->_mutex);
 }
 
-void BucketCatalog::BucketAccess::_create(bool openedDuetoMetadata) {
-    _bucket = _catalog->_allocateBucket(*_key, *_time, _stats, openedDuetoMetadata);
+void BucketCatalog::BucketAccess::_create(const HashedBucketKey& normalizedKey,
+                                          const HashedBucketKey& nonNormalizedKey,
+                                          bool openedDuetoMetadata) {
+    invariant(_options);
+    _bucket =
+        _catalog->_allocateBucket(normalizedKey, *_time, *_options, _stats, openedDuetoMetadata);
+    _catalog->_openBuckets[nonNormalizedKey] = _bucket;
+    _bucket->_nonNormalizedKeyMetadatas.push_back(nonNormalizedKey.key->metadata.toBSON());
     _acquire();
 }
 
@@ -852,11 +1054,15 @@ void BucketCatalog::BucketAccess::rollover(const std::function<bool(BucketAccess
     release();
 
     // Precompute the hash outside the lock, since it's expensive.
-    const auto& hasher = _catalog->_openBuckets.hash_function();
-    auto hash = hasher(*_key);
+    auto prevMetadata = _key->metadata.getMetaElement();
+    _key->metadata.normalize();
+    auto hashedNormalizedKey = BucketHasher{}.hashed_key(*_key);
+    auto prevBucketKey = prevMetadata ? _key->withCopiedMetadata(prevMetadata.wrap())
+                                      : _key->withCopiedMetadata(BSONObj());
+    auto hashedKey = BucketHasher{}.hashed_key(prevBucketKey);
 
     auto lk = _catalog->_lockExclusive();
-    _findOrCreateOpenBucketAndLock(hash);
+    _findOrCreateOpenBucketThenLock(hashedNormalizedKey, hashedKey);
 
     // Recheck if still full now that we've reacquired the bucket.
     bool sameBucket =
@@ -872,339 +1078,25 @@ void BucketCatalog::BucketAccess::rollover(const std::function<bool(BucketAccess
             invariant(removed);
         } else {
             _bucket->_full = true;
+
+            // We will recreate a new bucket for the same key below. We also need to cleanup all
+            // extra metadata keys added for the old bucket instance.
+            _catalog->_removeNonNormalizedKeysForBucket(_bucket);
             release();
         }
 
-        _create(false /* openedDueToMetadata */);
+        _create(hashedNormalizedKey, hashedKey, false /* openedDueToMetadata */);
     }
-}
-
-void BucketCatalog::BucketAccess::setTime() {
-    invariant(isLocked());
-    invariant(_key);
-    invariant(_stats);
-    invariant(_time);
-
-    _catalog->_setIdTimestamp(_bucket, *_time);
 }
 
 Date_t BucketCatalog::BucketAccess::getTime() const {
     return _bucket->id().asDateT();
 }
 
-void BucketCatalog::MinMax::Data::setValue(const BSONElement& elem) {
-    auto requiredSize = elem.size() - elem.fieldNameSize() + 1;
-    if (_totalSize < requiredSize) {
-        _value = std::make_unique<char[]>(requiredSize);
-    }
-    // Store element as BSONElement buffer but strip out the field name
-    _value[0] = elem.type();
-    _value[1] = '\0';
-    memcpy(_value.get() + 2, elem.value(), elem.valuesize());
-    _totalSize = requiredSize;
-    _type = Type::kValue;
-    _updated = true;
-}
-
-void BucketCatalog::MinMax::Data::setObject() {
-    if (std::exchange(_type, Type::kObject) != Type::kObject) {
-        _updated = true;
-    }
-}
-
-void BucketCatalog::MinMax::Data::setRootObject() {
-    _type = Type::kObject;
-}
-
-void BucketCatalog::MinMax::Data::setArray() {
-    if (std::exchange(_type, Type::kArray) != Type::kArray) {
-        _updated = true;
-    }
-}
-
-BSONElement BucketCatalog::MinMax::Data::value() const {
-    return BSONElement(_value.get(), 1, _totalSize, BSONElement::CachedSizeTag{});
-}
-
-BSONType BucketCatalog::MinMax::Data::valueType() const {
-    return (BSONType)_value[0];
-}
-
-int BucketCatalog::MinMax::Data::valueSize() const {
-    return _totalSize;
-}
-
-void BucketCatalog::MinMax::update(const BSONObj& doc,
-                                   boost::optional<StringData> metaField,
-                                   const StringData::ComparatorInterface* stringComparator) {
-    invariant(_min.type() == Type::kObject || _min.type() == Type::kUnset);
-    invariant(_max.type() == Type::kObject || _max.type() == Type::kUnset);
-
-
-    _min.setRootObject();
-    _max.setRootObject();
-    for (auto&& elem : doc) {
-        if (metaField && elem.fieldNameStringData() == metaField) {
-            continue;
-        }
-        _updateWithMemoryUsage(&_object[elem.fieldNameStringData()], elem, stringComparator);
-    }
-}
-
-void BucketCatalog::MinMax::_update(BSONElement elem,
-                                    const StringData::ComparatorInterface* stringComparator) {
-    auto typeComp = [&](BSONType type) {
-        return elem.canonicalType() - canonicalizeBSONType(type);
-    };
-
-    if (elem.type() == Object) {
-        auto shouldUpdateObject = [&](Data& data, auto compare) {
-            return data.type() == Type::kObject || data.type() == Type::kUnset ||
-                (data.type() == Type::kArray && compare(typeComp(Array), 0)) ||
-                (data.type() == Type::kValue && compare(typeComp(data.valueType()), 0));
-        };
-        bool updateMin = shouldUpdateObject(_min, std::less<int>{});
-        if (updateMin) {
-            _min.setObject();
-        }
-        bool updateMax = shouldUpdateObject(_max, std::greater<int>{});
-        if (updateMax) {
-            _max.setObject();
-        }
-
-        // Compare objects element-wise if min or max need to be updated
-        if (updateMin || updateMax) {
-            for (auto&& subElem : elem.Obj()) {
-                _updateWithMemoryUsage(
-                    &_object[subElem.fieldNameStringData()], subElem, stringComparator);
-            }
-        }
-        return;
-    }
-
-    if (elem.type() == Array) {
-        auto shouldUpdateArray = [&](Data& data, auto compare) {
-            return data.type() == Type::kArray || data.type() == Type::kUnset ||
-                (data.type() == Type::kObject && compare(typeComp(Object), 0)) ||
-                (data.type() == Type::kValue && compare(typeComp(data.valueType()), 0));
-        };
-        bool updateMin = shouldUpdateArray(_min, std::less<int>{});
-        if (updateMin) {
-            _min.setArray();
-        }
-        bool updateMax = shouldUpdateArray(_max, std::greater<int>{});
-        if (updateMax) {
-            _max.setArray();
-        }
-        // Compare objects element-wise if min or max need to be updated
-        if (updateMin || updateMax) {
-            auto elemArray = elem.Array();
-            if (_array.size() < elemArray.size()) {
-                _array.resize(elemArray.size());
-            }
-            for (size_t i = 0; i < elemArray.size(); i++) {
-                _updateWithMemoryUsage(&_array[i], elemArray[i], stringComparator);
-            }
-        }
-        return;
-    }
-
-    auto maybeUpdateValue = [&](Data& data, auto compare) {
-        if (data.type() == Type::kUnset ||
-            (data.type() == Type::kObject && compare(typeComp(Object), 0)) ||
-            (data.type() == Type::kArray && compare(typeComp(Array), 0)) ||
-            (data.type() == Type::kValue &&
-             compare(elem.woCompare(data.value(), false, stringComparator), 0))) {
-            data.setValue(elem);
-        }
-    };
-    maybeUpdateValue(_min, std::less<int>{});
-    maybeUpdateValue(_max, std::greater<int>{});
-}
-
-void BucketCatalog::MinMax::_updateWithMemoryUsage(
-    MinMax* minMax, BSONElement elem, const StringData::ComparatorInterface* stringComparator) {
-    _memoryUsage -= minMax->getMemoryUsage();
-    minMax->_update(elem, stringComparator);
-    _memoryUsage += minMax->getMemoryUsage();
-}
-
-BSONObj BucketCatalog::MinMax::min() const {
-    invariant(_min.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _append(&builder, GetMin());
-    return builder.obj();
-}
-
-BSONObj BucketCatalog::MinMax::max() const {
-    invariant(_max.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _append(&builder, GetMax());
-    return builder.obj();
-}
-
-template <typename GetDataFn>
-void BucketCatalog::MinMax::_append(BSONObjBuilder* builder, GetDataFn getData) const {
-    invariant(getData(*this).type() == Type::kObject);
-
-    for (const auto& minMax : _object) {
-        const Data& data = getData(minMax.second);
-        invariant(data.type() != Type::kUnset);
-        if (data.type() == Type::kObject) {
-            BSONObjBuilder subObj(builder->subobjStart(minMax.first));
-            minMax.second._append(&subObj, getData);
-        } else if (data.type() == Type::kArray) {
-            BSONArrayBuilder subArr(builder->subarrayStart(minMax.first));
-            minMax.second._append(&subArr, getData);
-        } else {
-            builder->appendAs(data.value(), minMax.first);
-        }
-    }
-}
-
-template <typename GetDataFn>
-void BucketCatalog::MinMax::_append(BSONArrayBuilder* builder, GetDataFn getData) const {
-    invariant(getData(*this).type() == Type::kArray);
-
-    for (const auto& minMax : _array) {
-        const Data& data = getData(minMax);
-        invariant(data.type() != Type::kUnset);
-        if (data.type() == Type::kObject) {
-            BSONObjBuilder subObj(builder->subobjStart());
-            minMax._append(&subObj, getData);
-        } else if (data.type() == Type::kArray) {
-            BSONArrayBuilder subArr(builder->subarrayStart());
-            minMax._append(&subArr, getData);
-        } else {
-            builder->append(data.value());
-        }
-    }
-}
-
-BSONObj BucketCatalog::MinMax::minUpdates() {
-    invariant(_min.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _appendUpdates(&builder, GetMin());
-    return builder.obj();
-}
-
-BSONObj BucketCatalog::MinMax::maxUpdates() {
-    invariant(_max.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _appendUpdates(&builder, GetMax());
-    return builder.obj();
-}
-
-template <typename GetDataFn>
-bool BucketCatalog::MinMax::_appendUpdates(BSONObjBuilder* builder, GetDataFn getData) {
-    const auto& data = getData(*this);
-    invariant(data.type() == Type::kObject || data.type() == Type::kArray);
-
-    bool appended = false;
-    if (data.type() == Type::kObject) {
-        bool hasUpdateSection = false;
-        BSONObjBuilder updateSection;
-        StringMap<BSONObj> subDiffs;
-        for (auto& minMax : _object) {
-            const auto& subdata = getData(minMax.second);
-            invariant(subdata.type() != Type::kUnset);
-            if (subdata.updated()) {
-                if (subdata.type() == Type::kObject) {
-                    BSONObjBuilder subObj(updateSection.subobjStart(minMax.first));
-                    minMax.second._append(&subObj, getData);
-                } else if (subdata.type() == Type::kArray) {
-                    BSONArrayBuilder subArr(updateSection.subarrayStart(minMax.first));
-                    minMax.second._append(&subArr, getData);
-                } else {
-                    updateSection.appendAs(subdata.value(), minMax.first);
-                }
-                minMax.second._clearUpdated(getData);
-                appended = true;
-                hasUpdateSection = true;
-            } else if (subdata.type() != Type::kValue) {
-                BSONObjBuilder subDiff;
-                if (minMax.second._appendUpdates(&subDiff, getData)) {
-                    // An update occurred at a lower level, so append the sub diff.
-                    subDiffs[doc_diff::kSubDiffSectionFieldPrefix + minMax.first] = subDiff.obj();
-                    appended = true;
-                };
-            }
-        }
-        if (hasUpdateSection) {
-            builder->append(doc_diff::kUpdateSectionFieldName, updateSection.done());
-        }
-
-        // Sub diffs are required to come last.
-        for (auto& subDiff : subDiffs) {
-            builder->append(subDiff.first, std::move(subDiff.second));
-        }
-    } else {
-        builder->append(doc_diff::kArrayHeader, true);
-        DecimalCounter<size_t> count;
-        for (auto& minMax : _array) {
-            const auto& subdata = getData(minMax);
-            invariant(subdata.type() != Type::kUnset);
-            if (subdata.updated()) {
-                std::string updateFieldName = str::stream()
-                    << doc_diff::kUpdateSectionFieldName << StringData(count);
-                if (subdata.type() == Type::kObject) {
-                    BSONObjBuilder subObj(builder->subobjStart(updateFieldName));
-                    minMax._append(&subObj, getData);
-                } else if (subdata.type() == Type::kArray) {
-                    BSONArrayBuilder subArr(builder->subarrayStart(updateFieldName));
-                    minMax._append(&subArr, getData);
-                } else {
-                    builder->appendAs(subdata.value(), updateFieldName);
-                }
-                minMax._clearUpdated(getData);
-                appended = true;
-            } else if (subdata.type() != Type::kValue) {
-                BSONObjBuilder subDiff;
-                if (minMax._appendUpdates(&subDiff, getData)) {
-                    // An update occurred at a lower level, so append the sub diff.
-                    builder->append(str::stream() << doc_diff::kSubDiffSectionFieldPrefix
-                                                  << StringData(count),
-                                    subDiff.done());
-                    appended = true;
-                }
-            }
-            ++count;
-        }
-    }
-
-    return appended;
-}
-
-template <typename GetDataFn>
-void BucketCatalog::MinMax::_clearUpdated(GetDataFn getData) {
-    auto& data = getData(*this);
-    invariant(data.type() != Type::kUnset);
-
-    data.clearUpdated();
-    if (data.type() == Type::kObject) {
-        for (auto& minMax : _object) {
-            minMax.second._clearUpdated(getData);
-        }
-    } else if (_min.type() == Type::kArray) {
-        for (auto& minMax : _array) {
-            minMax._clearUpdated(getData);
-        }
-    }
-}
-
-uint64_t BucketCatalog::MinMax::getMemoryUsage() const {
-    return _memoryUsage + _min.valueSize() + _min.valueSize() +
-        (sizeof(MinMax) * (_object.size() + _array.size()));
-}
-
 BucketCatalog::WriteBatch::WriteBatch(Bucket* bucket,
-                                      const UUID& lsid,
+                                      OperationId opId,
                                       const std::shared_ptr<ExecutionStats>& stats)
-    : _bucket{bucket}, _lsid(lsid), _stats{stats} {}
+    : _bucket{bucket}, _opId(opId), _stats{stats} {}
 
 bool BucketCatalog::WriteBatch::claimCommitRights() {
     return !_commitRights.swap(true);
@@ -1297,16 +1189,24 @@ void BucketCatalog::WriteBatch::_prepareCommit() {
         ++it;
     }
 
-    _bucket->_memoryUsage -= _bucket->_minmax.getMemoryUsage();
     for (const auto& doc : _measurements) {
         _bucket->_minmax.update(
             doc, _bucket->_metadata.getMetaField(), _bucket->_metadata.getComparator());
     }
-    _bucket->_memoryUsage += _bucket->_minmax.getMemoryUsage();
 
     const bool isUpdate = _numPreviouslyCommittedMeasurements > 0;
-    _min = isUpdate ? _bucket->_minmax.minUpdates() : _bucket->_minmax.min();
-    _max = isUpdate ? _bucket->_minmax.maxUpdates() : _bucket->_minmax.max();
+    if (isUpdate) {
+        _min = _bucket->_minmax.minUpdates();
+        _max = _bucket->_minmax.maxUpdates();
+    } else {
+        _min = _bucket->_minmax.min();
+        _max = _bucket->_minmax.max();
+
+        // Approximate minmax memory usage by taking sizes of initial commit. Subsequent updates may
+        // add fields but are most likely just to update values.
+        _bucket->_memoryUsage += _min.objsize();
+        _bucket->_memoryUsage += _max.objsize();
+    }
 }
 
 void BucketCatalog::WriteBatch::_finish(const CommitInfo& info) {
@@ -1318,6 +1218,10 @@ void BucketCatalog::WriteBatch::_finish(const CommitInfo& info) {
 
 void BucketCatalog::WriteBatch::_abort(const boost::optional<Status>& status,
                                        bool canAccessBucket) {
+    if (finished()) {
+        return;
+    }
+
     _active = false;
     std::string bucketIdentification;
     if (canAccessBucket) {

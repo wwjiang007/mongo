@@ -2,10 +2,9 @@
  * Verifies multi-writes in transactions are sent with shard versions to only the targeted shards.
  *
  * @tags: [
- *  requires_find_command,
- *  requires_sharding,
- *  uses_multi_shard_transaction,
- *  uses_transactions,
+ *   requires_sharding,
+ *   uses_multi_shard_transaction,
+ *   uses_transactions,
  * ]
  */
 (function() {
@@ -17,7 +16,7 @@ const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-const st = new ShardingTest({shards: 3, config: 1, mongos: 2});
+const st = new ShardingTest({shards: 3, mongos: 2});
 
 enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
 enableStaleVersionAndSnapshotRetriesWithinTransactions(st);

@@ -37,29 +37,17 @@
 namespace mongo {
 
 class WindowFunctionExecForEndpoint : public WindowFunctionExec {
-public:
-    // Endpoint executors are constant size and don't hold any of the values passing through.
-    size_t getApproximateSize() const final {
-        return 0;
-    }
-
 protected:
     WindowFunctionExecForEndpoint(PartitionIterator* iter,
                                   boost::intrusive_ptr<Expression> input,
                                   WindowBounds bounds,
-                                  boost::optional<boost::intrusive_ptr<Expression>> defaultValue)
-        : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kEndpoints)),
+                                  const boost::optional<Value>& defaultValue,
+                                  MemoryUsageTracker::PerFunctionMemoryTracker* memTracker)
+        : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kEndpoints),
+                             memTracker),
           _input(std::move(input)),
-          _bounds(std::move(bounds)) {
-        if (!defaultValue) {
-            _default = Value{BSONNULL};
-        } else {
-            boost::intrusive_ptr<Expression> expr = (*defaultValue)->optimize();
-            ExpressionConstant* ec = dynamic_cast<ExpressionConstant*>(expr.get());
-            tassert(ErrorCodes::FailedToParse, "default expression must be a constant.", ec);
-            _default = ec->getValue();
-        }
-    }
+          _bounds(std::move(bounds)),
+          _default(defaultValue.get_value_or(Value(BSONNULL))) {}
 
     Value getFirst() {
         auto endpoints = _iter.getEndpoints(_bounds);
@@ -90,9 +78,10 @@ public:
     WindowFunctionExecFirst(PartitionIterator* iter,
                             boost::intrusive_ptr<Expression> input,
                             WindowBounds bounds,
-                            boost::optional<boost::intrusive_ptr<Expression>> defaultValue)
+                            const boost::optional<Value>& defaultValue,
+                            MemoryUsageTracker::PerFunctionMemoryTracker* memTracker)
         : WindowFunctionExecForEndpoint(
-              iter, std::move(input), std::move(bounds), std::move(defaultValue)) {}
+              iter, std::move(input), std::move(bounds), defaultValue, memTracker) {}
 
     Value getNext() {
         return getFirst();
@@ -103,8 +92,10 @@ class WindowFunctionExecLast final : public WindowFunctionExecForEndpoint {
 public:
     WindowFunctionExecLast(PartitionIterator* iter,
                            boost::intrusive_ptr<Expression> input,
-                           WindowBounds bounds)
-        : WindowFunctionExecForEndpoint(iter, input, std::move(bounds), boost::none) {}
+                           WindowBounds bounds,
+                           MemoryUsageTracker::PerFunctionMemoryTracker* memTracker)
+        : WindowFunctionExecForEndpoint(
+              iter, std::move(input), std::move(bounds), boost::none, memTracker) {}
 
     Value getNext() {
         return getLast();

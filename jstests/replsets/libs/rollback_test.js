@@ -128,6 +128,10 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         // Make sure we have a primary.
         curPrimary = replSet.getPrimary();
+        // The default WC is majority and we must use w:1 to be able to properly test rollback.
+        assert.commandWorked(curPrimary.adminCommand(
+            {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+        replSet.awaitReplication();
 
         // Extract the other two nodes and wait for them to be ready.
         let secondaries = replSet.getSecondaries();
@@ -159,7 +163,8 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         // Make sync source selection faster.
         replSet.nodes.forEach((node) => {
-            setFailPoint(node, "forceBgSyncSyncSourceRetryWaitMS", {sleepMS: kRetryIntervalMS});
+            configureFailPoint(
+                node, "forceBgSyncSyncSourceRetryWaitMS", {sleepMS: kRetryIntervalMS});
             setFastGetMoreEnabled(node);
         });
 
@@ -607,7 +612,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // Fail-point will clear on restart so do post-start.
         setFastGetMoreEnabled(rst.nodes[nodeId]);
         // Make sync source selection faster.
-        setFailPoint(
+        configureFailPoint(
             rst.nodes[nodeId], "forceBgSyncSyncSourceRetryWaitMS", {sleepMS: kRetryIntervalMS});
 
         // Step up if the restarted node is the current primary.

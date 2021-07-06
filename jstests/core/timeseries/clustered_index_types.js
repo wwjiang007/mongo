@@ -2,12 +2,10 @@
  * Tests inserting various _id values and duplicates on a collection clustered by _id.
  *
  * @tags: [
- *     assumes_against_mongod_not_mongos,
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_wiredtiger,
+ *   assumes_against_mongod_not_mongos,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   requires_fcv_49,
  * ]
  */
 
@@ -16,17 +14,11 @@
 
 load("jstests/core/timeseries/libs/timeseries.js");
 
-// Although this test is tagged with 'requires_wiredtiger', this is not sufficient for ensuring that
-// the parallel suite runs this test only on WT configurations.
-if (!TimeseriesTest.supportsClusteredIndexes(db.getMongo())) {
-    return;
-}
-
 const collName = 'system.buckets.test';
 const coll = db[collName];
 coll.drop();
 
-assert.commandWorked(db.createCollection(collName, {clusteredIndex: {}}));
+assert.commandWorked(db.createCollection(collName, {clusteredIndex: true}));
 
 // Expect that duplicates are rejected.
 let oid = new ObjectId();

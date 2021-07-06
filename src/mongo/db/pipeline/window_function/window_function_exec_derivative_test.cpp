@@ -53,7 +53,7 @@ public:
         boost::optional<TimeUnit> timeUnit = boost::none) {
         _docSource = DocumentSourceMock::createForTest(std::move(docs), getExpCtx());
         _iter = std::make_unique<PartitionIterator>(
-            getExpCtx().get(), _docSource.get(), boost::none, boost::none);
+            getExpCtx().get(), _docSource.get(), &_tracker, boost::none, boost::none);
 
         auto position = ExpressionFieldPath::parse(
             getExpCtx().get(), positionPath, getExpCtx()->variablesParseState);
@@ -64,7 +64,8 @@ public:
                                             std::move(position),
                                             std::move(time),
                                             std::move(bounds),
-                                            std::move(timeUnit));
+                                            std::move(timeUnit),
+                                            &_tracker["output"]);
     }
 
     auto advanceIterator() {
@@ -73,20 +74,18 @@ public:
 
     Value eval(std::pair<Value, Value> start,
                std::pair<Value, Value> end,
-               boost::optional<TimeUnit> outputUnit = {}) {
+               boost::optional<TimeUnit> unit = {}) {
         const std::deque<DocumentSource::GetNextResult> docs{
             Document{{"t", start.first}, {"y", start.second}},
             Document{{"t", end.first}, {"y", end.second}}};
-        auto mgr = createForFieldPath(std::move(docs),
-                                      "$y",
-                                      "$t",
-                                      {WindowBounds::DocumentBased{0, 1}},
-                                      std::move(outputUnit));
+        auto mgr = createForFieldPath(
+            std::move(docs), "$y", "$t", {WindowBounds::DocumentBased{0, 1}}, std::move(unit));
         return mgr.getNext();
     }
 
 private:
     boost::intrusive_ptr<DocumentSourceMock> _docSource;
+    MemoryUsageTracker _tracker{false, 100 * 1024 * 1024 /* default memory limit */};
     std::unique_ptr<PartitionIterator> _iter;
 };
 
@@ -240,41 +239,39 @@ TEST_F(WindowFunctionExecDerivativeTest, NonNumbers) {
     auto y0 = Value{5};
     auto y1 = Value{6};
     auto bad = Value{"a string"_sd};
-    // If any one value (position or time) is an invalid type, such as a string, the output is null.
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({bad, y0}, {t1, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, bad}, {t1, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {bad, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {t1, bad}));
 
-    // If any one value is null, the output is null.
+    // If the position or time is an invalid type, it's an error.
+    ASSERT_THROWS_CODE(eval({t0, bad}, {t1, y1}), DBException, ErrorCodes::TypeMismatch);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {t1, bad}), DBException, ErrorCodes::TypeMismatch);
+    ASSERT_THROWS_CODE(eval({bad, y0}, {t1, y1}), DBException, 5624902);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {bad, y1}), DBException, 5624902);
+
     bad = Value{BSONNULL};
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({bad, y0}, {t1, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, bad}, {t1, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {bad, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {t1, bad}));
+    // If the position or time is null, it's an error.
+    ASSERT_THROWS_CODE(eval({t0, bad}, {t1, y1}), DBException, 5624903);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {t1, bad}), DBException, 5624903);
+    ASSERT_THROWS_CODE(eval({bad, y0}, {t1, y1}), DBException, 5624902);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {bad, y1}), DBException, 5624902);
 
-    // If any one value is missing, the output is null.
     bad = Value{};
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({bad, y0}, {t1, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, bad}, {t1, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {bad, y1}));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {t1, bad}));
+    // If the position or time is missing, it's an error.
+    ASSERT_THROWS_CODE(eval({t0, bad}, {t1, y1}), DBException, 5624903);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {t1, bad}), DBException, 5624903);
+    ASSERT_THROWS_CODE(eval({bad, y0}, {t1, y1}), DBException, 5624902);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {bad, y1}), DBException, 5624902);
 }
 
 TEST_F(WindowFunctionExecDerivativeTest, DatesAreNonNumbers) {
-    // When no outputUnit is specified, dates are treated as any other non-numeric type.
+    // When no unit is specified, dates are considered an invalid type (an error).
 
-    // 'y' increases by 1, over 8ms.
     auto t0 = Value{Date_t::fromMillisSinceEpoch(0)};
     auto t1 = Value{Date_t::fromMillisSinceEpoch(8)};
     auto y0 = Value{5};
     auto y1 = Value{6};
-    // Each ms, 'y' increases by 1/8.
-    // This is exact despite floating point, because 8 is a power of 2.
-    ASSERT_VALUE_EQ(Value(BSONNULL), eval({t0, y0}, {t1, y1}));
+    ASSERT_THROWS_CODE(eval({t0, y0}, {t1, y1}), DBException, 5624901);
 }
 
-TEST_F(WindowFunctionExecDerivativeTest, OutputUnit) {
+TEST_F(WindowFunctionExecDerivativeTest, Unit) {
     // 'y' increases by 1, over 8ms.
     auto t0 = Value{Date_t::fromMillisSinceEpoch(0)};
     auto t1 = Value{Date_t::fromMillisSinceEpoch(8)};
@@ -296,9 +293,8 @@ TEST_F(WindowFunctionExecDerivativeTest, OutputUnit) {
     ASSERT_VALUE_EQ(Value{(1.0 / 8) * 1000 * 60 * 60 * 24 * 7}, calc(TimeUnit::week));
 }
 
-TEST_F(WindowFunctionExecDerivativeTest, OutputUnitNonDate) {
-    // outputUnit requires the time input to be a datetime: non-datetimes are treated like any other
-    // invalid type ($derivate returns null).
+TEST_F(WindowFunctionExecDerivativeTest, UnitNonDate) {
+    // unit requires the time input to be a datetime: non-datetimes throw an error.
 
     auto t0 = Value{Date_t::fromMillisSinceEpoch(0)};
     auto t1 = Value{Date_t::fromMillisSinceEpoch(1000)};
@@ -306,8 +302,8 @@ TEST_F(WindowFunctionExecDerivativeTest, OutputUnitNonDate) {
     auto y1 = Value{0};
     auto bad = Value{500};
 
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({bad, y0}, {t1, y1}, TimeUnit::millisecond));
-    ASSERT_VALUE_EQ(Value{BSONNULL}, eval({t0, y0}, {bad, y1}, TimeUnit::millisecond));
+    ASSERT_THROWS_CODE(eval({bad, y0}, {t1, y1}, TimeUnit::millisecond), DBException, 5624900);
+    ASSERT_THROWS_CODE(eval({t0, y0}, {bad, y1}, TimeUnit::millisecond), DBException, 5624900);
 }
 
 

@@ -103,7 +103,7 @@ public:
     // ================== Members of public ReplicationCoordinator API ===================
 
     virtual void startup(OperationContext* opCtx,
-                         LastStorageEngineShutdownState lastStorageEngineShutdownState) override;
+                         StorageEngine::LastShutdownState lastShutdownState) override;
 
     virtual void enterTerminalShutdown() override;
 
@@ -133,7 +133,7 @@ public:
 
     virtual Seconds getSecondaryDelaySecs() const override;
 
-    virtual void clearSyncSourceBlacklist() override;
+    virtual void clearSyncSourceDenylist() override;
 
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
@@ -230,6 +230,31 @@ public:
 
     virtual ReplSetConfig getConfig() const override;
 
+    virtual ConnectionString getConfigConnectionString() const override;
+
+    virtual Milliseconds getConfigElectionTimeoutPeriod() const override;
+
+    virtual std::vector<MemberConfig> getConfigVotingMembers() const override;
+
+    virtual std::int64_t getConfigTerm() const override;
+
+    virtual std::int64_t getConfigVersion() const override;
+
+    virtual ConfigVersionAndTerm getConfigVersionAndTerm() const override;
+
+    virtual int getConfigNumMembers() const override;
+
+    virtual Milliseconds getConfigHeartbeatTimeoutPeriodMillis() const override;
+
+    virtual BSONObj getConfigBSON() const override;
+
+    virtual const MemberConfig* findConfigMemberByHostAndPort(
+        const HostAndPort& hap) const override;
+
+    virtual bool isConfigLocalHostAllowed() const override;
+
+    virtual Milliseconds getConfigHeartbeatInterval() const override;
+
     virtual void processReplSetGetConfig(BSONObjBuilder* result,
                                          bool commitmentStatus = false,
                                          bool includeNewlyAdded = false) override;
@@ -283,7 +308,7 @@ public:
 
     virtual HostAndPort chooseNewSyncSource(const OpTime& lastOpTimeFetched) override;
 
-    virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
+    virtual void denylistSyncSource(const HostAndPort& host, Date_t until) override;
 
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx) override;
 
@@ -1084,11 +1109,10 @@ private:
      * config detected but more work is needed to set it as the local config (which will be
      * handled by the callback to _finishLoadLocalConfig).
      *
-     * Increments the rollback ID if the lastStorageEngineShutdownState indicates that the server
-     * was shut down uncleanly.
+     * Increments the rollback ID if the the server was shut down uncleanly.
      */
     bool _startLoadLocalConfig(OperationContext* opCtx,
-                               LastStorageEngineShutdownState lastStorageEngineShutdownState);
+                               StorageEngine::LastShutdownState lastShutdownState);
 
     /**
      * Callback that finishes the work started in _startLoadLocalConfig and sets _rsConfigState
@@ -1173,13 +1197,13 @@ private:
     void _onFollowerModeStateChange();
 
     /**
-     * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
+     * Removes 'host' from the sync source denylist. If 'host' isn't found, it's simply
      * ignored and no error is thrown.
      *
      * Must be scheduled as a callback.
      */
-    void _unblacklistSyncSource(const executor::TaskExecutor::CallbackArgs& cbData,
-                                const HostAndPort& host);
+    void _undenylistSyncSource(const executor::TaskExecutor::CallbackArgs& cbData,
+                               const HostAndPort& host);
 
     /**
      * Schedules stepdown to run with the global exclusive lock.
@@ -1469,6 +1493,11 @@ private:
     void _reconfigToRemoveNewlyAddedField(const executor::TaskExecutor::CallbackArgs& cbData,
                                           MemberId memberId,
                                           ConfigVersionAndTerm versionAndTerm);
+
+    /**
+     * Sets the implicit default write concern on startup.
+     */
+    void _setImplicitDefaultWriteConcern(OperationContext* opCtx, WithLock lk);
 
     /**
      * Checks whether replication coordinator supports automatic reconfig.

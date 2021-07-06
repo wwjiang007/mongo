@@ -6,7 +6,7 @@
  * @tags: [
  *   assumes_against_mongod_not_mongos,
  *   assumes_unsharded_collection,
- *   requires_fcv_47,
+ *   requires_fcv_50,
  *   uses_api_parameters,
  * ]
  */
@@ -128,6 +128,8 @@ assert.commandWorked(db.runCommand({aggregate: collName, pipeline: pipeline, cur
 db.view.drop();
 assert.commandWorked(db.runCommand(
     {create: "view", viewOn: collName, pipeline: [], apiStrict: true, apiVersion: "1"}));
+// find() on views should work normally if 'apiStrict' is true.
+assert.commandWorked(db.runCommand({find: "view", apiStrict: true, apiVersion: "1"}));
 // This command will work because API parameters are not inherited from views.
 assert.commandWorked(db.runCommand({aggregate: "view", pipeline: pipeline, cursor: {}}));
 assert.commandFailedWithCode(

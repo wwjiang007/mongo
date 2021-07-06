@@ -542,7 +542,7 @@ var Cluster = function(options) {
         jsTest.log('Finished validating collections in ' + totalTime + ' ms, ' + phase);
     };
 
-    this.checkReplicationConsistency = function checkReplicationConsistency(dbBlacklist, phase) {
+    this.checkReplicationConsistency = function checkReplicationConsistency(dbDenylist, phase) {
         assert(initialized, 'cluster must be initialized first');
 
         if (!this.isReplication()) {
@@ -561,7 +561,7 @@ var Cluster = function(options) {
                            ' assumed to still be primary, ' + phase);
 
                 // Compare the dbhashes of the primary and secondaries.
-                rst.checkReplicatedDataHashes(phase, dbBlacklist);
+                rst.checkReplicatedDataHashes(phase, dbDenylist);
                 var totalTime = Date.now() - startTime;
                 jsTest.log('Finished consistency checks of replica set with ' + primary.host +
                            ' as primary in ' + totalTime + ' ms, ' + phase);
@@ -579,14 +579,8 @@ var Cluster = function(options) {
                        phase +
                            ', failed to find self in replication status: ' + tojson(replSetStatus));
 
-                // Wait for all previous workload operations to complete, with "getLastError".
-                res = primary.getDB('test').runCommand({
-                    getLastError: 1,
-                    w: options.replication.numNodes,
-                    wtimeout: 5 * 60 * 1000,
-                    wOpTime: primaryInfo.optime
-                });
-                assert.commandWorked(res, phase + ', error awaiting replication');
+                // Wait for all previous workload operations to complete.
+                rst.awaitReplication();
             }
         });
     };

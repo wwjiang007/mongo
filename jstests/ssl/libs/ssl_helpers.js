@@ -11,6 +11,7 @@ var SERVER_CERT = "jstests/libs/server.pem";
 var CA_CERT = "jstests/libs/ca.pem";
 var CLIENT_CERT = "jstests/libs/client.pem";
 var DH_PARAM = "jstests/libs/8k-prime.dhparam";
+var CLUSTER_CERT = "jstests/libs/cluster_cert.pem";
 
 // Note: "sslAllowInvalidCertificates" is enabled to avoid
 // hostname conflicts with our testing certificates
@@ -233,6 +234,33 @@ function determineSSLProvider() {
     } else {
         return null;
     }
+}
+
+function isMacOS(minVersion) {
+    'use strict';
+
+    function parseVersion(version) {
+        // Intentionally leave the end of string unanchored.
+        // This allows vesions like: 10.15.7-pl2 or other extra data.
+        const v = version.match(/^(\d+)\.(\d+)\.(\d+)/);
+        assert(v !== null, "Invalid version string '" + version + "'");
+        return (v[1] << 16) | (v[2] << 8) | (v[3]);
+    }
+
+    const macOS = getBuildInfo().macOS;
+    if (macOS === undefined) {
+        // Not macOS at all.
+        return false;
+    }
+
+    if (minVersion === undefined) {
+        // Don't care what version, but it's macOS.
+        return true;
+    }
+
+    assert(macOS.osProductVersion !== undefined,
+           "Expected getBuildInfo() field 'macOS.osProductVersion' not present");
+    return parseVersion(minVersion) <= parseVersion(macOS.osProductVersion);
 }
 
 function requireSSLProvider(required, fn) {

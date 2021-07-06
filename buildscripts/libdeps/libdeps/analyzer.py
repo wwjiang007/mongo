@@ -115,17 +115,14 @@ class Analyzer:
     """Base class for different types of analyzers."""
 
     # pylint: disable=too-many-instance-attributes
-    def __init__(self, graph, progress=True):
+    def __init__(self, dependency_graph, progress=True):
         """Store the graph and extract the build_dir from the graph."""
 
-        self.graph_schema = graph.graph.get('graph_schema_version')
-        if self.graph_schema == 1:
-            self._dependents_graph = graph
-        else:
-            self._dependency_graph = graph
+        self.graph_schema = dependency_graph.graph.get('graph_schema_version')
+        self._dependency_graph = dependency_graph
 
-        self._build_dir = Path(graph.graph['build_dir'])
-        self.deptypes = json.loads(graph.graph.get('deptypes', "{}"))
+        self._build_dir = Path(dependency_graph.graph['build_dir'])
+        self.deptypes = json.loads(dependency_graph.graph.get('deptypes', "{}"))
         self.set_progress(progress)
 
     @property
@@ -152,16 +149,6 @@ class Analyzer:
         """Call down to loaded graph to get the deptype from name."""
 
         return int(self._dependency_graph.get_deptype(deptype))
-
-    def _strip_build_dir(self, node):
-        """Small util function for making args match the graph paths."""
-
-        return str(Path(node).relative_to(self._build_dir))
-
-    def _strip_build_dirs(self, nodes):
-        """Small util function for making a list of nodes match graph paths."""
-
-        return [self._strip_build_dir(node) for node in nodes]
 
     def set_progress(self, value=None):
         """Get a progress bar from the loaded graph."""
@@ -198,10 +185,10 @@ class Counter(Analyzer):
 class NodeCounter(Counter):
     """Counts and reports number of nodes in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.NODE.name
 
     @schema_check(schema_version=1)
@@ -214,10 +201,10 @@ class NodeCounter(Counter):
 class EdgeCounter(Counter):
     """Counts and reports number of edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.EDGE.name
 
     @schema_check(schema_version=1)
@@ -230,10 +217,10 @@ class EdgeCounter(Counter):
 class DirectEdgeCounter(Counter):
     """Counts and reports number of direct edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.DIR_EDGE.name
 
     @schema_check(schema_version=1)
@@ -246,10 +233,10 @@ class DirectEdgeCounter(Counter):
 class TransEdgeCounter(Counter):
     """Counts and reports number of transitive edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.TRANS_EDGE.name
 
     @schema_check(schema_version=1)
@@ -262,10 +249,10 @@ class TransEdgeCounter(Counter):
 class DirectPubEdgeCounter(Counter):
     """Counts and reports number of direct public edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.DIR_PUB_EDGE.name
 
     @schema_check(schema_version=1)
@@ -281,10 +268,10 @@ class DirectPubEdgeCounter(Counter):
 class PublicEdgeCounter(Counter):
     """Counts and reports number of public edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.PUB_EDGE.name
 
     @schema_check(schema_version=1)
@@ -297,10 +284,10 @@ class PublicEdgeCounter(Counter):
 class PrivateEdgeCounter(Counter):
     """Counts and reports number of private edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.PRIV_EDGE.name
 
     @schema_check(schema_version=1)
@@ -314,10 +301,10 @@ class PrivateEdgeCounter(Counter):
 class InterfaceEdgeCounter(Counter):
     """Counts and reports number of interface edges in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.IF_EDGE.name
 
     @schema_check(schema_version=1)
@@ -328,29 +315,13 @@ class InterfaceEdgeCounter(Counter):
                                          int(self.get_deptype('Interface')))
 
 
-class ShimCounter(Counter):
-    """Counts and reports number of shim nodes in the graph."""
-
-    def __init__(self, graph):
-        """Store graph and set type."""
-
-        super().__init__(graph)
-        self._count_type = CountTypes.SHIM.name
-
-    @schema_check(schema_version=1)
-    def run(self):
-        """Count the graphs shim nodes."""
-
-        return self.node_type_count(NodeProps.shim.name, True)
-
-
 class LibCounter(Counter):
     """Counts and reports number of library nodes in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.LIB.name
 
     @schema_check(schema_version=1)
@@ -363,10 +334,10 @@ class LibCounter(Counter):
 class ProgCounter(Counter):
     """Counts and reports number of program nodes in the graph."""
 
-    def __init__(self, graph):
+    def __init__(self, dependency_graph):
         """Store graph and set type."""
 
-        super().__init__(graph)
+        super().__init__(dependency_graph)
         self._count_type = CountTypes.PROG.name
 
     @schema_check(schema_version=1)
@@ -376,7 +347,7 @@ class ProgCounter(Counter):
         return self.node_type_count(NodeProps.bin_type.name, 'Program')
 
 
-def counter_factory(graph, counters, progressbar=True):
+def counter_factory(dependency_graph, counters, progressbar=True):
     """Construct counters from a list of strings."""
 
     counter_map = {
@@ -388,7 +359,6 @@ def counter_factory(graph, counters, progressbar=True):
         CountTypes.PUB_EDGE.name: PublicEdgeCounter,
         CountTypes.PRIV_EDGE.name: PrivateEdgeCounter,
         CountTypes.IF_EDGE.name: InterfaceEdgeCounter,
-        CountTypes.SHIM.name: ShimCounter,
         CountTypes.LIB.name: LibCounter,
         CountTypes.PROG.name: ProgCounter,
     }
@@ -399,7 +369,7 @@ def counter_factory(graph, counters, progressbar=True):
     counter_objs = []
     for counter in counters:
         if counter in counter_map:
-            counter_obj = counter_map[counter](graph)
+            counter_obj = counter_map[counter](dependency_graph)
             counter_obj.set_progress(progressbar)
             counter_objs.append(counter_obj)
 
@@ -412,11 +382,11 @@ def counter_factory(graph, counters, progressbar=True):
 class CommonDependents(Analyzer):
     """Finds common dependent nodes for a set of given dependency nodes."""
 
-    def __init__(self, graph, nodes):
+    def __init__(self, dependency_graph, nodes):
         """Store graph and strip the nodes."""
 
-        super().__init__(graph)
-        self._nodes = self._strip_build_dirs(nodes)
+        super().__init__(dependency_graph)
+        self._nodes = nodes
 
     @schema_check(schema_version=1)
     def run(self):
@@ -436,11 +406,11 @@ class CommonDependents(Analyzer):
 class DirectDependents(Analyzer):
     """Finds direct dependent nodes for a given dependency node."""
 
-    def __init__(self, graph, node):
+    def __init__(self, dependency_graph, node):
         """Store graph and strip the node."""
 
-        super().__init__(graph)
-        self._node = self._strip_build_dir(node)
+        super().__init__(dependency_graph)
+        self._node = node
 
     @schema_check(schema_version=1)
     def run(self):
@@ -462,11 +432,11 @@ class DirectDependents(Analyzer):
 class ExcludeDependents(Analyzer):
     """Finds dependents which depend on the first input node, but exclude the other input nodes."""
 
-    def __init__(self, graph, nodes):
+    def __init__(self, dependency_graph, nodes):
         """Store graph and strip the nodes."""
 
-        super().__init__(graph)
-        self._nodes = self._strip_build_dirs(nodes)
+        super().__init__(dependency_graph)
+        self._nodes = nodes
 
     @schema_check(schema_version=1)
     def run(self):
@@ -492,14 +462,45 @@ class ExcludeDependents(Analyzer):
         report[DependsReportTypes.EXCLUDE_DEPENDS.name][tuple(self._nodes)] = self.run()
 
 
+class InDegreeOne(Analyzer):
+    """
+    Finds library nodes which have 1 or 0 dependers.
+
+    Such libraries are good candidates for merging or deletion.
+    """
+
+    @schema_check(schema_version=1)
+    def run(self):
+        """Search the graph for in degree 1 or 0 nodes."""
+
+        in_degree_one_nodes = []
+        for node, data in self._dependency_graph.nodes(data=True):
+            if (len(self._dependents_graph[node]) < 2
+                    and data[NodeProps.bin_type.name] == 'SharedLibrary'):
+
+                if len(self._dependents_graph[node]) == 1:
+                    depender = list(self._dependents_graph[node].items())[0][0]
+                else:
+                    depender = None
+
+                in_degree_one_nodes.append([node, depender])
+
+        return sorted(in_degree_one_nodes)
+
+    def report(self, report):
+        """Add the indegree one list to the report."""
+
+        report[DependsReportTypes.IN_DEGREE_ONE.name] = self.run()
+
+
 class GraphPaths(Analyzer):
     """Finds all paths between two nodes in the graph."""
 
-    def __init__(self, graph, from_node, to_node):
+    def __init__(self, dependency_graph, from_node, to_node):
         """Store graph and strip the nodes."""
 
-        super().__init__(graph)
-        self._from_node, self._to_node = self._strip_build_dirs([from_node, to_node])
+        super().__init__(dependency_graph)
+        self._from_node, self._to_node = from_node, to_node
 
     @schema_check(schema_version=1)
     def run(self):
@@ -531,11 +532,11 @@ class GraphPaths(Analyzer):
 class CriticalEdges(Analyzer):
     """Finds all edges between two nodes, where removing those edges disconnects the two nodes."""
 
-    def __init__(self, graph, from_node, to_node):
+    def __init__(self, dependency_graph, from_node, to_node):
         """Store graph and strip the nodes."""
 
-        super().__init__(graph)
-        self._from_node, self._to_node = self._strip_build_dirs([from_node, to_node])
+        super().__init__(dependency_graph)
+        self._from_node, self._to_node = from_node, to_node
 
     @schema_check(schema_version=1)
     def run(self):
@@ -631,11 +632,10 @@ class UnusedPublicLinter(Analyzer):
         for edge in self._dependents_graph.edges:
             edge_attribs = self._dependents_graph[edge[0]][edge[1]]
 
-            if (edge_attribs.get(EdgeProps.direct.name) and edge_attribs.get(
-                    EdgeProps.visibility.name) == int(self.get_deptype('Public'))
-                    and not self._dependents_graph.nodes()[edge[0]].get(NodeProps.shim.name)
-                    and self._dependents_graph.nodes()[edge[1]].get(
-                        NodeProps.bin_type.name) == 'SharedLibrary'):
+            if (edge_attribs.get(EdgeProps.direct.name)
+                    and edge_attribs.get(EdgeProps.visibility.name) == int(
+                        self.get_deptype('Public')) and self._dependents_graph.nodes()[edge[1]].get(
+                            NodeProps.bin_type.name) == 'SharedLibrary'):
 
                 # First we will get all the transitive libdeps the dependent node
                 # induces, while we are getting those we also check if the depender
@@ -659,7 +659,7 @@ class UnusedPublicLinter(Analyzer):
         report[LinterTypes.PUBLIC_UNUSED.name] = self.run()
 
 
-def linter_factory(graph, linters, progressbar=True):
+def linter_factory(dependency_graph, linters, progressbar=True):
     """Construct linters from a list of strings."""
 
     linter_map = {
@@ -672,7 +672,7 @@ def linter_factory(graph, linters, progressbar=True):
     linters_objs = []
     for linter in linters:
         if linter in linter_map:
-            linters_objs.append(linter_map[linter](graph, progressbar))
+            linters_objs.append(linter_map[linter](dependency_graph, progressbar))
         else:
             print(f"Skipping unknown counter: {linter}")
 
@@ -694,10 +694,8 @@ class BuildDataReport(Analyzer):
 class LibdepsGraphAnalysis:
     """Runs the given analysis on the input graph."""
 
-    def __init__(self, libdeps_graph, analysis):
+    def __init__(self, analysis):
         """Perform analysis based off input args."""
-
-        self._libdeps_graph = libdeps_graph
 
         self._results = {}
         for analyzer in analysis:
@@ -762,7 +760,6 @@ class GaPrettyPrinter(GaPrinter):
         CountTypes.PUB_EDGE.name: "Public Edges in Graph: {}",
         CountTypes.PRIV_EDGE.name: "Private Edges in Graph: {}",
         CountTypes.IF_EDGE.name: "Interface Edges in Graph: {}",
-        CountTypes.SHIM.name: "Shim Nodes in Graph: {}",
         CountTypes.LIB.name: "Library Nodes in Graph: {}",
         CountTypes.PROG.name: "Program Nodes in Graph: {}",
     }
@@ -814,6 +811,11 @@ class GaPrettyPrinter(GaPrinter):
                 self._print_results_node_list(
                     f"=>critical edges between {nodes[0]} and {nodes[1]}:",
                     results[DependsReportTypes.CRITICAL_EDGES.name][nodes])
+
+        if DependsReportTypes.IN_DEGREE_ONE.name in results:
+            print("\nLibrary nodes with 1 or 0 dependers:")
+            for count, nodes in enumerate(results[DependsReportTypes.IN_DEGREE_ONE.name], start=1):
+                print(f"    {count}: '{nodes[0]}' <- '{nodes[1]}'")
 
     def print(self):
         """Print the result data."""

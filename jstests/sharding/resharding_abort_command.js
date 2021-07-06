@@ -9,10 +9,6 @@
 load("jstests/libs/discover_topology.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/sharding/libs/resharding_test_fixture.js");
-load("jstests/sharding/libs/resharding_test_util.js");
-
-// TODO SERVER-52838 Re-enable checking UUIDs.
-TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 const originalCollectionNs = "reshardingDb.coll";
 const enterAbortFailpointName = "reshardingPauseCoordinatorBeforeStartingErrorFlow";
@@ -177,6 +173,11 @@ const runAbortWithFailpoint = (failpointName, failpointNodeType, abortLocation, 
     const topology = DiscoverTopology.findConnectedNodes(mongos);
     const configsvr = new Mongo(topology.configsvr.nodes[0]);
 
+    let reshardingMetrics = configsvr.getDB('admin').serverStatus({}).shardingStatistics.resharding;
+    const reshardingOperationsInitialCount = reshardingMetrics.countReshardingOperations;
+    const reshardingSuccessesInitialCount = reshardingMetrics.countReshardingSuccessful;
+    const reshardingCanceledInitialCount = reshardingMetrics.countReshardingCanceled;
+
     let expectedAbortErrorCodes = ErrorCodes.OK;
     let expectedReshardingErrorCode = ErrorCodes.ReshardCollectionAborted;
 
@@ -211,27 +212,6 @@ const runAbortWithFailpoint = (failpointName, failpointNodeType, abortLocation, 
             ],
         },
         () => {
-            // TODO (SERVER-54704): Remove this call once it's no longer necessary to wait for
-            // participant machines to be set up to abort the reshardCollection command.
-            assert.soon(() => {
-                for (let donor of reshardingTest.donorShardNames) {
-                    const donorConn = new Mongo(topology.shards[donor].primary);
-                    const donorDoc =
-                        donorConn.getCollection('config.localReshardingOperations.donor').findOne({
-                            ns: originalCollectionNs
-                        });
-                    return donorDoc != null;
-                }
-
-                for (let recipient of reshardingTest.recipientShardNames) {
-                    const recipientConn = new Mongo(topology.shards[recipient].primary);
-                    const recipientDoc =
-                        recipientConn.getCollection('config.localReshardingOperations.recipient')
-                            .findOne({ns: originalCollectionNs});
-                    return recipientDoc != null;
-                }
-            });
-
             if (executeAtStartOfReshardingFn) {
                 jsTestLog(`Executing the start-of-resharding fn`);
                 executeAtStartOfReshardingFn(
@@ -275,9 +255,24 @@ const runAbortWithFailpoint = (failpointName, failpointNodeType, abortLocation, 
                 }
             }
         });
-    reshardingTest.teardown();
+
+    reshardingMetrics = configsvr.getDB('admin').serverStatus({}).shardingStatistics.resharding;
+    const reshardingOperationsFinalCount = reshardingMetrics.countReshardingOperations;
+    const reshardingSuccessesFinalCount = reshardingMetrics.countReshardingSuccessful;
+    const reshardingCanceledFinalCount = reshardingMetrics.countReshardingCanceled;
+
+    assert(reshardingOperationsFinalCount == reshardingOperationsInitialCount + 1);
+
+    if (expectedReshardingErrorCode == ErrorCodes.OK) {
+        assert.eq(reshardingSuccessesFinalCount, reshardingSuccessesInitialCount + 1);
+        assert.eq(reshardingCanceledInitialCount, reshardingCanceledFinalCount);
+    } else if (expectedAbortErrorCodes == ErrorCodes.OK) {
+        assert.eq(reshardingCanceledFinalCount, reshardingCanceledInitialCount + 1);
+        assert.eq(reshardingSuccessesInitialCount, reshardingSuccessesFinalCount);
+    }
 
     abortThread.join();
+    reshardingTest.teardown();
 };
 
 runAbortWithFailpoint("reshardingPauseRecipientBeforeCloning",
@@ -315,8 +310,12 @@ runAbortWithFailpoint(
                     return false;
                 }
 
+                if (coordinatorDoc.recipientShards == null) {
+                    return false;
+                }
+
                 for (const shardEntry of coordinatorDoc.recipientShards) {
-                    if (shardEntry.mutableState.state !== "steady-state") {
+                    if (shardEntry.mutableState.state !== "applying") {
                         return false;
                     }
                 }

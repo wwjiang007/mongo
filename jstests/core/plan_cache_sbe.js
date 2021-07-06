@@ -11,25 +11,21 @@
  *   # primary.
  *   assumes_read_concern_unchanged,
  *   assumes_read_preference_unchanged,
- *   assumes_unsharded_collection,]
+ *   assumes_unsharded_collection,
+ *   # This test makes assertions about the types of plans produced by the query engine, which has
+ *   # changed from the classic engine starting in version 5.0.
+ *   requires_fcv_50,
+ * ]
  */
 (function() {
 "use strict";
 
+load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
+
 const coll = db.plan_cache_sbe;
 coll.drop();
 
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
-const isLegacyMode = db.getMongo().readMode() === "legacy";
-// For legacy reads we always use the classic engine, even when SBE is turned on as a default
-// engine.
-const isSBECompat = isSBEEnabled && !isLegacyMode;
+const isSBEEnabled = checkSBEEnabled(db);
 assert.commandWorked(coll.insert({a: 1, b: 1}));
 
 // We need two indexes so that the multi-planner is executed.
@@ -44,6 +40,6 @@ const allStats = coll.aggregate([{$planCacheStats: {}}]).toArray();
 assert.eq(allStats.length, 1, allStats);
 const stats = allStats[0];
 assert(stats.hasOwnProperty("cachedPlan"), stats);
-assert.eq(stats.cachedPlan.hasOwnProperty("queryPlan"), isSBECompat, stats);
-assert.eq(stats.cachedPlan.hasOwnProperty("slotBasedPlan"), isSBECompat, stats);
+assert.eq(stats.cachedPlan.hasOwnProperty("queryPlan"), isSBEEnabled, stats);
+assert.eq(stats.cachedPlan.hasOwnProperty("slotBasedPlan"), isSBEEnabled, stats);
 })();

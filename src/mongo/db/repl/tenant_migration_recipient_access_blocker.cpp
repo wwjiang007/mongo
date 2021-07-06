@@ -65,14 +65,13 @@ TenantMigrationRecipientAccessBlocker::TenantMigrationRecipientAccessBlocker(
                                            .getOrCreateBlockedOperationsExecutor();
 }
 
-Status TenantMigrationRecipientAccessBlocker::checkIfCanWrite() {
+Status TenantMigrationRecipientAccessBlocker::checkIfCanWrite(Timestamp writeTs) {
     // This is guaranteed by the migration protocol. The recipient will not get any writes until the
     // migration is committed on the donor.
     return Status::OK();
 }
 
-Status TenantMigrationRecipientAccessBlocker::waitUntilCommittedOrAborted(
-    OperationContext* opCtx, OperationType operationType) {
+Status TenantMigrationRecipientAccessBlocker::waitUntilCommittedOrAborted(OperationContext* opCtx) {
     // Recipient nodes will not throw TenantMigrationConflict errors and so we should never need
     // to wait for a migration to commit/abort on the recipient set.
     MONGO_UNREACHABLE;
@@ -94,6 +93,16 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
         return SharedSemiFuture<void>();
     }
 
+    if (opCtx->getClient()->session() &&
+        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient)) {
+        LOGV2_DEBUG(5739900,
+                    1,
+                    "Internal tenant read got excluded from the MTAB filtering",
+                    "tenantId"_attr = _tenantId,
+                    "opId"_attr = opCtx->getOpID());
+        return SharedSemiFuture<void>();
+    }
+
     auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     auto atClusterTime = [opCtx, &readConcernArgs]() -> boost::optional<Timestamp> {
         if (auto atClusterTime = readConcernArgs.getArgsAtClusterTime()) {
@@ -105,13 +114,27 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
     }();
 
     stdx::lock_guard<Latch> lk(_mutex);
-    if (_state == State::kReject) {
+    if (_state.isReject()) {
+        LOGV2_DEBUG(5749100,
+                    1,
+                    "Tenant read is blocked on the recipient before migration completes",
+                    "tenantId"_attr = _tenantId,
+                    "opId"_attr = opCtx->getOpID(),
+                    "command"_attr = command);
         return SharedSemiFuture<void>(Status(
             ErrorCodes::SnapshotTooOld, "Tenant read is not allowed before migration completes"));
     }
-    invariant(_state == State::kRejectBefore);
+    invariant(_state.isRejectBefore());
     invariant(_rejectBeforeTimestamp);
     if (atClusterTime && *atClusterTime < *_rejectBeforeTimestamp) {
+        LOGV2_DEBUG(5749101,
+                    1,
+                    "Tenant read is blocked on the recipient before migration completes",
+                    "tenantId"_attr = _tenantId,
+                    "opId"_attr = opCtx->getOpID(),
+                    "command"_attr = command,
+                    "atClusterTime"_attr = *atClusterTime,
+                    "rejectBeforeTimestamp"_attr = *_rejectBeforeTimestamp);
         return SharedSemiFuture<void>(Status(
             ErrorCodes::SnapshotTooOld, "Tenant read is not allowed before migration completes"));
     }
@@ -168,16 +191,18 @@ void TenantMigrationRecipientAccessBlocker::appendInfoForServerStatus(
     stdx::lock_guard<Latch> lg(_mutex);
 
     BSONObjBuilder tenantBuilder;
-    tenantBuilder.append("state", _stateToString(_state));
+    tenantBuilder.append("state", _state.toString());
     if (_rejectBeforeTimestamp) {
         tenantBuilder.append("rejectBeforeTimestamp", _rejectBeforeTimestamp.get());
     }
     tenantBuilder.append("ttlIsBlocked", _ttlIsBlocked);
-    builder->append(_tenantId, tenantBuilder.obj());
+    tenantBuilder.append("tenantId", _tenantId);
+
+    builder->append("recipient", tenantBuilder.obj());
 }
 
-std::string TenantMigrationRecipientAccessBlocker::_stateToString(State state) const {
-    switch (state) {
+std::string TenantMigrationRecipientAccessBlocker::BlockerState::toString() const {
+    switch (_state) {
         case State::kReject:
             return "reject";
         case State::kRejectBefore:
@@ -197,7 +222,7 @@ BSONObj TenantMigrationRecipientAccessBlocker::getDebugInfo() const {
 
 void TenantMigrationRecipientAccessBlocker::startRejectingReadsBefore(const Timestamp& timestamp) {
     stdx::lock_guard<Latch> lk(_mutex);
-    _state = State::kRejectBefore;
+    _state.transitionToRejectBefore();
     if (!_rejectBeforeTimestamp || timestamp > *_rejectBeforeTimestamp) {
         LOGV2(5358100,
               "Tenant migration recipient starting to reject reads before timestamp",

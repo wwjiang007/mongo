@@ -14,11 +14,12 @@
 "use strict";
 
 load("jstests/auth/lib/commands_lib.js");  // Provides an exhaustive list of commands.
+load("jstests/libs/fail_point_util.js");   // Helper to enable/disable failpoints easily.
 
 const tests = authCommandsLib.tests;
 
 // The following commands require additional start up configuration and hence need to be skipped.
-const blacklistedTests =
+const denylistedTests =
     ["startRecordingTraffic", "stopRecordingTraffic", "addShardToZone", "removeShardFromZone"];
 
 function runTests(tests, conn, impls) {
@@ -26,7 +27,7 @@ function runTests(tests, conn, impls) {
     const secondDb = conn.getDB(secondDbName);
     const isMongos = authCommandsLib.isMongos(conn);
     for (const test of tests) {
-        if (!blacklistedTests.includes(test.testname)) {
+        if (!denylistedTests.includes(test.testname)) {
             authCommandsLib.runOneTest(conn, test, impls, isMongos);
         }
     }
@@ -34,6 +35,13 @@ function runTests(tests, conn, impls) {
 
 const impls = {
     runOneTest: function(conn, testObj) {
+        // Some tests requires mongot, however, setting this failpoint will make search queries to
+        // return EOF, that way all the hassle of setting it up can be avoided.
+        let disableSearchFailpoint;
+        if (testObj.disableSearch) {
+            disableSearchFailpoint = configureFailPoint(conn.rs0 ? conn.rs0.getPrimary() : conn,
+                                                        'searchReturnEofImmediately');
+        }
         const testCase = testObj.testcases[0];
 
         const runOnDb = conn.getDB(testCase.runOnDb);
@@ -49,6 +57,10 @@ const impls = {
 
         if (testObj.teardown) {
             testObj.teardown(runOnDb, res);
+        }
+
+        if (disableSearchFailpoint) {
+            disableSearchFailpoint.off();
         }
     }
 };

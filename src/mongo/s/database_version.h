@@ -45,6 +45,8 @@ namespace mongo {
  */
 class DatabaseVersion : public DatabaseVersionBase {
 public:
+    using DatabaseVersionBase::getTimestamp;
+
     DatabaseVersion() = default;
 
     explicit DatabaseVersion(const BSONObj& obj) {
@@ -113,8 +115,13 @@ public:
      * Creates a ComparableDatabaseVersion that wraps the given DatabaseVersion.
      * Each object created through this method will have a local sequence number greater than the
      * previously created ones.
+     *
+     * If version is boost::none it creates a ComparableDatabaseVersion that doesn't have a valid
+     * DatabaseVersion. This is useful in some scenarios in which the DatabaseVersion is provided
+     * later through ComparableDatabaseVersion::setVersion.
      */
-    static ComparableDatabaseVersion makeComparableDatabaseVersion(const DatabaseVersion& version);
+    static ComparableDatabaseVersion makeComparableDatabaseVersion(
+        const boost::optional<DatabaseVersion>& version);
 
     /**
      * Creates a new instance which will artificially be greater than any
@@ -124,14 +131,6 @@ public:
      * inferred.
      */
     static ComparableDatabaseVersion makeComparableDatabaseVersionForForcedRefresh();
-
-    /**
-     * Creates a new instance which will artificially be greater than any
-     * previously created ComparableDatabaseVersion. Instances created afterwards
-     * will be compared as-if this object was a normal (i.e. non-forced) ComparableDatabaseVersion.
-     */
-    static ComparableDatabaseVersion makeComparableDatabaseVersionForForcedRefresh(
-        const DatabaseVersion& version);
 
     /**
      * Empty constructor needed by the ReadThroughCache.
@@ -169,6 +168,8 @@ public:
     }
 
 private:
+    friend class CatalogCache;
+
     static AtomicWord<uint64_t> _uuidDisambiguatingSequenceNumSource;
     static AtomicWord<uint64_t> _forcedRefreshSequenceNumSource;
 
@@ -178,6 +179,8 @@ private:
         : _dbVersion(std::move(version)),
           _uuidDisambiguatingSequenceNum(uuidDisambiguatingSequenceNum),
           _forcedRefreshSequenceNum(forcedRefreshSequenceNum) {}
+
+    void setDatabaseVersion(const DatabaseVersion& version);
 
     boost::optional<DatabaseVersion> _dbVersion;
 

@@ -73,7 +73,6 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/query/sbe_stage_builder_eval_frame.h"
 #include "mongo/db/query/sbe_stage_builder_expression.h"
-#include "mongo/db/query/sbe_stage_builder_helpers.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/util/str.h"
 
@@ -81,6 +80,7 @@ namespace mongo::stage_builder {
 namespace {
 
 struct MatchExpressionVisitorContext;
+const size_t kMaxChildrenForTopLevelAndOptimization = 25;
 
 /**
  * Output of the tree can come from two places:
@@ -116,21 +116,15 @@ using MakePredicateFn =
 struct MatchExpressionVisitorContext {
     // Construct a visitor context to generate a filter expression from a single input slot
     // holding a document against which to perform the match.
-    MatchExpressionVisitorContext(OperationContext* opCtx,
-                                  sbe::value::SlotIdGenerator* slotIdGenerator,
-                                  sbe::value::FrameIdGenerator* frameIdGenerator,
+    MatchExpressionVisitorContext(StageBuilderState& state,
                                   EvalStage inputStage,
                                   sbe::value::SlotId inputSlot,
                                   const MatchExpression* root,
-                                  sbe::RuntimeEnvironment* env,
                                   PlanNodeId planNodeId,
                                   const FilterStateHelper& stateHelper)
-        : opCtx{opCtx},
+        : state{state},
           inputSlot{inputSlot},
-          slotIdGenerator{slotIdGenerator},
-          frameIdGenerator{frameIdGenerator},
           topLevelAnd{nullptr},
-          env{env},
           planNodeId{planNodeId},
           stateHelper{stateHelper} {
         // Set up the top-level EvalFrame.
@@ -138,7 +132,8 @@ struct MatchExpressionVisitorContext {
 
         // If the root node is an $and, store it in 'topLevelAnd'.
         // TODO: SERVER-50673: Revisit how we implement the top-level $and optimization.
-        if (root->matchType() == MatchExpression::AND) {
+        if (root->matchType() == MatchExpression::AND &&
+            root->numChildren() <= kMaxChildrenForTopLevelAndOptimization) {
             topLevelAnd = root;
         }
     }
@@ -148,23 +143,14 @@ struct MatchExpressionVisitorContext {
     // Instead of a single input slot holding the root document, it takes a vector of 'keySlots' and
     // 'keyFields' which represent a subset of the fields of the index key pattern that are depended
     // on to evaluate the predicate, and corresponding slots for each of the key fields.
-    MatchExpressionVisitorContext(OperationContext* opCtx,
-                                  sbe::value::SlotIdGenerator* slotIdGenerator,
-                                  sbe::value::FrameIdGenerator* frameIdGenerator,
+    MatchExpressionVisitorContext(StageBuilderState& state,
                                   EvalStage inputStage,
                                   sbe::value::SlotVector keySlots,
                                   std::vector<std::string> keyFields,
                                   const MatchExpression* root,
-                                  sbe::RuntimeEnvironment* env,
                                   PlanNodeId planNodeId,
                                   const FilterStateHelper& stateHelper)
-        : opCtx{opCtx},
-          slotIdGenerator{slotIdGenerator},
-          frameIdGenerator{frameIdGenerator},
-          topLevelAnd{nullptr},
-          env{env},
-          planNodeId{planNodeId},
-          stateHelper{stateHelper} {
+        : state{state}, topLevelAnd{nullptr}, planNodeId{planNodeId}, stateHelper{stateHelper} {
         // Set up the top-level EvalFrame.
         evalStack.emplaceFrame(std::move(inputStage), boost::none);
 
@@ -181,7 +167,8 @@ struct MatchExpressionVisitorContext {
 
         // If the root node is an $and, store it in 'topLevelAnd'.
         // TODO: SERVER-50673: Revisit how we implement the top-level $and optimization.
-        if (root->matchType() == MatchExpression::AND) {
+        if (root->matchType() == MatchExpression::AND &&
+            root->numChildren() <= kMaxChildrenForTopLevelAndOptimization) {
             topLevelAnd = root;
         }
     }
@@ -204,8 +191,11 @@ struct MatchExpressionVisitorContext {
             // In case 'outputSlot' is defined and state contains a value, we need to extract this
             // value into a separate slot and return it. The resulting value depends on the state
             // type, see the implementation of specific state helper for details.
-            return stateHelper.projectValueCombinator(
-                *outputSlot, frame.extractStage(), planNodeId, slotIdGenerator, frameIdGenerator);
+            return stateHelper.projectValueCombinator(*outputSlot,
+                                                      frame.extractStage(),
+                                                      planNodeId,
+                                                      state.slotIdGenerator,
+                                                      state.frameIdGenerator);
         }
 
         return {boost::none, frame.extractStage()};
@@ -223,7 +213,8 @@ struct MatchExpressionVisitorContext {
         FrameData(boost::optional<sbe::value::SlotId> inputSlot) : inputSlot{inputSlot} {}
     };
 
-    OperationContext* opCtx;
+    StageBuilderState& state;
+
     EvalStack<FrameData> evalStack;
     // The current context must be initialized either with an 'inputSlot' over which an entire match
     // expression needs to be evaluated, or a pair of 'keySlots' and 'keyFields' vectors
@@ -232,10 +223,7 @@ struct MatchExpressionVisitorContext {
     // 'indexKeySlots' map.
     boost::optional<sbe::value::SlotId> inputSlot;
     StringMap<sbe::value::SlotId> indexKeySlots;
-    sbe::value::SlotIdGenerator* slotIdGenerator;
-    sbe::value::FrameIdGenerator* frameIdGenerator;
     const MatchExpression* topLevelAnd;
-    sbe::RuntimeEnvironment* env;
 
     // The id of the 'QuerySolutionNode' which houses the match expression that we are converting to
     // SBE.
@@ -256,7 +244,7 @@ void projectCurrentExprToOutputSlot(MatchExpressionVisitorContext* context) {
     tassert(5291405, "Output slot is not empty", !context->outputSlot);
     auto& frame = context->evalStack.topFrame();
     auto [projectedExprSlot, stage] = projectEvalExpr(
-        frame.popExpr(), frame.extractStage(), context->planNodeId, context->slotIdGenerator);
+        frame.popExpr(), frame.extractStage(), context->planNodeId, context->state.slotIdGenerator);
     context->outputSlot = projectedExprSlot;
     frame.pushExpr(projectedExprSlot);
     frame.setStage(std::move(stage));
@@ -587,8 +575,8 @@ void generatePredicate(MatchExpressionVisitorContext* context,
                                              *path,
                                              0,
                                              context->planNodeId,
-                                             context->slotIdGenerator,
-                                             context->frameIdGenerator,
+                                             context->state.slotIdGenerator,
+                                             context->state.frameIdGenerator,
                                              makePredicate,
                                              mode,
                                              context->stateHelper);
@@ -642,7 +630,7 @@ void generateArraySize(MatchExpressionVisitorContext* context,
                              EvalStage inputStage) -> EvalExprStagePair {
         // Generate a traverse that projects the integer value 1 for each element in the array and
         // then sums up the 1's, resulting in the count of elements in the array.
-        auto innerSlot = context->slotIdGenerator->generate();
+        auto innerSlot = context->state.slotId();
         auto innerBranch =
             makeProject(EvalStage{},
                         context->planNodeId,
@@ -650,7 +638,7 @@ void generateArraySize(MatchExpressionVisitorContext* context,
                         sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
                                                    sbe::value::bitcastFrom<int64_t>(1)));
 
-        auto traverseSlot = context->slotIdGenerator->generate();
+        auto traverseSlot = context->state.slotId();
         auto traverseStage = makeTraverse(EvalStage{},
                                           std::move(innerBranch),
                                           inputSlot,
@@ -687,7 +675,7 @@ void generateArraySize(MatchExpressionVisitorContext* context,
         auto [opOutput, opStage] = generateShortCircuitingLogicalOp(sbe::EPrimBinary::logicAnd,
                                                                     std::move(branches),
                                                                     context->planNodeId,
-                                                                    context->slotIdGenerator,
+                                                                    context->state.slotIdGenerator,
                                                                     BooleanStateHelper{});
 
         inputStage = makeLoopJoin(std::move(inputStage), std::move(opStage), context->planNodeId);
@@ -711,18 +699,15 @@ void generateComparison(MatchExpressionVisitorContext* context,
     auto makePredicate = [context, expr, binaryOp](sbe::value::SlotId inputSlot,
                                                    EvalStage inputStage) -> EvalExprStagePair {
         const auto& rhs = expr->getData();
-        auto [tagView, valView] = sbe::bson::convertFrom(
-            true, rhs.rawdata(), rhs.rawdata() + rhs.size(), rhs.fieldNameSize() - 1);
-
-        // SBE EConstant assumes ownership of the value so we have to make a copy here.
-        auto [tag, val] = sbe::value::copyValue(tagView, valView);
+        auto [tagView, valView] = sbe::bson::convertFrom<true>(
+            rhs.rawdata(), rhs.rawdata() + rhs.size(), rhs.fieldNameSize() - 1);
 
         // Most commonly the comparison does not do any kind of type conversions (i.e. 12 > "10"
         // does not evaluate to true as we do not try to convert a string to a number). Internally,
         // SBE returns Nothing for mismatched types.
         // However, there is a wrinkle with MQL (and there always is one). We can compare any type
         // to MinKey or MaxKey type and expect a true/false answer.
-        if (tag == sbe::value::TypeTags::MinKey) {
+        if (tagView == sbe::value::TypeTags::MinKey) {
             switch (binaryOp) {
                 case sbe::EPrimBinary::eq:
                 case sbe::EPrimBinary::neq:
@@ -746,7 +731,7 @@ void generateComparison(MatchExpressionVisitorContext* context,
                 default:
                     break;
             }
-        } else if (tag == sbe::value::TypeTags::MaxKey) {
+        } else if (tagView == sbe::value::TypeTags::MaxKey) {
             switch (binaryOp) {
                 case sbe::EPrimBinary::eq:
                 case sbe::EPrimBinary::neq:
@@ -770,7 +755,7 @@ void generateComparison(MatchExpressionVisitorContext* context,
                 default:
                     break;
             }
-        } else if (tag == sbe::value::TypeTags::Null) {
+        } else if (tagView == sbe::value::TypeTags::Null) {
             // When comparing to null we have to consider missing and undefined.
             auto inputExpr = buildMultiBranchConditional(
                 CaseValuePair{generateNullOrMissing(sbe::EVariable(inputSlot)),
@@ -779,10 +764,10 @@ void generateComparison(MatchExpressionVisitorContext* context,
 
             return {makeFillEmptyFalse(makeBinaryOp(binaryOp,
                                                     std::move(inputExpr),
-                                                    sbe::makeE<sbe::EConstant>(tag, val),
-                                                    context->env)),
+                                                    makeConstant(sbe::value::TypeTags::Null, 0),
+                                                    context->state.env)),
                     std::move(inputStage)};
-        } else if (sbe::value::isNaN(tag, val)) {
+        } else if (sbe::value::isNaN(tagView, valView)) {
             // Construct an expression to perform a NaN check.
             switch (binaryOp) {
                 case sbe::EPrimBinary::eq:
@@ -804,13 +789,18 @@ void generateComparison(MatchExpressionVisitorContext* context,
             }
         }
 
+        // SBE EConstant assumes ownership of the value so we have to make a copy here.
+        auto [tag, val] = sbe::value::copyValue(tagView, valView);
+
         // When 'rhs' is not NaN, return false if lhs is NaN. Otherwise, use usual comparison
         // semantics.
         return {makeBinaryOp(
                     sbe::EPrimBinary::logicAnd,
                     makeNot(makeFillEmptyFalse(makeFunction("isNaN", makeVariable(inputSlot)))),
-                    makeFillEmptyFalse(makeBinaryOp(
-                        binaryOp, makeVariable(inputSlot), makeConstant(tag, val), context->env))),
+                    makeFillEmptyFalse(makeBinaryOp(binaryOp,
+                                                    makeVariable(inputSlot),
+                                                    makeConstant(tag, val),
+                                                    context->state.env))),
                 std::move(inputStage)};
     };
 
@@ -848,9 +838,9 @@ void generateAlwaysBoolean(MatchExpressionVisitorContext* context, bool value) {
  */
 void generateBitTest(MatchExpressionVisitorContext* context,
                      const BitTestMatchExpression* expr,
-                     const sbe::BitTestBehavior& bitTestBehavior) {
-    auto makePredicate = [expr, bitTestBehavior](sbe::value::SlotId inputSlot,
-                                                 EvalStage inputStage) -> EvalExprStagePair {
+                     const sbe::BitTestBehavior& bitOp) {
+    auto makePredicate = [expr, bitOp](sbe::value::SlotId inputSlot,
+                                       EvalStage inputStage) -> EvalExprStagePair {
         auto bitPositions = expr->getBitPositions();
 
         // Build an array set of bit positions for the bitmask, and remove duplicates in the
@@ -872,49 +862,53 @@ void generateBitTest(MatchExpressionVisitorContext* context,
         // An EExpression for the BinData and position list for the binary case of
         // BitTestMatchExpressions. This function will be applied to values carrying BinData
         // elements.
-        auto binaryBitTestEExpr = sbe::makeE<sbe::EFunction>(
-            "bitTestPosition",
-            sbe::makeEs(sbe::makeE<sbe::EConstant>(bitPosTag, bitPosVal),
-                        sbe::makeE<sbe::EVariable>(inputSlot),
-                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
-                                                   sbe::value::bitcastFrom<int32_t>(
-                                                       static_cast<int32_t>(bitTestBehavior)))));
+        auto binaryBitTestExpr = makeFunction(
+            "bitTestPosition"_sd,
+            sbe::makeE<sbe::EConstant>(bitPosTag, bitPosVal),
+            makeVariable(inputSlot),
+            makeConstant(sbe::value::TypeTags::NumberInt32, static_cast<int32_t>(bitOp)));
 
         // Build An EExpression for the numeric bitmask case. The AllSet case tests if (mask &
-        // value) == mask, and AllClear case tests if (mask & value) == 0. The AnyClear and the
-        // AnySet case is the negation of the AllSet and AllClear cases, respectively.
-        auto numericBitTestEExpr =
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
-                                       sbe::value::bitcastFrom<int64_t>(expr->getBitMask()));
-        if (bitTestBehavior == sbe::BitTestBehavior::AllSet ||
-            bitTestBehavior == sbe::BitTestBehavior::AnyClear) {
-            numericBitTestEExpr = sbe::makeE<sbe::EFunction>(
-                "bitTestMask",
-                sbe::makeEs(std::move(numericBitTestEExpr), sbe::makeE<sbe::EVariable>(inputSlot)));
-
-            // The AnyClear case is the negation of the AllSet case.
-            if (bitTestBehavior == sbe::BitTestBehavior::AnyClear) {
-                numericBitTestEExpr = makeNot(std::move(numericBitTestEExpr));
+        // value) == mask, and AllClear case tests if (mask & value) == 0. The AnyClear and
+        // AnySet cases are the negation of the AllSet and AllClear cases, respectively.
+        auto numericBitTestFnName = [&]() {
+            if (bitOp == sbe::BitTestBehavior::AllSet || bitOp == sbe::BitTestBehavior::AnyClear) {
+                return "bitTestMask"_sd;
             }
-        } else if (bitTestBehavior == sbe::BitTestBehavior::AllClear ||
-                   bitTestBehavior == sbe::BitTestBehavior::AnySet) {
-            numericBitTestEExpr = sbe::makeE<sbe::EFunction>(
-                "bitTestZero",
-                sbe::makeEs(std::move(numericBitTestEExpr), sbe::makeE<sbe::EVariable>(inputSlot)));
-
-            // The AnySet case is the negation of the AllClear case.
-            if (bitTestBehavior == sbe::BitTestBehavior::AnySet) {
-                numericBitTestEExpr = makeNot(std::move(numericBitTestEExpr));
+            if (bitOp == sbe::BitTestBehavior::AllClear || bitOp == sbe::BitTestBehavior::AnySet) {
+                return "bitTestZero"_sd;
             }
-        } else {
-            MONGO_UNREACHABLE;
+            MONGO_UNREACHABLE_TASSERT(5610200);
+        }();
+
+        // We round NumberDecimal values to the nearest integer to match the classic execution
+        // engine's behavior for now. Note that this behavior is _not_ consistent with MongoDB's
+        // documentation. At some point, we should consider removing this call to round() to make
+        // SBE's behavior consistent with MongoDB's documentation.
+        auto numericBitTestInputExpr = sbe::makeE<sbe::EIf>(
+            sbe::makeE<sbe::ETypeMatch>(makeVariable(inputSlot),
+                                        getBSONTypeMask(sbe::value::TypeTags::NumberDecimal)),
+            makeFunction("round"_sd, makeVariable(inputSlot)),
+            makeVariable(inputSlot));
+
+        // Convert the value to a 64-bit integer, and then pass the converted value along with the
+        // mask to the appropriate bit-test function. If the value cannot be losslessly converted
+        // to a 64-bit integer, this expression will return Nothing.
+        auto numericBitTestExpr =
+            makeFunction(numericBitTestFnName,
+                         makeConstant(sbe::value::TypeTags::NumberInt64, expr->getBitMask()),
+                         sbe::makeE<sbe::ENumericConvert>(std::move(numericBitTestInputExpr),
+                                                          sbe::value::TypeTags::NumberInt64));
+
+        // For the AnyClear and AnySet cases, negate the output of the bit-test function.
+        if (bitOp == sbe::BitTestBehavior::AnyClear || bitOp == sbe::BitTestBehavior::AnySet) {
+            numericBitTestExpr = makeNot(std::move(numericBitTestExpr));
         }
 
-        return {sbe::makeE<sbe::EIf>(
-                    sbe::makeE<sbe::EFunction>("isBinData",
-                                               sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot))),
-                    std::move(binaryBitTestEExpr),
-                    std::move(numericBitTestEExpr)),
+        // numericBitTestExpr might produce Nothing, so we wrap it with makeFillEmptyFalse().
+        return {sbe::makeE<sbe::EIf>(makeFunction("isBinData"_sd, makeVariable(inputSlot)),
+                                     std::move(binaryBitTestExpr),
+                                     makeFillEmptyFalse(std::move(numericBitTestExpr))),
                 std::move(inputStage)};
     };
 
@@ -964,7 +958,7 @@ void buildLogicalExpression(sbe::EPrimBinary::Op op,
     auto&& [expr, opStage] = generateShortCircuitingLogicalOp(op,
                                                               std::move(branches),
                                                               context->planNodeId,
-                                                              context->slotIdGenerator,
+                                                              context->state.slotIdGenerator,
                                                               context->stateHelper);
     frame.pushExpr(std::move(expr));
 
@@ -986,7 +980,7 @@ EvalExprStagePair elemMatchMakePredicate(MatchExpressionVisitorContext* context,
     // the assumption that 'childInputSlot' is some correlated slot that will be made
     // available by childStages's parent. We add a projection here to 'inputStage' to
     // feed 'inputSlot' into 'childInputSlot'.
-    auto isInputArray = context->slotIdGenerator->generate();
+    auto isInputArray = context->state.slotId();
     auto fromBranch = makeProject(std::move(inputStage),
                                   context->planNodeId,
                                   childInputSlot,
@@ -999,7 +993,7 @@ EvalExprStagePair elemMatchMakePredicate(MatchExpressionVisitorContext* context,
             return {filterSlot, std::move(filterStage)};
         }
 
-        auto resultSlot = context->slotIdGenerator->generate();
+        auto resultSlot = context->state.slotId();
         return {resultSlot,
                 makeProject(std::move(filterStage),
                             context->planNodeId,
@@ -1012,7 +1006,7 @@ EvalExprStagePair elemMatchMakePredicate(MatchExpressionVisitorContext* context,
         std::move(innerBranch), sbe::makeE<sbe::EVariable>(isInputArray), context->planNodeId);
 
     // Generate the traverse.
-    auto traverseSlot = context->slotIdGenerator->generate();
+    auto traverseSlot = context->state.slotId();
     auto traverseStage = context->stateHelper.makeTraverseCombinator(
         std::move(fromBranch),
         std::move(innerBranch),  // NOLINT(bugprone-use-after-move)
@@ -1020,7 +1014,7 @@ EvalExprStagePair elemMatchMakePredicate(MatchExpressionVisitorContext* context,
         traverseSlot,
         innerResultSlot,
         context->planNodeId,
-        context->frameIdGenerator);
+        context->state.frameIdGenerator);
 
     // There are some cases where 'traverseOutputSlot' gets set to Nothing when TraverseStage
     // doesn't match anything. One  example of when this happens is when innerBranch->getNext()
@@ -1078,7 +1072,7 @@ public:
         // 'stage' field to be a null tree, and we set the 'inputSlot' field to be a newly allocated
         // slot (childInputSlot). childInputSlot is a "correlated slot" that will be set up later
         // (handled in the post-visitor).
-        auto childInputSlot = _context->slotIdGenerator->generate();
+        auto childInputSlot = _context->state.slotId();
         _context->evalStack.emplaceFrame(EvalStage{}, childInputSlot);
     }
 
@@ -1089,7 +1083,7 @@ public:
         // for the first child. For all of the children's EvalFrames, we set the 'inputSlot' field
         // to 'childInputSlot'. childInputSlot is a "correlated slot" that will be set up later in
         // the post-visitor (childInputSlot will be the correlated parameter of a TraverseStage).
-        auto childInputSlot = _context->slotIdGenerator->generate();
+        auto childInputSlot = _context->state.slotId();
         _context->evalStack.emplaceFrame(EvalStage{}, childInputSlot);
     }
 
@@ -1289,8 +1283,10 @@ public:
         auto childInputSlot = *_context->evalStack.topFrame().data().inputSlot;
         auto [filterSlot, filterStage] = [&]() {
             auto [expr, stage] = _context->evalStack.popFrame();
-            auto [predicateSlot, predicateStage] = projectEvalExpr(
-                std::move(expr), std::move(stage), _context->planNodeId, _context->slotIdGenerator);
+            auto [predicateSlot, predicateStage] = projectEvalExpr(std::move(expr),
+                                                                   std::move(stage),
+                                                                   _context->planNodeId,
+                                                                   _context->state.slotIdGenerator);
 
             auto isObjectOrArrayExpr =
                 makeBinaryOp(sbe::EPrimBinary::logicOr,
@@ -1344,14 +1340,14 @@ public:
             generateShortCircuitingLogicalOp(sbe::EPrimBinary::logicAnd,
                                              std::move(childStages),
                                              _context->planNodeId,
-                                             _context->slotIdGenerator,
+                                             _context->state.slotIdGenerator,
                                              _context->stateHelper);
 
         sbe::value::SlotId filterSlot;
         std::tie(filterSlot, filterStage) = projectEvalExpr(std::move(filterExpr),
                                                             std::move(filterStage),
                                                             _context->planNodeId,
-                                                            _context->slotIdGenerator);
+                                                            _context->state.slotIdGenerator);
 
         // We're using 'kDoNotTraverseLeaf' traverse mode, so we're guaranteed that 'makePredcate'
         // will only be called once, so it's safe to bind the reference to 'filterStage' subtree
@@ -1404,16 +1400,12 @@ public:
                 *frame.data().inputSlot == *_context->inputSlot);
 
         auto currentStage = stageOrLimitCoScan(frame.extractStage(), _context->planNodeId);
-        auto&& [_, expr, stage] = generateExpression(_context->opCtx,
+        auto&& [_, expr, stage] = generateExpression(_context->state,
                                                      matchExpr->getExpression().get(),
-                                                     std::move(currentStage.stage),
-                                                     _context->slotIdGenerator,
-                                                     _context->frameIdGenerator,
+                                                     std::move(currentStage),
                                                      *frame.data().inputSlot,
-                                                     _context->env,
-                                                     _context->planNodeId,
-                                                     &currentStage.outSlots);
-        auto frameId = _context->frameIdGenerator->generate();
+                                                     _context->planNodeId);
+        auto frameId = _context->state.frameId();
 
         // We will need to convert the result of $expr to a boolean value, so we'll wrap it into an
         // expression which does exactly that.
@@ -1423,7 +1415,7 @@ public:
             frameId, sbe::makeEs(std::move(expr)), std::move(logicExpr));
 
         frame.pushExpr(_context->stateHelper.makeState(std::move(localBindExpr)));
-        frame.setStage(EvalStage{std::move(stage), std::move(currentStage.outSlots)});
+        frame.setStage(std::move(stage));
     }
 
     void visit(const GTEMatchExpression* expr) final {
@@ -1450,10 +1442,10 @@ public:
         auto hasArray = false;
         auto hasNull = false;
         for (auto&& equality : equalities) {
-            auto [tagView, valView] = sbe::bson::convertFrom(true,
-                                                             equality.rawdata(),
-                                                             equality.rawdata() + equality.size(),
-                                                             equality.fieldNameSize() - 1);
+            auto [tagView, valView] =
+                sbe::bson::convertFrom<true>(equality.rawdata(),
+                                             equality.rawdata() + equality.size(),
+                                             equality.fieldNameSize() - 1);
 
             hasNull |= tagView == sbe::value::TypeTags::Null;
             hasArray |= sbe::value::isArray(tagView);
@@ -1482,7 +1474,7 @@ public:
                 arrSetGuard.reset();
                 return {makeIsMember(std::move(inputExpr),
                                      sbe::makeE<sbe::EConstant>(arrSetTag, arrSetVal),
-                                     _context->env),
+                                     _context->state.env),
                         std::move(inputStage)};
             };
 
@@ -1514,9 +1506,9 @@ public:
             auto makePredicate =
                 [&, arrSetTag = arrSetTag, arrSetVal = arrSetVal, arrTag = arrTag, arrVal = arrVal](
                     sbe::value::SlotId inputSlot, EvalStage inputStage) -> EvalExprStagePair {
-                auto regexArraySlot{_context->slotIdGenerator->generate()};
-                auto regexInputSlot{_context->slotIdGenerator->generate()};
-                auto regexOutputSlot{_context->slotIdGenerator->generate()};
+                auto regexArraySlot{_context->state.slotId()};
+                auto regexInputSlot{_context->state.slotId()};
+                auto regexOutputSlot{_context->state.slotId()};
 
                 // Build a traverse stage that traverses the query regex pattern array. Here the
                 // FROM branch binds an array constant carrying the regex patterns to a slot. Then
@@ -1568,7 +1560,7 @@ public:
                     branches.emplace_back(
                         makeIsMember(std::move(inputExpr),
                                      sbe::makeE<sbe::EConstant>(arrSetTag, arrSetVal),
-                                     _context->env),
+                                     _context->state.env),
                         EvalStage{});
                     branches.emplace_back(regexOutputSlot, std::move(regexStage));
 
@@ -1576,7 +1568,7 @@ public:
                         generateShortCircuitingLogicalOp(sbe::EPrimBinary::logicOr,
                                                          std::move(branches),
                                                          _context->planNodeId,
-                                                         _context->slotIdGenerator,
+                                                         _context->state.slotIdGenerator,
                                                          BooleanStateHelper{});
 
                     inputStage =
@@ -1706,19 +1698,18 @@ public:
                                     EvalStage inputStage) -> EvalExprStagePair {
             auto [bsonRegexTag, bsonRegexVal] =
                 sbe::value::makeNewBsonRegex(expr->getString(), expr->getFlags());
+            auto bsonRegexExpr = makeConstant(bsonRegexTag, bsonRegexVal);
+
             auto [compiledRegexTag, compiledRegexVal] =
                 sbe::value::makeNewPcreRegex(expr->getString(), expr->getFlags());
-            sbe::EVariable inputVar{inputSlot};
+            auto compiledRegexExpr = makeConstant(compiledRegexTag, compiledRegexVal);
+
             auto resultExpr = makeBinaryOp(
                 sbe::EPrimBinary::logicOr,
-                makeFillEmptyFalse(
-                    makeBinaryOp(sbe::EPrimBinary::eq,
-                                 inputVar.clone(),
-                                 sbe::makeE<sbe::EConstant>(bsonRegexTag, bsonRegexVal))),
-                makeFillEmptyFalse(
-                    makeFunction("regexMatch",
-                                 sbe::makeE<sbe::EConstant>(compiledRegexTag, compiledRegexVal),
-                                 inputVar.clone())));
+                makeFillEmptyFalse(makeBinaryOp(
+                    sbe::EPrimBinary::eq, makeVariable(inputSlot), std::move(bsonRegexExpr))),
+                makeFillEmptyFalse(makeFunction(
+                    "regexMatch", std::move(compiledRegexExpr), makeVariable(inputSlot))));
 
             return {std::move(resultExpr), std::move(inputStage)};
         };
@@ -1741,9 +1732,9 @@ public:
         auto makePredicate = [expr](sbe::value::SlotId inputSlot,
                                     EvalStage inputStage) -> EvalExprStagePair {
             const MatcherTypeSet& ts = expr->typeSet();
-            return {sbe::makeE<sbe::ETypeMatch>(sbe::makeE<sbe::EVariable>(inputSlot),
-                                                ts.getBSONTypeMask()),
-                    std::move(inputStage)};
+            auto resultExpr = makeFillEmptyFalse(
+                sbe::makeE<sbe::ETypeMatch>(makeVariable(inputSlot), ts.getBSONTypeMask()));
+            return {std::move(resultExpr), std::move(inputStage)};
         };
 
         const auto traversalMode = expr->typeSet().hasType(BSONType::Array)
@@ -1889,15 +1880,11 @@ private:
 };
 }  // namespace
 
-std::pair<boost::optional<sbe::value::SlotId>, std::unique_ptr<sbe::PlanStage>> generateFilter(
-    OperationContext* opCtx,
+std::pair<boost::optional<sbe::value::SlotId>, EvalStage> generateFilter(
+    StageBuilderState& state,
     const MatchExpression* root,
-    std::unique_ptr<sbe::PlanStage> stage,
-    sbe::value::SlotIdGenerator* slotIdGenerator,
-    sbe::value::FrameIdGenerator* frameIdGenerator,
+    EvalStage stage,
     sbe::value::SlotId inputSlot,
-    sbe::RuntimeEnvironment* env,
-    sbe::value::SlotVector relevantSlots,
     PlanNodeId planNodeId,
     bool trackIndex) {
     // The planner adds an $and expression without the operands if the query was empty. We can bail
@@ -1906,21 +1893,9 @@ std::pair<boost::optional<sbe::value::SlotId>, std::unique_ptr<sbe::PlanStage>> 
         return {boost::none, std::move(stage)};
     }
 
-    // If 'inputSlot' is not present within 'relevantSlots', add it now.
-    if (!std::count(relevantSlots.begin(), relevantSlots.end(), inputSlot)) {
-        relevantSlots.push_back(inputSlot);
-    }
-
     auto stateHelper = makeFilterStateHelper(trackIndex);
-    MatchExpressionVisitorContext context{opCtx,
-                                          slotIdGenerator,
-                                          frameIdGenerator,
-                                          EvalStage{std::move(stage), std::move(relevantSlots)},
-                                          inputSlot,
-                                          root,
-                                          env,
-                                          planNodeId,
-                                          *stateHelper};
+    MatchExpressionVisitorContext context{
+        state, std::move(stage), inputSlot, root, planNodeId, *stateHelper};
     MatchExpressionPreVisitor preVisitor{&context};
     MatchExpressionInVisitor inVisitor{&context};
     MatchExpressionPostVisitor postVisitor{&context};
@@ -1928,44 +1903,30 @@ std::pair<boost::optional<sbe::value::SlotId>, std::unique_ptr<sbe::PlanStage>> 
     tree_walker::walk<true, MatchExpression>(root, &walker);
 
     auto [resultSlot, resultStage] = context.done();
-    return {resultSlot, std::move(resultStage.stage)};
+    return {resultSlot, std::move(resultStage)};
 }
 
-std::unique_ptr<sbe::PlanStage> generateIndexFilter(OperationContext* opCtx,
-                                                    const MatchExpression* root,
-                                                    std::unique_ptr<sbe::PlanStage> stage,
-                                                    sbe::value::SlotIdGenerator* slotIdGenerator,
-                                                    sbe::value::FrameIdGenerator* frameIdGenerator,
-                                                    sbe::value::SlotVector keySlots,
-                                                    std::vector<std::string> keyFields,
-                                                    sbe::RuntimeEnvironment* env,
-                                                    sbe::value::SlotVector relevantSlots,
-                                                    PlanNodeId planNodeId) {
+EvalStage generateIndexFilter(StageBuilderState& state,
+                              const MatchExpression* root,
+                              EvalStage stage,
+                              sbe::value::SlotVector keySlots,
+                              std::vector<std::string> keyFields,
+                              PlanNodeId planNodeId) {
     // The planner adds an $and expression without the operands if the query was empty. We can bail
     // out early without generating the filter plan stage if this is the case.
     if (root->matchType() == MatchExpression::AND && root->numChildren() == 0) {
         return stage;
     }
 
-    // If 'keySlots' are not present within 'relevantSlots', add them now.
-    for (auto keySlot : keySlots) {
-        if (!std::count(relevantSlots.begin(), relevantSlots.end(), keySlot)) {
-            relevantSlots.push_back(keySlot);
-        }
-    }
-
     // Index filters never need to track the index of a matching element in the array as they cannot
     // be used with a positional projection.
     const bool trackIndex = false;
     auto stateHelper = makeFilterStateHelper(trackIndex);
-    MatchExpressionVisitorContext context{opCtx,
-                                          slotIdGenerator,
-                                          frameIdGenerator,
-                                          EvalStage{std::move(stage), std::move(relevantSlots)},
+    MatchExpressionVisitorContext context{state,
+                                          std::move(stage),
                                           std::move(keySlots),
                                           std::move(keyFields),
                                           root,
-                                          env,
                                           planNodeId,
                                           *stateHelper};
     MatchExpressionPreVisitor preVisitor{&context};
@@ -1976,6 +1937,6 @@ std::unique_ptr<sbe::PlanStage> generateIndexFilter(OperationContext* opCtx,
 
     auto [resultSlot, resultStage] = context.done();
     tassert(5273411, "Index filter must not track a matching element index", !resultSlot);
-    return std::move(resultStage.stage);
+    return std::move(resultStage);
 }
 }  // namespace mongo::stage_builder

@@ -44,7 +44,8 @@ WildcardAccessMethod::WildcardAccessMethod(IndexCatalogEntry* wildcardState,
               _descriptor->pathProjection(),
               _indexCatalogEntry->getCollator(),
               getSortedDataInterface()->getKeyStringVersion(),
-              getSortedDataInterface()->getOrdering()) {
+              getSortedDataInterface()->getOrdering(),
+              getSortedDataInterface()->rsKeyFormat()) {
     // Normalize the 'wildcardProjection' index option to facilitate its comparison as part of
     // index signature.
     if (!_descriptor->pathProjection().isEmpty()) {
@@ -60,7 +61,9 @@ bool WildcardAccessMethod::shouldMarkIndexAsMultikey(size_t numberOfKeys,
     return !multikeyMetadataKeys.empty();
 }
 
-void WildcardAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+void WildcardAccessMethod::doGetKeys(OperationContext* opCtx,
+                                     const CollectionPtr& collection,
+                                     SharedBufferFragmentBuilder& pooledBufferBuilder,
                                      const BSONObj& obj,
                                      GetKeysContext context,
                                      KeyStringSet* keys,

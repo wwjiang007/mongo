@@ -71,6 +71,21 @@ bool Helpers::findOne(OperationContext* opCtx,
     return true;
 }
 
+BSONObj Helpers::findOneForTesting(OperationContext* opCtx,
+                                   const CollectionPtr& collection,
+                                   const BSONObj& query,
+                                   const bool invariantOnError) {
+    BSONObj ret;
+    const bool requiresIndex = true;
+    bool found = findOne(opCtx, collection, query, ret, requiresIndex);
+    if (invariantOnError) {
+        invariant(found);
+    }
+
+    return ret.getOwned();
+}
+
+
 /* fetch a single object from collection ns that matches query
    set your db SavedContext first
 */
@@ -108,7 +123,6 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
-    options = options | QueryPlannerParams::OMIT_REPL_STATE_PERMITS_READS_CHECK;
     auto exec = uassertStatusOK(getExecutor(
         opCtx, &collection, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, options));
 
@@ -149,10 +163,11 @@ bool Helpers::findById(OperationContext* opCtx,
     if (indexFound)
         *indexFound = 1;
 
-    RecordId loc = catalog->getEntry(desc)->accessMethod()->findSingle(opCtx, query["_id"].wrap());
-    if (loc.isNull())
+    auto recordId =
+        catalog->getEntry(desc)->accessMethod()->findSingle(opCtx, collection, query["_id"].wrap());
+    if (recordId.isNull())
         return false;
-    result = collection->docFor(opCtx, loc).value();
+    result = collection->docFor(opCtx, recordId).value();
     return true;
 }
 
@@ -163,7 +178,8 @@ RecordId Helpers::findById(OperationContext* opCtx,
     const IndexCatalog* catalog = collection->getIndexCatalog();
     const IndexDescriptor* desc = catalog->findIdIndex(opCtx);
     uassert(13430, "no _id index", desc);
-    return catalog->getEntry(desc)->accessMethod()->findSingle(opCtx, idquery["_id"].wrap());
+    return catalog->getEntry(desc)->accessMethod()->findSingle(
+        opCtx, collection, idquery["_id"].wrap());
 }
 
 // Acquires necessary locks to read the collection with the given namespace. If this is an oplog

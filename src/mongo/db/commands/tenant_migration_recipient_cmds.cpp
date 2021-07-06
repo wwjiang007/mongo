@@ -190,6 +190,7 @@ public:
 
             const auto& cmd = request();
 
+            opCtx->setAlwaysInterruptAtStepDownOrUp();
             auto recipientService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
                     ->lookupServiceByName(repl::TenantMigrationRecipientService::
@@ -212,6 +213,12 @@ public:
                         cmd.getRecipientCertificateForDonor());
                 stateDoc.setRecipientCertificateForDonor(cmd.getRecipientCertificateForDonor());
             }
+
+            // Set the state to 'kDone' so that we don't create a recipient access blocker
+            // unnecessarily if this recipientForgetMigration command is received before a
+            // recipientSyncData command or after the state doc is garbage collected.
+            stateDoc.setState(TenantMigrationRecipientStateEnum::kDone);
+
             auto recipientInstance = repl::TenantMigrationRecipientService::Instance::getOrCreate(
                 opCtx, recipientService, stateDoc.toBSON());
 

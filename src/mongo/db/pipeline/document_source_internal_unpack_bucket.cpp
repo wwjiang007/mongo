@@ -29,8 +29,6 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
 #include <algorithm>
 #include <iterator>
 
@@ -54,17 +52,31 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/util/make_data_structure.h"
-#include "mongo/db/timeseries/timeseries_field_names.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
+/*
+ * $_internalUnpackBucket is an internal stage for materializing time-series measurements from
+ * time-series collections. It should never be used anywhere outside the MongoDB server.
+ */
 REGISTER_DOCUMENT_SOURCE(_internalUnpackBucket,
                          LiteParsedDocumentSourceDefault::parse,
-                         DocumentSourceInternalUnpackBucket::createFromBson,
-                         LiteParsedDocumentSource::AllowedWithApiStrict::kInternal);
+                         DocumentSourceInternalUnpackBucket::createFromBsonInternal,
+                         AllowedWithApiStrict::kInternal);
+
+/*
+ * $_unpackBucket is an alias of $_internalUnpackBucket. It only exposes the "timeField" and the
+ * "metaField" parameters and is only used for special known use cases by other MongoDB products
+ * rather than user applications.
+ */
+REGISTER_DOCUMENT_SOURCE(_unpackBucket,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceInternalUnpackBucket::createFromBsonExternal,
+                         AllowedWithApiStrict::kInternal);
 
 namespace {
 /**
@@ -273,39 +285,43 @@ DocumentSourceInternalUnpackBucket::DocumentSourceInternalUnpackBucket(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BucketUnpacker bucketUnpacker,
     int bucketMaxSpanSeconds)
-    : DocumentSource(kStageName, expCtx),
+    : DocumentSource(kStageNameInternal, expCtx),
       _bucketUnpacker(std::move(bucketUnpacker)),
       _bucketMaxSpanSeconds{bucketMaxSpanSeconds} {}
 
-boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createFromBson(
+boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createFromBsonInternal(
     BSONElement specElem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     uassert(5346500,
-            "$_internalUnpackBucket specification must be an object",
-            specElem.type() == Object);
+            str::stream() << "$_internalUnpackBucket specification must be an object, got: "
+                          << specElem.type(),
+            specElem.type() == BSONType::Object);
 
     // If neither "include" nor "exclude" is specified, the default is "exclude": [] and
     // if that's the case, no field will be added to 'bucketSpec.fieldSet' in the for-loop below.
     BucketUnpacker::Behavior unpackerBehavior = BucketUnpacker::Behavior::kExclude;
     BucketSpec bucketSpec;
     auto hasIncludeExclude = false;
-    std::vector<std::string> fields;
+    auto hasTimeField = false;
+    auto hasBucketMaxSpanSeconds = false;
     auto bucketMaxSpanSeconds = 0;
     std::vector<std::string> computedMetaProjFields;
     for (auto&& elem : specElem.embeddedObject()) {
         auto fieldName = elem.fieldNameStringData();
-        if (fieldName == "include" || fieldName == "exclude") {
+        if (fieldName == kInclude || fieldName == kExclude) {
             uassert(5408000,
                     "The $_internalUnpackBucket stage expects at most one of include/exclude "
                     "parameters to be specified",
                     !hasIncludeExclude);
 
             uassert(5346501,
-                    "include or exclude field must be an array",
+                    str::stream() << "include or exclude field must be an array, got: "
+                                  << elem.type(),
                     elem.type() == BSONType::Array);
 
             for (auto&& elt : elem.embeddedObject()) {
                 uassert(5346502,
-                        "include or exclude field element must be a string",
+                        str::stream() << "include or exclude field element must be a string, got: "
+                                      << elt.type(),
                         elt.type() == BSONType::String);
                 auto field = elt.valueStringData();
                 uassert(5346503,
@@ -313,12 +329,15 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createF
                         field.find('.') == std::string::npos);
                 bucketSpec.fieldSet.emplace(field);
             }
-            unpackerBehavior = fieldName == "include" ? BucketUnpacker::Behavior::kInclude
-                                                      : BucketUnpacker::Behavior::kExclude;
+            unpackerBehavior = fieldName == kInclude ? BucketUnpacker::Behavior::kInclude
+                                                     : BucketUnpacker::Behavior::kExclude;
             hasIncludeExclude = true;
         } else if (fieldName == timeseries::kTimeFieldName) {
-            uassert(5346504, "timeField field must be a string", elem.type() == BSONType::String);
+            uassert(5346504,
+                    str::stream() << "timeField field must be a string, got: " << elem.type(),
+                    elem.type() == BSONType::String);
             bucketSpec.timeField = elem.str();
+            hasTimeField = true;
         } else if (fieldName == timeseries::kMetaFieldName) {
             uassert(5346505,
                     str::stream() << "metaField field must be a string, got: " << elem.type(),
@@ -328,22 +347,27 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createF
                     str::stream() << "metaField field must be a single-element field path",
                     metaField.find('.') == std::string::npos);
             bucketSpec.metaField = std::move(metaField);
-        } else if (fieldName == "bucketMaxSpanSeconds") {
+        } else if (fieldName == kBucketMaxSpanSeconds) {
             uassert(5510600,
-                    "bucketMaxSpanSeconds field must be an integer",
+                    str::stream() << "bucketMaxSpanSeconds field must be an integer, got: "
+                                  << elem.type(),
                     elem.type() == BSONType::NumberInt);
             uassert(5510601,
                     "bucketMaxSpanSeconds field must be greater than zero",
                     elem._numberInt() > 0);
             bucketMaxSpanSeconds = elem._numberInt();
+            hasBucketMaxSpanSeconds = true;
         } else if (fieldName == "computedMetaProjFields") {
             uassert(5509900,
-                    "computedMetaProjFields field must be an array",
+                    str::stream() << "computedMetaProjFields field must be an array, got: "
+                                  << elem.type(),
                     elem.type() == BSONType::Array);
 
             for (auto&& elt : elem.embeddedObject()) {
                 uassert(5509901,
-                        "computedMetaProjFields field element must be a string",
+                        str::stream()
+                            << "computedMetaProjFields field element must be a string, got: "
+                            << elt.type(),
                         elt.type() == BSONType::String);
                 auto field = elt.valueStringData();
                 uassert(5509902,
@@ -358,16 +382,55 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createF
         }
     }
 
-    uassert(5346508,
-            "The $_internalUnpackBucket stage requires a timeField parameter",
-            specElem[timeseries::kTimeFieldName].ok());
+    uassert(
+        5346508, "The $_internalUnpackBucket stage requires a timeField parameter", hasTimeField);
 
     uassert(5510602,
             "The $_internalUnpackBucket stage requires a bucketMaxSpanSeconds parameter",
-            specElem["bucketMaxSpanSeconds"].ok());
+            hasBucketMaxSpanSeconds);
 
     return make_intrusive<DocumentSourceInternalUnpackBucket>(
         expCtx, BucketUnpacker{std::move(bucketSpec), unpackerBehavior}, bucketMaxSpanSeconds);
+}
+
+boost::intrusive_ptr<DocumentSource> DocumentSourceInternalUnpackBucket::createFromBsonExternal(
+    BSONElement specElem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(5612400,
+            str::stream() << "$_unpackBucket specification must be an object, got: "
+                          << specElem.type(),
+            specElem.type() == BSONType::Object);
+
+    BucketSpec bucketSpec;
+    auto hasTimeField = false;
+    for (auto&& elem : specElem.embeddedObject()) {
+        auto fieldName = elem.fieldNameStringData();
+        // We only expose "timeField" and "metaField" as parameters in $_unpackBucket.
+        if (fieldName == timeseries::kTimeFieldName) {
+            uassert(5612401,
+                    str::stream() << "timeField field must be a string, got: " << elem.type(),
+                    elem.type() == BSONType::String);
+            bucketSpec.timeField = elem.str();
+            hasTimeField = true;
+        } else if (fieldName == timeseries::kMetaFieldName) {
+            uassert(5612402,
+                    str::stream() << "metaField field must be a string, got: " << elem.type(),
+                    elem.type() == BSONType::String);
+            auto metaField = elem.str();
+            uassert(5612403,
+                    str::stream() << "metaField field must be a single-element field path",
+                    metaField.find('.') == std::string::npos);
+            bucketSpec.metaField = std::move(metaField);
+        } else {
+            uasserted(5612404,
+                      str::stream() << "unrecognized parameter to $_unpackBucket: " << fieldName);
+        }
+    }
+    uassert(5612405,
+            str::stream() << "The $_unpackBucket stage requires a timeField parameter",
+            hasTimeField);
+
+    return make_intrusive<DocumentSourceInternalUnpackBucket>(
+        expCtx, BucketUnpacker{std::move(bucketSpec), BucketUnpacker::Behavior::kExclude}, 3600);
 }
 
 void DocumentSourceInternalUnpackBucket::serializeToArray(
@@ -394,7 +457,7 @@ void DocumentSourceInternalUnpackBucket::serializeToArray(
     if (spec.metaField) {
         out.addField(timeseries::kMetaFieldName, Value{*spec.metaField});
     }
-    out.addField("bucketMaxSpanSeconds", Value{_bucketMaxSpanSeconds});
+    out.addField(kBucketMaxSpanSeconds, Value{_bucketMaxSpanSeconds});
 
     if (!spec.computedMetaProjFields.empty())
         out.addField("computedMetaProjFields", Value{[&] {
@@ -545,7 +608,8 @@ std::pair<BSONObj, bool> DocumentSourceInternalUnpackBucket::extractOrBuildProje
 std::unique_ptr<MatchExpression> createComparisonPredicate(
     const ComparisonMatchExpression* matchExpr,
     const BucketSpec& bucketSpec,
-    int bucketMaxSpanSeconds) {
+    int bucketMaxSpanSeconds,
+    ExpressionContext::CollationMatchesDefault collationMatchesDefault) {
     using namespace timeseries;
 
     // The control field's min and max are chosen using a field-order insensitive comparator, while
@@ -561,6 +625,14 @@ std::unique_ptr<MatchExpression> createComparisonPredicate(
     // min and max fields use, we will not perform this optimization on queries with null operands.
     if (matchExpr->getData().type() == BSONType::jstNULL)
         return nullptr;
+
+    // The control field's min and max are chosen based on the collation of the collection. If the
+    // query's collation does not match the collection's collation and the query operand is a
+    // string or compound type (skipped above) we will not perform this optimization.
+    if (collationMatchesDefault == ExpressionContext::CollationMatchesDefault::kNo &&
+        matchExpr->getData().type() == BSONType::String) {
+        return nullptr;
+    }
 
     // We must avoid mapping predicates on the meta field onto the control field.
     if (bucketSpec.metaField &&
@@ -658,7 +730,8 @@ DocumentSourceInternalUnpackBucket::createPredicatesOnBucketLevelField(
     } else if (ComparisonMatchExpression::isComparisonMatchExpression(matchExpr)) {
         return createComparisonPredicate(static_cast<const ComparisonMatchExpression*>(matchExpr),
                                          _bucketUnpacker.bucketSpec(),
-                                         _bucketMaxSpanSeconds);
+                                         _bucketMaxSpanSeconds,
+                                         pExpCtx->collationMatchesDefault);
     }
 
     return nullptr;
@@ -684,6 +757,110 @@ std::pair<BSONObj, bool> DocumentSourceInternalUnpackBucket::extractProjectForPu
     }
 
     return {BSONObj{}, false};
+}
+
+std::pair<bool, Pipeline::SourceContainer::iterator>
+DocumentSourceInternalUnpackBucket::rewriteGroupByMinMax(Pipeline::SourceContainer::iterator itr,
+                                                         Pipeline::SourceContainer* container) {
+    const auto* groupPtr = dynamic_cast<DocumentSourceGroup*>(std::next(itr)->get());
+    if (groupPtr == nullptr) {
+        return {};
+    }
+
+    const auto& idFields = groupPtr->getIdFields();
+    if (idFields.size() != 1 || !_bucketUnpacker.bucketSpec().metaField.has_value()) {
+        return {};
+    }
+
+    const auto& exprId = idFields.cbegin()->second;
+    const auto* exprIdPath = dynamic_cast<const ExpressionFieldPath*>(exprId.get());
+    if (exprIdPath == nullptr) {
+        return {};
+    }
+
+    const auto& idPath = exprIdPath->getFieldPath();
+    if (idPath.getPathLength() < 2 ||
+        idPath.getFieldName(1) != _bucketUnpacker.bucketSpec().metaField.get()) {
+        return {};
+    }
+
+    bool suitable = true;
+    std::vector<AccumulationStatement> accumulationStatements;
+    for (const AccumulationStatement& stmt : groupPtr->getAccumulatedFields()) {
+        const auto op = stmt.expr.name;
+        const bool isMin = op == "$min";
+        const bool isMax = op == "$max";
+
+        // Rewrite is valid only for min and max aggregates.
+        if (!isMin && !isMax) {
+            suitable = false;
+            break;
+        }
+
+        const auto* exprArg = stmt.expr.argument.get();
+        if (const auto* exprArgPath = dynamic_cast<const ExpressionFieldPath*>(exprArg)) {
+            const auto& path = exprArgPath->getFieldPath();
+            if (path.getPathLength() <= 1 ||
+                path.getFieldName(1) == _bucketUnpacker.bucketSpec().timeField) {
+                // Rewrite not valid for time field. We want to eliminate the bucket
+                // unpack stage here.
+                suitable = false;
+                break;
+            }
+
+            // Update aggregates to reference the control field.
+            std::ostringstream os;
+            if (isMin) {
+                os << timeseries::kControlMinFieldNamePrefix;
+            } else {
+                os << timeseries::kControlMaxFieldNamePrefix;
+            }
+
+            for (size_t index = 1; index < path.getPathLength(); index++) {
+                if (index > 1) {
+                    os << ".";
+                }
+                os << path.getFieldName(index);
+            }
+
+            const auto& newExpr = ExpressionFieldPath::createPathFromString(
+                pExpCtx.get(), os.str(), pExpCtx->variablesParseState);
+
+            AccumulationExpression accExpr = stmt.expr;
+            accExpr.argument = newExpr;
+            accumulationStatements.emplace_back(stmt.fieldName, std::move(accExpr));
+        }
+    }
+
+    if (suitable) {
+        std::ostringstream os;
+        os << timeseries::kBucketMetaFieldName;
+        for (size_t index = 2; index < idPath.getPathLength(); index++) {
+            os << "." << idPath.getFieldName(index);
+        }
+        auto exprId1 = ExpressionFieldPath::createPathFromString(
+            pExpCtx.get(), os.str(), pExpCtx->variablesParseState);
+
+        auto newGroup = DocumentSourceGroup::create(pExpCtx,
+                                                    std::move(exprId1),
+                                                    std::move(accumulationStatements),
+                                                    groupPtr->getMaxMemoryUsageBytes());
+
+        // Erase current stage and following group stage, and replace with updated
+        // group.
+        container->erase(std::next(itr));
+        *itr = std::move(newGroup);
+
+        if (itr == container->begin()) {
+            // Optimize group stage.
+            return {true, itr};
+        } else {
+            // Give chance of the previous stage to optimize against group stage.
+            return {true, std::prev(itr)};
+        }
+    }
+
+    return {};
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimizeAt(
@@ -727,6 +904,17 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalUnpackBucket::doOptimi
     if (!_optimizedEndOfPipeline) {
         _optimizedEndOfPipeline = true;
         optimizeEndOfPipeline(itr, container);
+
+        if (std::next(itr) == container->end()) {
+            return container->end();
+        }
+    }
+    {
+        // Check if we can avoid unpacking if we have a group stage with min/max aggregates.
+        auto [success, result] = rewriteGroupByMinMax(itr, container);
+        if (success) {
+            return result;
+        }
     }
 
     {

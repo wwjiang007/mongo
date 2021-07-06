@@ -40,6 +40,7 @@
 
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -54,7 +55,6 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/retryable_writes_stats.h"
@@ -93,7 +93,7 @@ MONGO_FAIL_POINT_DEFINE(failTransactionNoopWrite);
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
 // The command names that are allowed in a prepared transaction.
-const StringMap<int> preparedTxnCmdWhitelist = {
+const StringMap<int> preparedTxnCmdAllowlist = {
     {"abortTransaction", 1}, {"commitTransaction", 1}, {"prepareTransaction", 1}};
 
 void fassertOnRepeatedExecution(const LogicalSessionId& lsid,
@@ -243,7 +243,7 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
     auto idToFetch = updateRequest.getQuery().firstElement();
     auto toUpdateIdDoc = idToFetch.wrap();
     dassert(idToFetch.fieldNameStringData() == "_id"_sd);
-    auto recordId = indexAccess->findSingle(opCtx, toUpdateIdDoc);
+    auto recordId = indexAccess->findSingle(opCtx, *collection, toUpdateIdDoc);
     auto startingSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
     const auto updateMod = updateRequest.getUpdateModification().getUpdateClassic();
 
@@ -683,7 +683,7 @@ TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* o
 
     // Begin a new WUOW and reserve a slot in the oplog.
     WriteUnitOfWork wuow(opCtx);
-    auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+    auto oplogInfo = LocalOplogInfo::get(opCtx);
     _oplogSlots = oplogInfo->getNextOpTimes(opCtx, numSlotsToReserve);
 
     // Release the WUOW state since this WUOW is no longer in use.
@@ -761,6 +761,7 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
     _apiParameters = APIParameters::get(opCtx);
     _readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     _uncommittedCollections = UncommittedCollections::get(opCtx).releaseResources();
+    _uncommittedMultikey = UncommittedMultikey::get(opCtx).releaseResources();
 }
 
 TransactionParticipant::TxnResources::~TxnResources() {
@@ -827,6 +828,10 @@ void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
     // Transfer ownership of UncommittedCollections
     UncommittedCollections::get(opCtx).receiveResources(_uncommittedCollections);
     _uncommittedCollections = nullptr;
+
+    // Transfer ownership of UncommittedMultikey
+    UncommittedMultikey::get(opCtx).receiveResources(_uncommittedMultikey);
+    _uncommittedMultikey = nullptr;
 
     auto oldState = opCtx->setRecoveryUnit(std::move(_recoveryUnit),
                                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
@@ -1158,7 +1163,7 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
                 str::stream() << "prepareTransaction failed because one of the transaction "
                                  "operations was done against a temporary collection '"
                               << collection->ns() << "'.",
-                !collection->isTemporary(opCtx));
+                !collection->isTemporary());
     }
 
     boost::optional<OplogSlotReserver> oplogSlotReserver;
@@ -1324,7 +1329,7 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     //
     // TODO (SERVER-41165): Snapshot read concern should wait on the read timestamp instead.
     auto wc = opCtx->getWriteConcern();
-    auto needsNoopWrite = txnOps.empty() && !opCtx->getWriteConcern().usedDefault;
+    auto needsNoopWrite = txnOps.empty() && !opCtx->getWriteConcern().usedDefaultConstructedWC;
 
     const size_t operationCount = p().transactionOperations.size();
     const size_t oplogOperationBytes = p().transactionOperationBytes;
@@ -1522,6 +1527,14 @@ APIParameters TransactionParticipant::Participant::getAPIParameters(OperationCon
         return o().txnResourceStash->getAPIParameters();
     }
     return APIParameters::get(opCtx);
+}
+
+void TransactionParticipant::Participant::setLastWriteOpTime(OperationContext* opCtx,
+                                                             const repl::OpTime& lastWriteOpTime) {
+    stdx::lock_guard<Client> lg(*opCtx->getClient());
+    auto& curLastWriteOpTime = o(lg).lastWriteOpTime;
+    invariant(lastWriteOpTime.isNull() || lastWriteOpTime > curLastWriteOpTime);
+    curLastWriteOpTime = lastWriteOpTime;
 }
 
 bool TransactionParticipant::Observer::expiredAsOf(Date_t when) const {
@@ -1731,7 +1744,7 @@ void TransactionParticipant::Participant::_checkIsCommandValidWithTxnState(
             str::stream() << "Cannot call any operation other than abort, prepare or commit on"
                           << " a prepared transaction",
             !o().txnState.isPrepared() ||
-                preparedTxnCmdWhitelist.find(cmdName) != preparedTxnCmdWhitelist.cend());
+                preparedTxnCmdAllowlist.find(cmdName) != preparedTxnCmdAllowlist.cend());
 }
 
 BSONObj TransactionParticipant::Observer::reportStashedState(OperationContext* opCtx) const {
@@ -2168,7 +2181,8 @@ void TransactionParticipant::Participant::_setNewTxnNumber(OperationContext* opC
         "{lsid}",
         "New transaction started",
         "txnNumber"_attr = txnNumber,
-        "lsid"_attr = _sessionId().getId());
+        "lsid"_attr = _sessionId().getId(),
+        "apiParameters"_attr = APIParameters::get(opCtx).toBSON());
 
     // Abort the existing transaction if it's not prepared, committed, or aborted.
     if (o().txnState.isInProgress()) {

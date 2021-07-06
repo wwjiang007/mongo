@@ -1,5 +1,5 @@
 test_kind: fsm_workload_test
-use_in_multiversion: concurrency_replication_multiversion
+use_in_multiversion: concurrency_replication_multiversion_passthrough
 
 selector:
   roots:
@@ -31,9 +31,7 @@ executor:
       - CheckReplDBHash
       - ValidateCollections
     tests: true
-  config:
-    shell_options:
-      readMode: commands
+  config: {}
   hooks:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're

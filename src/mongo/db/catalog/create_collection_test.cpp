@@ -34,14 +34,13 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/uuid.h"
 
@@ -96,21 +95,22 @@ void CreateCollectionTest::validateValidator(const std::string& validatorStr,
     NamespaceString newNss("test.newCollWithValidation");
 
     auto opCtx = makeOpCtx();
-    Lock::GlobalLock lk(opCtx.get(), MODE_X);  // Satisfy low-level locking invariants.
 
     CollectionOptions options;
     options.validator = fromjson(validatorStr);
     options.uuid = UUID::gen();
 
-    AutoGetOrCreateDb autoDb(opCtx.get(), newNss.db(), MODE_X);
-    auto db = autoDb.getDb();
-    ASSERT_TRUE(db) << "Cannot create collection " << newNss << " because database " << newNss.db()
-                    << " does not exist.";
+    return writeConflictRetry(opCtx.get(), "create", newNss.ns(), [&] {
+        AutoGetCollection autoColl(opCtx.get(), newNss, MODE_IX);
+        auto db = autoColl.ensureDbExists();
+        ASSERT_TRUE(db) << "Cannot create collection " << newNss << " because database "
+                        << newNss.db() << " does not exist.";
 
-    WriteUnitOfWork wuow(opCtx.get());
-    const auto status =
-        db->userCreateNS(opCtx.get(), newNss, options, false /*createDefaultIndexes*/);
-    ASSERT_EQ(expectedError, status.code());
+        WriteUnitOfWork wuow(opCtx.get());
+        const auto status =
+            db->userCreateNS(opCtx.get(), newNss, options, false /*createDefaultIndexes*/);
+        ASSERT_EQ(expectedError, status.code()) << status;
+    });
 }
 
 /**
@@ -127,7 +127,7 @@ CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceS
     AutoGetCollectionForRead collection(opCtx, nss);
     ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
                             << " because collection does not exist.";
-    return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
+    return collection->getCollectionOptions();
 }
 
 /**

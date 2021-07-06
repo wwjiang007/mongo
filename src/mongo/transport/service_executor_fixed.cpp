@@ -256,6 +256,7 @@ Status ServiceExecutorFixed::shutdown(Milliseconds timeout) {
         }
     }
 
+    join();
     LOGV2_DEBUG(4910504,
                 kDiagnosticLogLevel,
                 "Shutdown fixed thread-pool service executor",
@@ -353,7 +354,7 @@ Status ServiceExecutorFixed::scheduleTask(Task task, ScheduleFlags flags) try {
     }
 
     auto mayExecuteTaskInline = [&] {
-        if (!(flags & ScheduleFlags::kMayRecurse))
+        if ((flags & ScheduleFlags::kMayRecurse) == ScheduleFlags{})
             return false;
         if (!_executorContext)
             return false;

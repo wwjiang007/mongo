@@ -251,6 +251,7 @@ public:
     using MutableOplogEntry::getFromMigrate;
     using MutableOplogEntry::getFromTenantMigration;
     using MutableOplogEntry::getHash;
+    using MutableOplogEntry::getNeedsRetryImage;
     using MutableOplogEntry::getNss;
     using MutableOplogEntry::getObject;
     using MutableOplogEntry::getObject2;
@@ -320,7 +321,8 @@ public:
                       const boost::optional<OpTime>& preImageOpTime,
                       const boost::optional<OpTime>& postImageOpTime,
                       const boost::optional<ShardId>& destinedRecipient,
-                      const boost::optional<Value>& idField);
+                      const boost::optional<Value>& idField,
+                      const boost::optional<RetryImageEnum>& needsRetryImage);
 
     // DEPRECATED: This constructor can throw. Use static parse method instead.
     explicit DurableOplogEntry(BSONObj raw);
@@ -510,9 +512,6 @@ public:
     void setPostImageOp(std::shared_ptr<DurableOplogEntry> postImageOp);
     void setPostImageOp(const BSONObj& postImageOp);
 
-    bool isForReshardingSessionApplication() const;
-    void setIsForReshardingSessionApplication(bool isForReshardingSessionApplication = true);
-
     std::string toStringForLogging() const;
 
     /**
@@ -545,6 +544,7 @@ public:
     const boost::optional<mongo::UUID>& getFromTenantMigration() const&;
     const boost::optional<mongo::repl::OpTime>& getPrevWriteOpTimeInTransaction() const&;
     const boost::optional<mongo::repl::OpTime>& getPostImageOpTime() const&;
+    const boost::optional<RetryImageEnum> getNeedsRetryImage() const;
     OpTime getOpTime() const;
     bool isCommand() const;
     bool isPartialTransaction() const;
@@ -572,8 +572,6 @@ private:
     std::shared_ptr<DurableOplogEntry> _postImageOp;
 
     bool _isForCappedCollection = false;
-
-    bool _isForReshardingSessionApplication = false;
 };
 
 std::ostream& operator<<(std::ostream& s, const DurableOplogEntry& o);

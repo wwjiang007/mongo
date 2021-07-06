@@ -103,7 +103,6 @@ class CustomFormatter(argparse.RawTextHelpFormatter, argparse.ArgumentDefaultsHe
                     {help_text[CountTypes.PUB_EDGE.name]}count edges that are public
                     {help_text[CountTypes.PRIV_EDGE.name]}count edges that are private
                     {help_text[CountTypes.IF_EDGE.name]}count edges that are interface
-                    {help_text[CountTypes.SHIM.name]}count shim nodes
                     {help_text[CountTypes.LIB.name]}count library nodes
                     {help_text[CountTypes.PROG.name]}count program nodes
                 """)
@@ -159,6 +158,11 @@ def setup_args_parser():
         "[from_node] [to_node]: Print edges between two nodes, which if removed would break the dependency between those "
         + "nodes,.")
 
+    parser.add_argument(
+        '--indegree-one', action='store_true', default=False, help=
+        "Find candidate nodes for merging by searching the graph for nodes with only one node which depends on them."
+    )
+
     args = parser.parse_args()
 
     for arg_list in args.graph_paths:
@@ -172,6 +176,18 @@ def setup_args_parser():
                 f'Must pass two args for --critical-edges, [from_node] [to_node], not {arg_list}')
 
     return parser.parse_args()
+
+
+def strip_build_dir(build_dir, node):
+    """Small util function for making args match the graph paths."""
+
+    return str(Path(node).relative_to(build_dir))
+
+
+def strip_build_dirs(build_dir, nodes):
+    """Small util function for making a list of nodes match graph paths."""
+
+    return [strip_build_dir(build_dir, node) for node in nodes]
 
 
 def load_graph_data(graph_file, output_format):
@@ -192,32 +208,48 @@ def main():
     args = setup_args_parser()
     graph = load_graph_data(args.graph_file, args.format)
     libdeps_graph = LibdepsGraph(graph=graph)
+    build_dir = libdeps_graph.graph['build_dir']
+
+    if libdeps_graph.graph['graph_schema_version'] == 1:
+        libdeps_graph = networkx.reverse_view(libdeps_graph)
 
     analysis = libdeps_analyzer.counter_factory(libdeps_graph, args.counts)
 
     for analyzer_args in args.direct_depends:
-        analysis.append(libdeps_analyzer.DirectDependents(libdeps_graph, analyzer_args))
+        analysis.append(
+            libdeps_analyzer.DirectDependents(libdeps_graph,
+                                              strip_build_dir(build_dir, analyzer_args)))
 
     for analyzer_args in args.common_depends:
-        analysis.append(libdeps_analyzer.CommonDependents(libdeps_graph, analyzer_args))
+        analysis.append(
+            libdeps_analyzer.CommonDependents(libdeps_graph,
+                                              strip_build_dirs(build_dir, analyzer_args)))
 
     for analyzer_args in args.exclude_depends:
-        analysis.append(libdeps_analyzer.ExcludeDependents(libdeps_graph, analyzer_args))
+        analysis.append(
+            libdeps_analyzer.ExcludeDependents(libdeps_graph,
+                                               strip_build_dirs(build_dir, analyzer_args)))
 
     for analyzer_args in args.graph_paths:
         analysis.append(
-            libdeps_analyzer.GraphPaths(libdeps_graph, analyzer_args[0], analyzer_args[1]))
+            libdeps_analyzer.GraphPaths(libdeps_graph, strip_build_dir(build_dir, analyzer_args[0]),
+                                        strip_build_dir(build_dir, analyzer_args[1])))
 
     for analyzer_args in args.critical_edges:
         analysis.append(
-            libdeps_analyzer.CriticalEdges(libdeps_graph, analyzer_args[0], analyzer_args[1]))
+            libdeps_analyzer.CriticalEdges(libdeps_graph,
+                                           strip_build_dir(build_dir, analyzer_args[0]),
+                                           strip_build_dir(build_dir, analyzer_args[1])))
+
+    if args.indegree_one:
+        analysis.append(libdeps_analyzer.InDegreeOne(libdeps_graph))
 
     analysis += libdeps_analyzer.linter_factory(libdeps_graph, args.lint)
 
     if args.build_data:
         analysis.append(libdeps_analyzer.BuildDataReport(libdeps_graph))
 
-    ga = libdeps_analyzer.LibdepsGraphAnalysis(libdeps_graph=libdeps_graph, analysis=analysis)
+    ga = libdeps_analyzer.LibdepsGraphAnalysis(analysis)
 
     if args.format == 'pretty':
         ga_printer = libdeps_analyzer.GaPrettyPrinter(ga)

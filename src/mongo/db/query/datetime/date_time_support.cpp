@@ -50,7 +50,7 @@ namespace mongo {
 
 namespace {
 
-const auto getTimeZoneDatabase =
+const auto getTimeZoneDatabaseDecorable =
     ServiceContext::declareDecoration<std::unique_ptr<TimeZoneDatabase>>();
 
 std::unique_ptr<_timelib_time, TimeZone::TimelibTimeDeleter> createTimelibTime() {
@@ -134,12 +134,12 @@ void validateFormat(StringData format,
 }  // namespace
 
 const TimeZoneDatabase* TimeZoneDatabase::get(ServiceContext* serviceContext) {
-    return getTimeZoneDatabase(serviceContext).get();
+    return getTimeZoneDatabaseDecorable(serviceContext).get();
 }
 
 void TimeZoneDatabase::set(ServiceContext* serviceContext,
                            std::unique_ptr<TimeZoneDatabase> dateTimeSupport) {
-    getTimeZoneDatabase(serviceContext) = std::move(dateTimeSupport);
+    getTimeZoneDatabaseDecorable(serviceContext) = std::move(dateTimeSupport);
 }
 
 TimeZoneDatabase::TimeZoneDatabase() {
@@ -182,7 +182,8 @@ void TimeZoneDatabase::loadTimeZoneInfo(
                                << entry.id << "\": " << timelib_get_error_message(errorCode)});
         }
 
-        invariant(errorCode == TIMELIB_ERROR_NO_ERROR);
+        invariant(errorCode == TIMELIB_ERROR_NO_ERROR ||
+                  errorCode == TIMELIB_ERROR_EMPTY_POSIX_STRING);
         _timeZones[entry.id] = TimeZone{tzInfo};
     }
 }
@@ -643,14 +644,28 @@ inline long long daysBetweenYears(long startYear, long endYear) {
 
 /**
  * Determines a correction needed in number of hours when calculating passed hours between two time
- * instants 'startInstant' and 'endInstant' due to the Daylight Savings Time. Returns 0, if both
- * time instants 'startInstant' and 'endInstant' are either in Standard Time (ST) or in Daylight
- * Saving Time (DST); returns 1, if 'endInstant' is in ST and 'startInstant' is in DST and
- * 'endInstant' > 'startInstant' or 'endInstant' is in DST and 'startInstant' is in ST and
- * 'endInstant' < 'startInstant'; otherwise returns -1.
+ * instants 'startInstant' and 'endInstant' due to different UTC offsets.
  */
-inline long long dstCorrection(timelib_time* startInstant, timelib_time* endInstant) {
+inline long long utcOffsetCorrectionForHours(timelib_time* startInstant, timelib_time* endInstant) {
     return (startInstant->z - endInstant->z) / (kMinutesPerHour * kSecondsPerMinute);
+}
+
+/**
+ * Determines a correction needed in number of minutes when calculating passed minutes between two
+ * time instants 'startInstant' and 'endInstant' due to different UTC offsets.
+ */
+inline long long utcOffsetCorrectionForMinutes(timelib_time* startInstant,
+                                               timelib_time* endInstant) {
+    return (startInstant->z - endInstant->z) / kSecondsPerMinute;
+}
+
+/**
+ * Determines a correction needed in number of seconds when calculating passed seconds between two
+ * time instants 'startInstant' and 'endInstant' due to different UTC offsets.
+ */
+inline long long utcOffsetCorrectionForSeconds(timelib_time* startInstant,
+                                               timelib_time* endInstant) {
+    return startInstant->z - endInstant->z;
 }
 inline long long dateDiffYear(Date startInstant, Date endInstant) {
     return endInstant.year - startInstant.year;
@@ -697,18 +712,27 @@ inline long long dateDiffWeek(Date startInstant, Date endInstant, DayOfWeek star
             dayOfWeek(endInstant, startOfWeek)) /
         kDaysPerWeek;
 }
+inline long long dateDiffHourWithoutUTCOffsetCorrection(timelib_time* startInstant,
+                                                        timelib_time* endInstant) {
+    return endInstant->h - startInstant->h + dateDiffDay(*startInstant, *endInstant) * kHoursPerDay;
+}
 inline long long dateDiffHour(timelib_time* startInstant, timelib_time* endInstant) {
-    return endInstant->h - startInstant->h +
-        dateDiffDay(*startInstant, *endInstant) * kHoursPerDay +
-        dstCorrection(startInstant, endInstant);
+    return dateDiffHourWithoutUTCOffsetCorrection(startInstant, endInstant) +
+        utcOffsetCorrectionForHours(startInstant, endInstant);
+}
+inline long long dateDiffMinuteWithoutUTCOffsetCorrection(timelib_time* startInstant,
+                                                          timelib_time* endInstant) {
+    return endInstant->i - startInstant->i +
+        dateDiffHourWithoutUTCOffsetCorrection(startInstant, endInstant) * kMinutesPerHour;
 }
 inline long long dateDiffMinute(timelib_time* startInstant, timelib_time* endInstant) {
-    return endInstant->i - startInstant->i +
-        dateDiffHour(startInstant, endInstant) * kMinutesPerHour;
+    return dateDiffMinuteWithoutUTCOffsetCorrection(startInstant, endInstant) +
+        utcOffsetCorrectionForMinutes(startInstant, endInstant);
 }
 inline long long dateDiffSecond(timelib_time* startInstant, timelib_time* endInstant) {
     return endInstant->s - startInstant->s +
-        dateDiffMinute(startInstant, endInstant) * kSecondsPerMinute;
+        dateDiffMinuteWithoutUTCOffsetCorrection(startInstant, endInstant) * kSecondsPerMinute +
+        utcOffsetCorrectionForSeconds(startInstant, endInstant);
 }
 inline long long dateDiffMillisecond(Date_t startDate, Date_t endDate) {
     long long result;
@@ -920,6 +944,9 @@ std::pair<long long, long long> addMonths(long long year, long long month, long 
  * needed
  */
 boost::optional<long long> daysToAdd(timelib_time* tm, TimeUnit unit, long long amount) {
+    if (unit != TimeUnit::year && unit != TimeUnit::quarter && unit != TimeUnit::month) {
+        return boost::none;
+    }
     if (tm->d <= 28 && tm->z == 0) {
         return boost::none;
     }
@@ -938,28 +965,6 @@ boost::optional<long long> daysToAdd(timelib_time* tm, TimeUnit unit, long long 
     long long intervalInDays = timelib_day_of_year(resYear, resMonth, targetDay) -
         timelib_day_of_year(tm->y, tm->m, tm->d) + daysBetweenYears(tm->y, resYear);
     return boost::make_optional(intervalInDays);
-}
-
-/**
- * A helper function that computes DST correction in seconds for start and end seconds-since-epoch
- * for the given timezone argument.
- */
-long long dateAddDSTCorrection(long long startSse, long long endSse, const TimeZone& timezone) {
-    auto tz = timezone.getTzInfo();
-    if (!tz) {
-        return 0;
-    }
-    auto startOffset = timelib_get_time_zone_info(startSse, tz.get());
-    auto endOffset = timelib_get_time_zone_info(endSse, tz.get());
-    long long corr = startOffset->offset - endOffset->offset;
-    // If the result date falls into the missing hour during Standard to DST time
-    // change, forward the clock with 1 hour.
-    if (endOffset->is_dst && endSse - endOffset->transition_time <= 3600) {
-        corr += 3600;
-    }
-    timelib_time_offset_dtor(startOffset);
-    timelib_time_offset_dtor(endOffset);
-    return corr;
 }
 
 /**
@@ -1132,50 +1137,57 @@ std::pair<Date_t, Date> defaultReferencePointForDateTrunc(const TimeZone& timezo
 }  // namespace
 
 Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& timezone) {
-    auto utcTime = createTimelibTime();
-    timelib_unixtime2gmt(utcTime.get(), seconds(date));
+    if (unit == TimeUnit::millisecond) {
+        return date + Milliseconds(amount);
+    }
+
+    auto localTime = timezone.getTimelibTime(date);
+    auto microSec = durationCount<Microseconds>(Milliseconds(date.toMillisSinceEpoch() % 1000));
+    localTime->us = microSec;
 
     // Check if an adjustment for the last day of month is necessary.
-    if (unit == TimeUnit::year || unit == TimeUnit::quarter || unit == TimeUnit::month) {
-        auto intervalInDays = [&]() {
-            if (timezone.isUtcZone()) {
-                return daysToAdd(utcTime.get(), unit, amount);
-            }
-            // If a timezone is provided, the last day adjustment is computed in this timezone.
-            auto localTime = timezone.getTimelibTime(date);
-            return daysToAdd(localTime.get(), unit, amount);
-        }();
-        if (intervalInDays) {
-            unit = TimeUnit::day;
-            amount = intervalInDays.get();
-        }
+    auto intervalInDays = daysToAdd(localTime.get(), unit, amount);
+    if (intervalInDays) {
+        unit = TimeUnit::day;
+        amount = intervalInDays.get();
     }
 
     auto interval = getTimelibRelTime(unit, amount);
 
-    // Compute the result date in UTC and if needed later perform a DST correction for a timezone.
-    // The alternative computation in the associated timezone gives incorrect results when the
-    // computed date falls into the missing hour during the standard time-to-DST transition or
-    // falls into the repeated hour during the DST-to-standard time transition.
-    auto newTime = timelib_add(utcTime.get(), interval.get());
+    auto timeAfterAddition = [&]() {
+        // For time units of day or larger perform the computation in the local timezone. This
+        // keeps the values of hour, minute, second, and millisecond components from the input date
+        // the same in the result date regardless of transitions from DST to Standard Time and vice
+        // versa that may happen between the input date and the result.
+        if (timezone.isUtcZone() || timezone.isUtcOffsetZone() || interval->d || interval->m ||
+            interval->y) {
+            return timelib_add(localTime.get(), interval.get());
+        }
 
-    // Check the DST offsets in the given timezone and compute a correction if the time unit is
-    // a day or a larger unit. UTC and offset-based timezones do not have DST and do not need
-    // this correction.
-    if ((interval->d || interval->m || interval->y) && timezone.isTimeZoneIDZone()) {
-        newTime->sse += dateAddDSTCorrection(utcTime->sse, newTime->sse, timezone);
-    }
+        // For time units of hour or smaller and a timezone different from UTC perform the
+        // computation in UTC. In this case we don't want to apply the DST correction to the return
+        // date, which would happen by default if we used the timelib_add() function with local
+        // time. For example:
+        //    {$dateAdd: { startDate: ISODate("2020-11-01T05:50:02Z"),
+        //     unit: "hour", amount: 1, timezone: "America/New_York"}}
+        // returns ISODate("2020-11-01T07:50:02Z") when we call timelib_add(localTime ...)
+        // and ISODate("2020-11-01T06:50:02Z") when we call timelib_add(utcTime ...).
+        auto utcTime = createTimelibTime();
+        timelib_unixtime2gmt(utcTime.get(), seconds(date));
+        utcTime->us = microSec;
+        return timelib_add(utcTime.get(), interval.get());
+    }();
 
     long long res;
-    if (overflow::mul(newTime->sse, 1000L, &res)) {
-        timelib_time_dtor(newTime);
+    if (overflow::mul(timeAfterAddition->sse, 1000L, &res)) {
+        timelib_time_dtor(timeAfterAddition);
         uasserted(5166406, "dateAdd overflowed");
     }
 
-    auto returnDate =
-        Date_t::fromMillisSinceEpoch(durationCount<Milliseconds>(Seconds(newTime->sse)) +
-                                     durationCount<Milliseconds>(Microseconds(newTime->us)));
-    timelib_time_dtor(newTime);
+    auto returnDate = Date_t::fromMillisSinceEpoch(
+        durationCount<Milliseconds>(Seconds(timeAfterAddition->sse)) +
+        durationCount<Milliseconds>(Microseconds(timeAfterAddition->us)));
+    timelib_time_dtor(timeAfterAddition);
     return returnDate;
 }
 

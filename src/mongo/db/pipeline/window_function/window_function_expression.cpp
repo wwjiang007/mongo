@@ -37,30 +37,62 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 
+#include "mongo/db/pipeline/window_function/partition_iterator.h"
+#include "mongo/db/pipeline/window_function/window_function_exec.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_derivative.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_first_last.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
 
 using boost::intrusive_ptr;
 using boost::optional;
 
 namespace mongo::window_function {
-
+using namespace std::string_literals;
 REGISTER_WINDOW_FUNCTION(derivative, ExpressionDerivative::parse);
+REGISTER_WINDOW_FUNCTION(first, ExpressionFirst::parse);
+REGISTER_WINDOW_FUNCTION(last, ExpressionLast::parse);
 
 StringMap<Expression::Parser> Expression::parserMap;
 
 intrusive_ptr<Expression> Expression::parse(BSONObj obj,
                                             const optional<SortPattern>& sortBy,
                                             ExpressionContext* expCtx) {
-    boost::optional<Expression::Parser> parser;
+
     for (const auto& field : obj) {
-        // Found one valid window function. If there are multiple window functions they will be
-        // caught as invalid arguments to the Expression parser later.
-        auto parser = parserMap.find(field.fieldNameStringData());
-        if (parser != parserMap.end()) {
-            return parser->second(obj, sortBy, expCtx);
+        // Check if window function is $-prefixed.
+        auto fieldName = field.fieldNameStringData();
+
+        if (fieldName.startsWith("$"_sd)) {
+
+            if (auto parser = parserMap.find(field.fieldNameStringData());
+                parser != parserMap.end()) {
+                // Found one valid window function. If there are multiple window functions they will
+                // be caught as invalid arguments to the Expression parser later.
+                return parser->second(obj, sortBy, expCtx);
+            }
+            // The window function provided in the window function expression is invalid.
+
+            // For example, in this window function expression:
+            //     {$setWindowFields:
+            //         {output:
+            //             {total:
+            //                 {$summ: "$x", windoww: {documents: ['unbounded', 'current']}
+            //                 }
+            //             }
+            //         }
+            //     }
+            //
+            // the window function, $summ, is invalid as it is mispelled.
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << "Unrecognized window function, " << fieldName);
         }
     }
-    uasserted(ErrorCodes::FailedToParse, "Unrecognized window function");
+    // The command did not contain any $-prefixed window functions.
+    uasserted(ErrorCodes::FailedToParse,
+              "Expected a $-prefixed window function"s +
+                  (obj.firstElementFieldNameStringData().empty()
+                       ? ""s
+                       : ", "s + obj.firstElementFieldNameStringData()));
 }
 
 void Expression::registerParser(std::string functionName, Parser parser) {
@@ -84,6 +116,7 @@ boost::intrusive_ptr<Expression> ExpressionExpMovingAvg::parse(
                           << kInputArg << "' field, and either an '" << kNArg << "' field or an '"
                           << kAlphaArg << "' field",
             subObj.nFields() == 2 && subObj.hasField(kInputArg));
+    uassert(ErrorCodes::FailedToParse, "$expMovingAvg requires an explicit 'sortBy'", sortBy);
     input =
         ::mongo::Expression::parseOperand(expCtx, subObj[kInputArg], expCtx->variablesParseState);
     // ExpMovingAvg is always unbounded to current.
@@ -110,11 +143,13 @@ boost::intrusive_ptr<Expression> ExpressionExpMovingAvg::parse(
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "'" << kAlphaArg << "' must be a number",
                 subObj[kAlphaArg].isNumber());
-        return make_intrusive<ExpressionExpMovingAvg>(expCtx,
-                                                      std::string(kAccName),
-                                                      std::move(input),
-                                                      std::move(bounds),
-                                                      subObj[kAlphaArg].numberDecimal());
+        auto alpha = subObj[kAlphaArg].numberDecimal();
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << "'" << kAlphaArg << "' must be between 0 and 1 (exclusive), found "
+                              << subObj[kAlphaArg],
+                alpha.isGreater(Decimal128(0)) && alpha.isLess(Decimal128(1.0)));
+        return make_intrusive<ExpressionExpMovingAvg>(
+            expCtx, std::string(kAccName), std::move(input), std::move(bounds), std::move(alpha));
     } else {
         uasserted(ErrorCodes::FailedToParse,
                   str::stream() << "Got unrecognized field in $expMovingAvg"
@@ -124,9 +159,64 @@ boost::intrusive_ptr<Expression> ExpressionExpMovingAvg::parse(
     }
 }
 
-MONGO_INITIALIZER(windowFunctionExpressionMap)(InitializerContext*) {
-    // Nothing to do. This initializer exists to tie together all the individual initializers
-    // defined by REGISTER_WINDOW_FUNCTION and REGISTER_REMOVABLE_WINDOW_FUNCTION
+boost::intrusive_ptr<Expression> ExpressionFirstLast::parse(
+    BSONObj obj,
+    const boost::optional<SortPattern>& sortBy,
+    ExpressionContext* expCtx,
+    Sense sense) {
+    // Example document:
+    // {
+    //   accumulatorName: <expr>,
+    //   window: {...} // optional
+    // }
+
+    const std::string& accumulatorName = senseToAccumulatorName(sense);
+    boost::optional<WindowBounds> bounds;
+    boost::intrusive_ptr<::mongo::Expression> input;
+    for (const auto& arg : obj) {
+        auto argName = arg.fieldNameStringData();
+        if (argName == kWindowArg) {
+            uassert(ErrorCodes::FailedToParse,
+                    "'window' field must be an object",
+                    obj[kWindowArg].type() == BSONType::Object);
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "saw multiple 'window' fields in '" << accumulatorName
+                                  << "' expression",
+                    bounds == boost::none);
+            bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
+        } else if (argName == StringData(accumulatorName)) {
+            input = ::mongo::Expression::parseOperand(expCtx, arg, expCtx->variablesParseState);
+
+        } else {
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << accumulatorName << " got unexpected argument: " << argName);
+        }
+    }
+    tassert(ErrorCodes::FailedToParse,
+            str::stream() << accumulatorName << " parser called with no " << accumulatorName
+                          << " key",
+            input);
+
+    // The default window bounds are [unbounded, unbounded].
+    if (!bounds) {
+        bounds = WindowBounds{
+            WindowBounds::DocumentBased{WindowBounds::Unbounded{}, WindowBounds::Unbounded{}}};
+    }
+
+    switch (sense) {
+        case Sense::kFirst:
+            return make_intrusive<ExpressionFirst>(expCtx, std::move(input), std::move(*bounds));
+        case Sense::kLast:
+            return make_intrusive<ExpressionLast>(expCtx, std::move(input), std::move(*bounds));
+        default:
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << accumulatorName << " is not $first or $last");
+            return nullptr;
+    }
 }
 
+MONGO_INITIALIZER_GROUP(BeginWindowFunctionRegistration,
+                        ("default"),
+                        ("EndWindowFunctionRegistration"))
+MONGO_INITIALIZER_GROUP(EndWindowFunctionRegistration, ("BeginWindowFunctionRegistration"), ())
 }  // namespace mongo::window_function

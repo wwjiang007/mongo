@@ -35,6 +35,7 @@
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/json.h"
 #include "mongo/db/update/update_node_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -255,18 +256,6 @@ TEST_F(ObjectReplaceExecutorTest, CanAddImmutableId) {
     ASSERT_EQUALS(fromjson("{_id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0}"), result.oplogEntry);
-}
-
-TEST_F(ObjectReplaceExecutorTest, CannotCreateDollarPrefixedNameWhenValidateForStorageIsTrue) {
-    auto obj = fromjson("{a: {b: 1, $bad: 1}}");
-    ObjectReplaceExecutor node(obj);
-
-    mutablebson::Document doc(fromjson("{}"));
-    ASSERT_THROWS_CODE_AND_WHAT(
-        node.applyUpdate(getApplyParams(doc.root())),
-        AssertionException,
-        ErrorCodes::DollarPrefixedFieldName,
-        "The dollar ($) prefixed field '$bad' in 'a.$bad' is not valid for storage.");
 }
 
 TEST_F(ObjectReplaceExecutorTest, CanCreateDollarPrefixedNameWhenValidateForStorageIsFalse) {

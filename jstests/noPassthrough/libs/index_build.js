@@ -238,15 +238,6 @@ var IndexBuildTest = class {
 
 const ResumableIndexBuildTest = class {
     /**
-     * Returns whether resumable index builds are supported.
-     */
-    static resumableIndexBuildsEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, enableResumableIndexBuilds: 1}))
-            .enableResumableIndexBuilds;
-    }
-
-    /**
      * Returns a version of the given array that has been flattened into one dimension.
      */
     static flatten(array) {
@@ -584,14 +575,14 @@ const ResumableIndexBuildTest = class {
 
             const resumeCheck = resumeChecks[resumeChecks.length === 1 ? 0 : i];
 
-            if (resumeCheck.numScannedAferResume) {
+            if (resumeCheck.numScannedAfterResume) {
                 // Ensure that the resumed index build resumed the collection scan from the correct
                 // location.
                 checkLog.containsJson(conn, 20391, {
                     buildUUID: function(uuid) {
                         return uuid["uuid"]["$uuid"] === buildUUIDs[i];
                     },
-                    totalRecords: resumeCheck.numScannedAferResume
+                    totalRecords: resumeCheck.numScannedAfterResume
                 });
             } else if (resumeCheck.skippedPhaseLogID) {
                 // Ensure that the resumed index build does not perform a phase that it already
@@ -604,7 +595,7 @@ const ResumableIndexBuildTest = class {
                        "Found log " + resumeCheck.skippedPhaseLogID + " for index build " +
                            buildUUIDs[i] + " when this phase should not have run after resuming");
             } else {
-                assert(false, "Must specify one of numScannedAferResume and skippedPhaseLogID");
+                assert(false, "Must specify one of numScannedAfterResume and skippedPhaseLogID");
             }
         }
     }
@@ -631,7 +622,7 @@ const ResumableIndexBuildTest = class {
      *   case all index builds will be expected to resume from that phase, or it must be exactly
      *   the length of 'indexSpecs'.
      *
-     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAferResume' and
+     * 'resumeChecks' is an array of objects that contain exactly one of 'numScannedAfterResume' and
      *   'skippedPhaseLogID'. The former is used to verify that the index build scanned the
      *   expected number of documents in the collection scan after resuming. The latter is used for
      *   phases which do not perform a collection scan after resuming, to verify that the index
@@ -656,12 +647,6 @@ const ResumableIndexBuildTest = class {
                postIndexBuildInserts = [],
                restartOptions) {
         const primary = rst.getPrimary();
-
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(primary)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
-
         const coll = primary.getDB(dbName).getCollection(collName);
         const indexNames = ResumableIndexBuildTest.generateIndexNames(indexSpecs);
 
@@ -710,12 +695,6 @@ const ResumableIndexBuildTest = class {
                                           postIndexBuildInserts = []) {
         const resumeNode = rst.getPrimary();
         const resumeDB = resumeNode.getDB(dbName);
-
-        if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(resumeNode)) {
-            jsTestLog("Skipping test because resumable index builds are not enabled");
-            return;
-        }
-
         const secondary = rst.getSecondary();
         const coll = resumeDB.getCollection(collName);
         const indexName = "resumable_index_build";

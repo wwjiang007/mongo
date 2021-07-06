@@ -70,8 +70,7 @@ function testRecipientSyncDataInterrupt(interruptFunc, recipientRestarted) {
     sleep(Math.random() * kMaxSleepTimeMS);
     interruptFunc(recipientRst);
 
-    const stateRes = assert.commandWorked(runMigrationThread.returnData());
-    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
+    TenantMigrationTest.assertCommitted(runMigrationThread.returnData());
     tenantMigrationTest.waitForDonorNodesToReachState(donorRst.nodes,
                                                       migrationId,
                                                       migrationOpts.tenantId,
@@ -104,7 +103,7 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     const donorRst = new ReplSetTest({
         nodes: 1,
         name: "donorRst",
-        nodeOptions: Object.assign(migrationX509Options.donor, {
+        nodeOptions: Object.assign({}, migrationX509Options.donor, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
                 ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
@@ -114,7 +113,7 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     const recipientRst = new ReplSetTest({
         nodes: 3,
         name: "recipientRst",
-        nodeOptions: Object.assign(migrationX509Options.recipient, {
+        nodeOptions: Object.assign({}, migrationX509Options.recipient, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
                 ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
@@ -146,9 +145,8 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     };
     const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
 
-    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(
+    TenantMigrationTest.assertCommitted(tenantMigrationTest.runMigration(
         migrationOpts, false /* retryOnRetryableErrors */, false /* automaticForgetMigration */));
-    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
     const forgetMigrationThread = new Thread(TenantMigrationUtil.forgetMigrationAsync,
                                              migrationOpts.migrationIdString,
                                              donorRstArgs,
@@ -192,6 +190,8 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     testRecipientSyncDataInterrupt((recipientRst) => {
         recipientRst.stopSet(null /* signal */, true /*forRestart */);
         recipientRst.startSet({restart: true});
+        recipientRst.awaitSecondaryNodes();
+        recipientRst.getPrimary();
     }, true);
 })();
 
@@ -211,6 +211,8 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     testRecipientForgetMigrationInterrupt((recipientRst) => {
         recipientRst.stopSet(null /* signal */, true /*forRestart */);
         recipientRst.startSet({restart: true});
+        recipientRst.awaitSecondaryNodes();
+        recipientRst.getPrimary();
     });
 })();
 })();

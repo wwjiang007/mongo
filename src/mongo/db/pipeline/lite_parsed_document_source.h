@@ -38,6 +38,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/stdx/unordered_set.h"
@@ -54,32 +55,6 @@ class LiteParsedPipeline;
  */
 class LiteParsedDocumentSource {
 public:
-    /**
-     * Flags to mark stages with different allowance constrains when API versioning is enabled.
-     */
-    enum class AllowedWithApiStrict {
-        // The stage is always allowed in the pipeline regardless of API versions.
-        kAlways,
-        // This stage can be allowed in a stable API version, depending on the parameters.
-        kSometimes,
-        // The stage is allowed only for internal client when 'apiStrict' is set to true.
-        kInternal,
-        // The stage is never allowed in API version '1' when 'apiStrict' is set to true.
-        kNeverInVersion1
-    };
-
-    /**
-     * Determines the type of client which is permitted to use a particular stage in its command
-     * request. Ensures that only internal clients are permitted to send or deserialize certain
-     * stages.
-     */
-    enum class AllowedWithClientType {
-        // The stage can be specified in the command request of any client.
-        kAny,
-        // The stage can be specified in the command request of an internal client only.
-        kInternal,
-    };
-
     /*
      * This is the type of parser you should register using REGISTER_DOCUMENT_SOURCE. It need not
      * do any validation of options, only enough parsing to be able to implement the interface.
@@ -192,7 +167,8 @@ public:
     /**
      * Verifies that this stage is allowed to run with the specified read concern level.
      */
-    virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const {
+    virtual ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                         bool isImplicitDefault) const {
         return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
     }
 
@@ -224,11 +200,11 @@ protected:
                                 << "multi-document transaction.");
     }
 
-    ReadConcernSupportResult onlySingleReadConcernSupported(
-        StringData stageName,
-        repl::ReadConcernLevel supportedLevel,
-        repl::ReadConcernLevel candidateLevel) const {
-        return {{candidateLevel != supportedLevel,
+    ReadConcernSupportResult onlySingleReadConcernSupported(StringData stageName,
+                                                            repl::ReadConcernLevel supportedLevel,
+                                                            repl::ReadConcernLevel candidateLevel,
+                                                            bool isImplicitDefault) const {
+        return {{candidateLevel != supportedLevel && !isImplicitDefault,
                  {ErrorCodes::InvalidOptions,
                   str::stream() << "Aggregation stage " << stageName
                                 << " cannot run with a readConcern other than '"
@@ -241,9 +217,10 @@ protected:
     }
 
     ReadConcernSupportResult onlyReadConcernLocalSupported(StringData stageName,
-                                                           repl::ReadConcernLevel level) const {
+                                                           repl::ReadConcernLevel level,
+                                                           bool isImplicitDefault) const {
         return onlySingleReadConcernSupported(
-            stageName, repl::ReadConcernLevel::kLocalReadConcern, level);
+            stageName, repl::ReadConcernLevel::kLocalReadConcern, level, isImplicitDefault);
     }
 
 private:

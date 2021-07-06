@@ -85,6 +85,14 @@ public:
     void recoverFromOplogUpTo(OperationContext* opCtx, Timestamp endPoint) override;
 
 private:
+    enum class RecoveryMode {
+        kStartupFromStableTimestamp,
+        kStartupFromUnstableCheckpoint,
+        kRollbackFromStableTimestamp,
+        // There is no RecoveryMode::kRollbackFromUnstableCheckpoint, rollback can only recover from
+        // a stable timestamp.
+    };
+
     /**
      * Confirms that the data and oplog all indicate that the nodes has an unstable checkpoint
      * that is fully up to date.
@@ -97,7 +105,8 @@ private:
      */
     void _recoverFromStableTimestamp(OperationContext* opCtx,
                                      Timestamp stableTimestamp,
-                                     OpTime topOfOplog);
+                                     OpTime topOfOplog,
+                                     RecoveryMode recoveryMode);
 
     /**
      * After truncating the oplog, completes recovery if we're recovering from an unstable
@@ -113,7 +122,8 @@ private:
      */
     void _applyToEndOfOplog(OperationContext* opCtx,
                             const Timestamp& oplogApplicationStartPoint,
-                            const Timestamp& topOfOplog);
+                            const Timestamp& topOfOplog,
+                            RecoveryMode recoveryMode);
 
     /**
      * Applies all oplog entries from startPoint (exclusive) to endPoint (inclusive). Returns the
@@ -121,7 +131,8 @@ private:
      */
     Timestamp _applyOplogOperations(OperationContext* opCtx,
                                     const Timestamp& startPoint,
-                                    const Timestamp& endPoint);
+                                    const Timestamp& endPoint,
+                                    RecoveryMode recoveryMode);
 
     /**
      * Gets the last applied OpTime from the end of the oplog. Returns CollectionIsEmpty if there is
@@ -154,6 +165,18 @@ private:
      */
     void _truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint(
         OperationContext* opCtx, boost::optional<Timestamp>* stableTimestamp);
+
+    /**
+     * Checks if the proposed oplog application start point (which is typically derived from the
+     * stable timestamp) exists in the oplog. If it does, this returns that same start point
+     * unchanged. If that point is not in the oplog, this function returns an entry before
+     * that start point.
+     * It is safe to do as as we make sure that we always keep an oplog entry that is less than
+     * or equal to the stable timestamp so such a correction always pushes the start point back and
+     * never forward. Applying entries from an earlier point is permissible due to oplog entry
+     * idempotency (and also due to the order being preserved.)
+     */
+    Timestamp _adjustStartPointIfNecessary(OperationContext* opCtx, Timestamp startPoint);
 
     StorageInterface* _storageInterface;
     ReplicationConsistencyMarkers* _consistencyMarkers;

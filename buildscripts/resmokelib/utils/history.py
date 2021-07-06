@@ -55,7 +55,7 @@ class Historic(ABC, metaclass=registry.make_registry_metaclass(_HISTORICS, type(
         """
         Subscribe to the Historic object.
 
-        The subscriber's accept_read / write is called on an update.
+        The subscriber's accept_write is called on an update.
         """
         if not isinstance(subscriber, Historic):
             raise ValueError("Subscribers should inherit from the Historic ABC.")
@@ -65,11 +65,6 @@ class Historic(ABC, metaclass=registry.make_registry_metaclass(_HISTORICS, type(
     def unsubscribe(self, subscriber):
         """Allow a subscriber to unsubscribe from notifications."""
         self._subscribers = [sub for sub in self._subscribers if sub.obj is not subscriber]
-
-    def notify_subscriber_read(self):
-        """Notify the subscribers that a read has happened."""
-        for subscriber in self._subscribers:
-            subscriber.obj.accept_read(subscriber.key)
 
     def notify_subscriber_write(self):
         """Notify the subscribers that a write has happened."""
@@ -104,14 +99,6 @@ class Historic(ABC, metaclass=registry.make_registry_metaclass(_HISTORICS, type(
         """
         return
 
-    def accept_read(self, key):  # pylint: disable=unused-argument
-        """
-        Update state based on a subscriber's read.
-
-        Override this method if a class also tracks historic state.
-        """
-        self.notify_subscriber_read()
-
     def accept_write(self, key):  # pylint: disable=unused-argument
         """
         Update state based on a subscriber's write.
@@ -129,9 +116,10 @@ class Subscriber:
     key: 'typing.Any'
 
 
-# We only allow immutable types or types that have special logic
-# for being inside a HistoryDict, or else we may miss changes and
-# have difficulty converting to yaml.
+# 1. We only allow immutable types or types that have special logic
+#    for being inside a HistoryDict, or else we may miss changes and
+#    have difficulty converting to yaml.
+# 2. Dictionaries are allowed to be passed in but are implicitly converted to Historic.
 ALLOWED_TYPES = (bool, int, float, str, type(None), Historic)
 
 
@@ -259,11 +247,6 @@ class HistoryDict(MutableMapping, Historic):  # pylint: disable=too-many-ancesto
             history_dict[key] = make_historic(value)
         return history_dict
 
-    def accept_read(self, key):
-        """Record subscribee's read. Overrides Historic."""
-        self._record_read(key)
-        super(HistoryDict, self).accept_read(key)
-
     def accept_write(self, key):
         """Record subscribee's write. Overrides Historic."""
         self._record_write(key, self._value_store[key])
@@ -273,7 +256,7 @@ class HistoryDict(MutableMapping, Historic):  # pylint: disable=too-many-ancesto
         """
         Shallow-copy the value store, deep-copy history.
 
-        Don't record reads/writes here.
+        Don't record writes here.
         """
         history_dict = HistoryDict()
         history_dict._global_time = self._global_time  # pylint: disable=protected-access
@@ -283,20 +266,22 @@ class HistoryDict(MutableMapping, Historic):  # pylint: disable=too-many-ancesto
         return history_dict
 
     def __getitem__(self, key):
-        self._record_read(key)
-        self.notify_subscriber_read()
-
         # We don't return a deep copy because we rely on objects to alert us
         # when modified.
         return self._value_store[key]
 
     def __setitem__(self, key, value):
+        # Implicitly convert dictionaries to HistoricDicts to avoid users having to manually wrap dictionaries.
+        # This should only used when assigning a dictionary directly to a key in HistoryDict and not a standalone
+        # variable, as its history will not be recorded.
+        if isinstance(value, dict):
+            value = make_historic(value)
+
         if not isinstance(value, ALLOWED_TYPES):
             raise ValueError(f"HistoryDict cannot store type {type(value)}."
                              " Please use a different type or create a Historic wrapper.")
-
-        self._value_store[key] = value
         self._record_write(key, value)
+        self._value_store[key] = value
         if isinstance(value, HistoryDict):
             value.subscribe(self, key)
 
@@ -326,16 +311,13 @@ class HistoryDict(MutableMapping, Historic):  # pylint: disable=too-many-ancesto
                 pairs.append(f"'{key}': {str(value)}")
         return "{" + ", ".join(pairs) + "}"
 
-    def _record_read(self, key):
-        cur_access = Access(type=AccessType.READ, location=_get_location(), value_written=None,
-                            time=self._global_time)
-        self._history_store[key].append(cur_access)
-        self._global_time += 1
-
     def _record_write(self, key, value):
-        history_value = storable_dict_from_historic(value)
-        cur_access = Access(type=AccessType.WRITE, location=_get_location(),
-                            value_written=copy.deepcopy(history_value), time=self._global_time)
+        written = None
+        if type(value) in ALLOWED_TYPES and value is not Historic:
+            written = value
+
+        cur_access = Access(type=AccessType.WRITE, location=_get_location(), value_written=written,
+                            time=self._global_time)
         self._history_store[key].append(cur_access)
         self._global_time += 1
 
@@ -364,7 +346,7 @@ TOMBSTONE = object()
 class AccessType(Enum):
     """Class representing the operation performed in an accesss."""
 
-    READ = 0
+    READ = 0  # Reads are not recorded here.
     WRITE = 1
     DELETE = 2
 

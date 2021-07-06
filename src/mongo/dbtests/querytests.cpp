@@ -271,12 +271,6 @@ protected:
     void insert(const char* ns, BSONObj o) {
         _client.insert(ns, o);
     }
-    void update(const char* ns, BSONObj q, BSONObj o, bool upsert = 0) {
-        _client.update(ns, Query(q), o, upsert);
-    }
-    bool error() {
-        return !_client.getLastError().empty();
-    }
 
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
@@ -830,9 +824,9 @@ public:
     void run() {
         const char* ns = "unittests.querytests.ArrayId";
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("_id" << 1)));
-        ASSERT(!error());
-        _client.insert(ns, fromjson("{'_id':[1,2]}"));
-        ASSERT(error());
+
+        auto response = _client.insertAcknowledged(ns, {fromjson("{'_id':[1,2]}")});
+        ASSERT_NOT_OK(getStatusFromWriteCommandReply(response));
     }
 };
 
@@ -842,12 +836,12 @@ public:
         _client.dropCollection("unittests.querytests._UnderscoreNs");
     }
     void run() {
-        ASSERT(!error());
         const char* ns = "unittests.querytests._UnderscoreNs";
         ASSERT(_client.findOne(ns, "{}").isEmpty());
-        _client.insert(ns, BSON("a" << 1));
+        auto response = _client.insertAcknowledged(ns, {BSON("a" << 1)});
+        ASSERT_OK(getStatusFromWriteCommandReply(response));
+        ASSERT_EQ(1, response["n"].Int());
         ASSERT_EQUALS(1, _client.findOne(ns, "{}").getIntField("a"));
-        ASSERT(!error());
     }
 };
 
@@ -931,6 +925,12 @@ public:
         index();
     }
     void run() {
+        // TODO (SERVER-57194): enable lock-free reads.
+        bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+        storageGlobalParams.disableLockFreeReads = true;
+        ON_BLOCK_EXIT(
+            [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
         _client.dropDatabase("unittests");
         noIndex();
         checkIndex();
@@ -1807,6 +1807,12 @@ public:
     GetIndexSpecsByUUID() : CollectionBase("GetIndexSpecsByUUID") {}
 
     void run() {
+        // TODO (SERVER-57194): enable lock-free reads.
+        bool disableLockFreeReadsOriginalValue = storageGlobalParams.disableLockFreeReads;
+        storageGlobalParams.disableLockFreeReads = true;
+        ON_BLOCK_EXIT(
+            [&] { storageGlobalParams.disableLockFreeReads = disableLockFreeReadsOriginalValue; });
+
         CollectionOptions coll_opts;
         coll_opts.uuid = UUID::gen();
         {
@@ -1920,14 +1926,12 @@ public:
                                        << "capped" << true << "size" << 8192),
                                   info));
         _client.insert(ns(), BSON("ts" << Timestamp(1000, 0)));
-        Message message;
-        assembleQueryRequest(ns(),
-                             BSON("ts" << GTE << Timestamp(1000, 0)),
-                             0,
-                             0,
-                             nullptr,
-                             QueryOption_CursorTailable | QueryOption_Exhaust,
-                             message);
+        Message message = makeQueryMessage(ns(),
+                                           BSON("ts" << GTE << Timestamp(1000, 0)),
+                                           0,
+                                           0,
+                                           nullptr,
+                                           QueryOption_CursorTailable | QueryOption_Exhaust);
         DbMessage dbMessage(message);
         QueryMessage queryMessage(dbMessage);
         Message result;

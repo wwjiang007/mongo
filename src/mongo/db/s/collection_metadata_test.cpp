@@ -117,7 +117,7 @@ protected:
         TypeCollectionReshardingFields reshardingFields{reshardingUuid};
         reshardingFields.setState(state);
 
-        if (state == CoordinatorStateEnum::kDecisionPersisted) {
+        if (state == CoordinatorStateEnum::kCommitting) {
             TypeCollectionRecipientFields recipientFields{
                 {kThisShard, kOtherShard}, existingUuid, kNss, 5000};
             reshardingFields.setRecipientFields(std::move(recipientFields));
@@ -129,10 +129,8 @@ protected:
             reshardingFields.setDonorFields(std::move(donorFields));
         }
 
-        auto metadataUuid = (state >= CoordinatorStateEnum::kDecisionPersisted &&
-                             state != CoordinatorStateEnum::kError)
-            ? reshardingUuid
-            : existingUuid;
+        auto metadataUuid =
+            (state >= CoordinatorStateEnum::kCommitting) ? reshardingUuid : existingUuid;
 
         return makeCollectionMetadataImpl(
             KeyPattern(BSON("a" << 1)), {}, false, metadataUuid, reshardingFields);
@@ -204,78 +202,6 @@ TEST_F(NoChunkFixture, OrphanedDataRangeEnd) {
 
     ConstructedRangeMap pending;
     ASSERT(!metadata.getNextOrphanRange(pending, metadata.getMaxKey()));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata = makeCollectionMetadata(
-        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
-
-    // Writes should be disallowed if the collection metadata's UUID matches the original
-    // collection's UUID.
-    ASSERT(metadata.disallowWritesForResharding(originalUUID));
-}
-
-TEST_F(NoChunkFixture, AllowWritesInDecisionPersistedWithReshardingUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata = makeCollectionMetadata(
-        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
-
-    // Writes should NOT be disallowed when the UUID matches the temp collection's
-    // UUID.
-    ASSERT(!metadata.disallowWritesForResharding(reshardingUUID));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInDecisionPersistedThrows) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-    UUID rogueUUID = UUID::gen();
-
-    auto metadata = makeCollectionMetadata(
-        originalUUID, reshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
-
-    // If the collection's UUID matches neither the original UUID nor the resharding UUID,
-    // expect an exception.
-    ASSERT_THROWS_CODE(metadata.disallowWritesForResharding(rogueUUID),
-                       AssertionException,
-                       ErrorCodes::InvalidUUID);
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInApplyingWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kApplying);
-
-    // Writes should NOT be disallowed if the coordinator state is applying.
-    ASSERT(!metadata.disallowWritesForResharding(originalUUID));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInBlockingWritesWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kBlockingWrites);
-
-    // Writes should be disallowed if the coordinator state is blocking-writes.
-    ASSERT(metadata.disallowWritesForResharding(originalUUID));
-}
-
-TEST_F(NoChunkFixture, DisallowWritesInErrorWithOrigUUID) {
-    UUID originalUUID = UUID::gen();
-    UUID reshardingUUID = UUID::gen();
-
-    auto metadata =
-        makeCollectionMetadata(originalUUID, reshardingUUID, CoordinatorStateEnum::kError);
-
-    // Writes should NOT be disallowed if the coordinator state is error.
-    ASSERT(!metadata.disallowWritesForResharding(originalUUID));
 }
 
 /**

@@ -167,6 +167,7 @@ bool shouldBuildIndexesOnEmptyCollectionSinglePhased(OperationContext* opCtx,
  */
 void removeIndexBuildEntryAfterCommitOrAbort(OperationContext* opCtx,
                                              const NamespaceStringOrUUID& dbAndUUID,
+                                             const CollectionPtr& indexBuildEntryCollection,
                                              const ReplIndexBuildState& replState) {
     if (IndexBuildProtocol::kSinglePhase == replState.protocol) {
         return;
@@ -177,7 +178,8 @@ void removeIndexBuildEntryAfterCommitOrAbort(OperationContext* opCtx,
         return;
     }
 
-    auto status = indexbuildentryhelpers::removeIndexBuildEntry(opCtx, replState.buildUUID);
+    auto status = indexbuildentryhelpers::removeIndexBuildEntry(
+        opCtx, indexBuildEntryCollection, replState.buildUUID);
 
     // If we fail to remove the document from config.system.indexBuilds, it is because the document
     // or collection is missing. In any case, we do not need to fail the commit or abort operation.
@@ -431,9 +433,8 @@ bool isIndexBuildResumable(OperationContext* opCtx,
     }
 
     // Ensure that this node is a voting member in the replica set config.
-    auto rsConfig = replCoord->getConfig();
     auto hap = replCoord->getMyHostAndPort();
-    if (auto memberConfig = rsConfig.findMemberByHostAndPort(hap)) {
+    if (auto memberConfig = replCoord->findConfigMemberByHostAndPort(hap)) {
         if (!memberConfig->isVoter()) {
             return false;
         }
@@ -546,7 +547,8 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
             auto descriptor =
                 indexCatalog->findIndexByName(opCtx, indexNames[i], includeUnfinished);
             if (descriptor) {
-                Status s = indexCatalog->dropIndex(opCtx, descriptor);
+                Status s =
+                    indexCatalog->dropIndex(opCtx, collection.getWritableCollection(), descriptor);
                 if (!s.isOK()) {
                     return s;
                 }
@@ -556,8 +558,7 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
             // If the index is not present in the catalog, then we are trying to drop an already
             // aborted index. This may happen when rollback-via-refetch restarts an index build
             // after an abort has been rolled back.
-            if (!DurableCatalog::get(opCtx)->isIndexPresent(
-                    opCtx, collection->getCatalogId(), indexNames[i])) {
+            if (!collection->isIndexPresent(indexNames[i])) {
                 LOGV2(20652,
                       "An index was not found in the catalog while trying to drop the index during "
                       "recovery",
@@ -566,8 +567,7 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
                 continue;
             }
 
-            const auto durableBuildUUID = DurableCatalog::get(opCtx)->getIndexBuildUUID(
-                opCtx, collection->getCatalogId(), indexNames[i]);
+            const auto durableBuildUUID = collection->getIndexBuildUUID(indexNames[i]);
 
             // A build UUID is present if and only if we are rebuilding a two-phase build.
             invariant((protocol == IndexBuildProtocol::kTwoPhase) ==
@@ -584,7 +584,8 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
             includeUnfinished = true;
             descriptor = indexCatalog->findIndexByName(opCtx, indexNames[i], includeUnfinished);
             if (descriptor) {
-                Status s = indexCatalog->dropUnfinishedIndex(opCtx, descriptor);
+                Status s = indexCatalog->dropUnfinishedIndex(
+                    opCtx, collection.getWritableCollection(), descriptor);
                 if (!s.isOK()) {
                     return s;
                 }
@@ -592,12 +593,8 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
                 // There are no concurrent users of the index during startup recovery, so it is OK
                 // to pass in a nullptr for the index 'ident', promising that the index is not in
                 // use.
-                catalog::removeIndex(opCtx,
-                                     indexNames[i],
-                                     collection->getCatalogId(),
-                                     collection->uuid(),
-                                     collection->ns(),
-                                     nullptr /* ident */);
+                catalog::removeIndex(
+                    opCtx, indexNames[i], collection.getWritableCollection(), nullptr /* ident */);
             }
         }
 
@@ -664,10 +661,9 @@ Status IndexBuildsCoordinator::_setUpResumeIndexBuild(OperationContext* opCtx,
         // Check that the information in the durable catalog matches the resume info.
         uassert(4841702,
                 "Index not found in durable catalog while attempting to resume index build",
-                durableCatalog->isIndexPresent(opCtx, collection->getCatalogId(), indexName));
+                collection->isIndexPresent(indexName));
 
-        const auto durableBuildUUID =
-            durableCatalog->getIndexBuildUUID(opCtx, collection->getCatalogId(), indexName);
+        const auto durableBuildUUID = collection->getIndexBuildUUID(indexName);
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << "Cannot resume index build with a buildUUID: " << buildUUID
                               << " that did not match the buildUUID in the durable catalog: "
@@ -682,8 +678,7 @@ Status IndexBuildsCoordinator::_setUpResumeIndexBuild(OperationContext* opCtx,
                           << indexName,
             indexIdent.size() > 0);
 
-        uassertStatusOK(durableCatalog->checkMetaDataForIndex(
-            opCtx, collection->getCatalogId(), indexName, spec));
+        uassertStatusOK(collection->checkMetaDataForIndex(indexName, spec));
     }
 
     if (!collection->isInitialized()) {
@@ -859,7 +854,8 @@ void IndexBuildsCoordinator::applyStartIndexBuild(OperationContext* opCtx,
                         !name.empty());
 
                 if (auto desc = indexCatalog->findIndexByName(opCtx, name, includeUnfinished)) {
-                    uassertStatusOK(indexCatalog->dropIndex(opCtx, desc));
+                    uassertStatusOK(
+                        indexCatalog->dropIndex(opCtx, coll.getWritableCollection(), desc));
                 }
             }
 
@@ -1090,6 +1086,8 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
             unlockRSTL(opCtx);
         }
         Lock::CollectionLock collLock(opCtx, dbAndUUID, MODE_X);
+        AutoGetCollection indexBuildEntryColl(
+            opCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
 
         // If we are using two-phase index builds and are no longer primary after receiving an
         // abort, we cannot replicate an abortIndexBuild oplog entry. Continue holding the RSTL to
@@ -1148,13 +1146,11 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
 
         // At this point we must continue aborting the index build.
         try {
-            // We are holding the RSTL and an exclusive collection lock, so we will block stepdown
-            // and be targeted for being killed. In addition to writing to the catalog, we need to
-            // acquire an IX lock to write to the config.system.indexBuilds collection. Since
-            // we must perform these final writes, but we expect them not to block, we can safely,
-            // temporarily disable interrupts.
-            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-            _completeAbort(opCtx, replState, signalAction, {ErrorCodes::IndexBuildAborted, reason});
+            _completeAbort(opCtx,
+                           replState,
+                           *indexBuildEntryColl,
+                           signalAction,
+                           {ErrorCodes::IndexBuildAborted, reason});
         } catch (const DBException& e) {
             LOGV2_FATAL(
                 4656011,
@@ -1195,6 +1191,7 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
 
 void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
                                             std::shared_ptr<ReplIndexBuildState> replState,
+                                            const CollectionPtr& indexBuildEntryCollection,
                                             IndexBuildAction signalAction,
                                             Status reason) {
     CollectionWriter coll(opCtx, replState->collectionUUID);
@@ -1216,7 +1213,8 @@ void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
                                     << (IndexBuildProtocol::kSinglePhase == replState->protocol));
             auto onCleanUpFn = [&] { onAbortIndexBuild(opCtx, coll->ns(), *replState, reason); };
             _indexBuildsManager.abortIndexBuild(opCtx, coll, replState->buildUUID, onCleanUpFn);
-            removeIndexBuildEntryAfterCommitOrAbort(opCtx, dbAndUUID, *replState);
+            removeIndexBuildEntryAfterCommitOrAbort(
+                opCtx, dbAndUUID, indexBuildEntryCollection, *replState);
             break;
         }
         // Deletes the index from the durable catalog.
@@ -1263,8 +1261,10 @@ void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
 
 void IndexBuildsCoordinator::_completeSelfAbort(OperationContext* opCtx,
                                                 std::shared_ptr<ReplIndexBuildState> replState,
+                                                const CollectionPtr& indexBuildEntryCollection,
                                                 Status reason) {
-    _completeAbort(opCtx, replState, IndexBuildAction::kPrimaryAbort, reason);
+    _completeAbort(
+        opCtx, replState, indexBuildEntryCollection, IndexBuildAction::kPrimaryAbort, reason);
     replState->abortSelf(opCtx);
 
     activeIndexBuilds.unregisterIndexBuild(&_indexBuildsManager, replState);
@@ -1400,7 +1400,7 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
         try {
             // This spawns a new thread and returns immediately. These index builds will resume and
             // wait for a commit or abort to be replicated.
-            MONGO_COMPILER_VARIABLE_UNUSED auto fut = uassertStatusOK(resumeIndexBuild(
+            [[maybe_unused]] auto fut = uassertStatusOK(resumeIndexBuild(
                 opCtx, nss->db().toString(), collUUID, indexSpecs, buildUUID, resumeInfo));
             successfullyResumed.insert(buildUUID);
         } catch (const DBException& e) {
@@ -1462,14 +1462,13 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
         indexBuildOptions.applicationMode = ApplicationMode::kStartupRepair;
         // This spawns a new thread and returns immediately. These index builds will start and wait
         // for a commit or abort to be replicated.
-        MONGO_COMPILER_VARIABLE_UNUSED auto fut =
-            uassertStatusOK(startIndexBuild(opCtx,
-                                            nss->db().toString(),
-                                            build.collUUID,
-                                            build.indexSpecs,
-                                            buildUUID,
-                                            IndexBuildProtocol::kTwoPhase,
-                                            indexBuildOptions));
+        [[maybe_unused]] auto fut = uassertStatusOK(startIndexBuild(opCtx,
+                                                                    nss->db().toString(),
+                                                                    build.collUUID,
+                                                                    build.indexSpecs,
+                                                                    buildUUID,
+                                                                    IndexBuildProtocol::kTwoPhase,
+                                                                    indexBuildOptions));
     }
 }
 
@@ -1630,7 +1629,8 @@ void IndexBuildsCoordinator::createIndexesOnEmptyCollection(OperationContext* op
         // Each index will be added to the mdb catalog using the preceding createIndexes
         // timestamp.
         opObserver->onCreateIndex(opCtx, nss, collectionUUID, spec, fromMigrate);
-        uassertStatusOK(indexCatalog->createIndexOnEmptyCollection(opCtx, spec));
+        uassertStatusOK(indexCatalog->createIndexOnEmptyCollection(
+            opCtx, collection.getWritableCollection(), spec));
     }
 }
 
@@ -2038,7 +2038,9 @@ void IndexBuildsCoordinator::_cleanUpSinglePhaseAfterFailure(
 
             const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
             Lock::CollectionLock collLock(abortCtx, dbAndUUID, MODE_X);
-            _completeSelfAbort(abortCtx, replState, status);
+            AutoGetCollection indexBuildEntryColl(
+                abortCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
+            _completeSelfAbort(abortCtx, replState, *indexBuildEntryColl, status);
         });
 }
 
@@ -2077,7 +2079,9 @@ void IndexBuildsCoordinator::_cleanUpTwoPhaseAfterFailure(
             }
 
             Lock::CollectionLock collLock(abortCtx, dbAndUUID, MODE_X);
-            _completeSelfAbort(abortCtx, replState, status);
+            AutoGetCollection indexBuildEntryColl(
+                abortCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
+            _completeSelfAbort(abortCtx, replState, *indexBuildEntryColl, status);
         });
 }
 
@@ -2091,6 +2095,11 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     try {
 
         hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
+
+        // Index builds can safely ignore prepare conflicts and perform writes. On secondaries,
+        // prepare operations wait for index builds to complete.
+        opCtx->recoveryUnit()->setPrepareConflictBehavior(
+            PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
         if (resumeInfo) {
             _resumeIndexBuildFromPhase(opCtx, replState, indexBuildOptions, resumeInfo.get());
@@ -2155,6 +2164,12 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // Index builds only check index constraints when committing. If an error occurs at that point,
     // then the build is cleaned up while still holding the appropriate locks. The only errors that
     // we cannot anticipate are user interrupts and shutdown errors.
+    if (status == ErrorCodes::OutOfDiskSpace) {
+        LOGV2_ERROR(5642401,
+                    "Index build unable to proceed due to insufficient disk space",
+                    "error"_attr = status);
+        fassertFailedNoTrace(5642402);
+    }
     invariant(status.isA<ErrorCategory::Interruption>() ||
                   status.isA<ErrorCategory::ShutdownError>(),
               str::stream() << "Unexpected error code during index build cleanup: " << status);
@@ -2371,11 +2386,6 @@ CollectionPtr IndexBuildsCoordinator::_setUpForScanCollectionAndInsertSortedKeys
     // Set up the thread's currentOp information to display createIndexes cmd information.
     updateCurOpOpDescription(opCtx, collection->ns(), replState->indexSpecs);
 
-    // Index builds can safely ignore prepare conflicts and perform writes. On secondaries,
-    // prepare operations wait for index builds to complete.
-    opCtx->recoveryUnit()->setPrepareConflictBehavior(
-        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
-
     return collection;
 }
 
@@ -2456,6 +2466,8 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     // Need to return the collection lock back to exclusive mode to complete the index build.
     const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
     Lock::CollectionLock collLock(opCtx, dbAndUUID, MODE_X);
+    AutoGetCollection indexBuildEntryColl(
+        opCtx, NamespaceString::kIndexBuildEntryNamespace, MODE_IX);
 
     // If we can't acquire the RSTL within a given time period, there is an active state transition
     // and we should release our locks and try again. We would otherwise introduce a deadlock with
@@ -2608,11 +2620,11 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
 
         // This index build failed due to an indexing error in normal circumstances. Abort while
         // still holding the RSTL and collection locks.
-        _completeSelfAbort(opCtx, replState, status);
+        _completeSelfAbort(opCtx, replState, *indexBuildEntryColl, status);
         throw;
     }
 
-    removeIndexBuildEntryAfterCommitOrAbort(opCtx, dbAndUUID, *replState);
+    removeIndexBuildEntryAfterCommitOrAbort(opCtx, dbAndUUID, *indexBuildEntryColl, *replState);
     replState->stats.numIndexesAfter = getNumIndexesTotal(opCtx, collection.get());
     LOGV2(20663,
           "Index build: completed successfully",
@@ -2757,8 +2769,8 @@ std::vector<BSONObj> IndexBuildsCoordinator::prepareSpecListForCreate(
 
     // Remove any index specifications which already exist in the catalog.
     auto indexCatalog = collection->getIndexCatalog();
-    auto resultSpecs =
-        indexCatalog->removeExistingIndexes(opCtx, normalSpecs, true /*removeIndexBuildsToo*/);
+    auto resultSpecs = indexCatalog->removeExistingIndexes(
+        opCtx, collection, normalSpecs, true /*removeIndexBuildsToo*/);
 
     // Verify that each spec is compatible with the collection's sharding state.
     for (const BSONObj& spec : resultSpecs) {

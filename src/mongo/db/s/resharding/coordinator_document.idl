@@ -64,6 +64,16 @@ structs:
             # overwrite with a single $set.
             mutableState: RecipientShardContext
 
+    ReshardingCoordinatorMetrics:
+        description: "Contains metrics about the resharding operation on the coordinator."
+        strict: false
+        fields:
+            operationRuntime:
+                    type: ReshardingMetricsTimeInterval
+                    description: >-
+                        The time interval of the entire resharding operation on the coordinator.
+                    optional: true
+
     ReshardingCoordinatorDocument:
         description: "Represents a resharding operation on the coordinator."
         inline_chained_structs: true
@@ -89,7 +99,7 @@ structs:
                 type: array<RecipientShardEntry>
                 description: "The list of all recipient shards for this resharding operation."
             zones:
-                type: array<object_owned>
+                type: array<ReshardingZoneType>
                 description: "The zones associated with the new shard key."
                 optional: true
             numInitialChunks:
@@ -97,7 +107,7 @@ structs:
                 description: "The number of chunks the new collection should have after resharding."
                 optional: true
             presetReshardedChunks:
-                type: array<object_owned>
+                type: array<ReshardedChunk>
                 description: >-
                     Mapping of chunk ranges to be used as the initial split output. This is only
                     for testing purposes.
@@ -109,3 +119,6 @@ structs:
                     index on in order to prevent multiple resharding operations from being active at
                     the same time.
                 default: true
+            metrics:
+                type: ReshardingCoordinatorMetrics
+                description: "Metrics related to the coordinator."

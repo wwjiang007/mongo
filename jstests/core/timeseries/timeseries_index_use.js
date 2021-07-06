@@ -2,12 +2,11 @@
  * Tests index usage on meta and time fields for timeseries collections.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -64,15 +63,7 @@ TimeseriesTest.run((insert) => {
         const explain = query.explain();
         const ixscan = getAggPlanStage(explain, "IXSCAN");
         assert.neq(null, ixscan, tojson(explain));
-        // TODO (SERVER-56238): Remove conditional once queries always use the 'testIndexName'
-        // index.
-        assert.eq(TimeseriesTest.supportsClusteredIndexes(db.getMongo()) ||
-                          !filter.hasOwnProperty(timeFieldName) ||
-                          !indexSpec.hasOwnProperty(timeFieldName)
-                      ? "testIndexName"
-                      : "_id_",
-                  ixscan.indexName,
-                  tojson(ixscan));
+        assert.eq("testIndexName", ixscan.indexName, tojson(ixscan));
 
         assert.commandWorked(coll.dropIndex("testIndexName"));
     };

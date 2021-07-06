@@ -2,13 +2,11 @@
  * Verifies that the _id index cannot be created on a time-series collection.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
- *     requires_wiredtiger,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -18,12 +16,6 @@ load("jstests/core/timeseries/libs/timeseries.js");
 
 if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     jsTestLog("Skipping test because the time-series collection feature flag is disabled");
-    return;
-}
-
-// Although this test is tagged with 'requires_wiredtiger', this is not sufficient for ensuring that
-// the parallel suite runs this test only on WT configurations.
-if (!TimeseriesTest.supportsClusteredIndexes(db.getMongo())) {
     return;
 }
 

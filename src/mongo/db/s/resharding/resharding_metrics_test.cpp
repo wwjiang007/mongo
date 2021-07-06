@@ -46,7 +46,7 @@ namespace {
 
 using namespace fmt::literals;
 
-constexpr auto kOpTimeRemaining = "remainingOperationTimeEstimated"_sd;
+constexpr auto kOpTimeRemaining = "remainingOperationTimeEstimatedSecs"_sd;
 
 class ReshardingMetricsTest : public ServiceContextTest {
 public:
@@ -67,6 +67,23 @@ public:
         return ReshardingMetrics::get(getGlobalServiceContext());
     }
 
+    void startOperation(ReshardingMetrics::Role role) {
+        getMetrics()->onStart(role, getGlobalServiceContext()->getFastClockSource()->now());
+    }
+
+    void stepUpOperation(ReshardingMetrics::Role role) {
+        getMetrics()->onStepUp(role);
+    }
+
+    void stepDownOperation(ReshardingMetrics::Role role) {
+        getMetrics()->onStepDown(role);
+    }
+
+    void completeOperation(ReshardingMetrics::Role role, ReshardingOperationStatusEnum opStatus) {
+        getMetrics()->onCompletion(
+            role, opStatus, getGlobalServiceContext()->getFastClockSource()->now());
+    }
+
     // Timer step in milliseconds
     static constexpr auto kTimerStep = 100;
 
@@ -79,14 +96,11 @@ public:
         if (reportType == OpReportType::CumulativeReport) {
             getMetrics()->serializeCumulativeOpMetrics(&bob);
         } else if (reportType == OpReportType::CurrentOpReportDonorRole) {
-            getMetrics()->serializeCurrentOpMetrics(
-                &bob, ReshardingMetrics::ReporterOptions::Role::kDonor);
+            getMetrics()->serializeCurrentOpMetrics(&bob, ReshardingMetrics::Role::kDonor);
         } else if (reportType == OpReportType::CurrentOpReportRecipientRole) {
-            getMetrics()->serializeCurrentOpMetrics(
-                &bob, ReshardingMetrics::ReporterOptions::Role::kRecipient);
+            getMetrics()->serializeCurrentOpMetrics(&bob, ReshardingMetrics::Role::kRecipient);
         } else {
-            getMetrics()->serializeCurrentOpMetrics(
-                &bob, ReshardingMetrics::ReporterOptions::Role::kCoordinator);
+            getMetrics()->serializeCurrentOpMetrics(&bob, ReshardingMetrics::Role::kCoordinator);
         }
         return bob.obj();
     }
@@ -116,16 +130,77 @@ private:
     ClockSourceMock* _clockSource;
 };
 
+// TODO Re-enable once underlying invariants are re-enabled
+/*
 DEATH_TEST_F(ReshardingMetricsTest, RunOnCompletionBeforeOnStart, "No operation is in progress") {
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+    completeOperation(ReshardingMetrics::Role::kRecipient,
+        ReshardingOperationStatusEnum::kSuccess);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest,
+             RunOnStepUpAfterOnStartInvariants,
+             "Another operation is in progress") {
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    stepUpOperation(ReshardingMetrics::Role::kRecipient);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest,
+             RunOnCompletionAfterOnStepDownInvariants,
+             "No operation is in progress") {
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    stepDownOperation(ReshardingMetrics::Role::kRecipient);
+    completeOperation(ReshardingMetrics::Role::kRecipient,
+        ReshardingOperationStatusEnum::kSuccess);
+}
+*/
+
+TEST_F(ReshardingMetricsTest, RunOnStepDownAfterOnCompletionIsSafe) {
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kSuccess);
+    stepDownOperation(ReshardingMetrics::Role::kRecipient);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest, CoordinatorThenDonor, "Another operation is in progress") {
+    startOperation(ReshardingMetrics::Role::kCoordinator);
+    startOperation(ReshardingMetrics::Role::kDonor);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest, DonorThenCoordinator, "Another operation is in progress") {
+    startOperation(ReshardingMetrics::Role::kDonor);
+    startOperation(ReshardingMetrics::Role::kCoordinator);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest, CoordinatorThenRecipient, "Another operation is in progress") {
+    startOperation(ReshardingMetrics::Role::kCoordinator);
+    startOperation(ReshardingMetrics::Role::kRecipient);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest, RecipientThenCoordinator, "Another operation is in progress") {
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    startOperation(ReshardingMetrics::Role::kCoordinator);
+}
+
+TEST_F(ReshardingMetricsTest, DonorAndRecipientCombinationIsSafe) {
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    startOperation(ReshardingMetrics::Role::kDonor);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kSuccess);
+    completeOperation(ReshardingMetrics::Role::kDonor, ReshardingOperationStatusEnum::kSuccess);
+}
+
+TEST_F(ReshardingMetricsTest, DonorAndRecipientStepdownIsSafe) {
+    startOperation(ReshardingMetrics::Role::kDonor);
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    stepDownOperation(ReshardingMetrics::Role::kRecipient);
+    stepDownOperation(ReshardingMetrics::Role::kDonor);
 }
 
 TEST_F(ReshardingMetricsTest, OperationStatus) {
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kCoordinator);
     const auto report = getReport(OpReportType::CurrentOpReportCoordinatorRole);
     ASSERT_EQ(report.getStringField("opStatus"),
               ReshardingOperationStatus_serializer(ReshardingOperationStatusEnum::kRunning));
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+    completeOperation(ReshardingMetrics::Role::kCoordinator,
+                      ReshardingOperationStatusEnum::kSuccess);
 }
 
 TEST_F(ReshardingMetricsTest, TestOperationStatus) {
@@ -134,18 +209,21 @@ TEST_F(ReshardingMetricsTest, TestOperationStatus) {
     const auto kNumCanceledOps = 7;
 
     for (auto i = 0; i < kNumSuccessfulOps; i++) {
-        getMetrics()->onStart();
-        getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+        startOperation(ReshardingMetrics::Role::kRecipient);
+        completeOperation(ReshardingMetrics::Role::kRecipient,
+                          ReshardingOperationStatusEnum::kSuccess);
     }
 
     for (auto i = 0; i < kNumFailedOps; i++) {
-        getMetrics()->onStart();
-        getMetrics()->onCompletion(ReshardingOperationStatusEnum::kFailure);
+        startOperation(ReshardingMetrics::Role::kRecipient);
+        completeOperation(ReshardingMetrics::Role::kRecipient,
+                          ReshardingOperationStatusEnum::kFailure);
     }
 
     for (auto i = 0; i < kNumCanceledOps; i++) {
-        getMetrics()->onStart();
-        getMetrics()->onCompletion(ReshardingOperationStatusEnum::kCanceled);
+        startOperation(ReshardingMetrics::Role::kRecipient);
+        completeOperation(ReshardingMetrics::Role::kRecipient,
+                          ReshardingOperationStatusEnum::kCanceled);
     }
 
     checkMetrics("countReshardingSuccessful", kNumSuccessfulOps, OpReportType::CumulativeReport);
@@ -154,19 +232,21 @@ TEST_F(ReshardingMetricsTest, TestOperationStatus) {
 
     const auto total = kNumSuccessfulOps + kNumFailedOps + kNumCanceledOps;
     checkMetrics("countReshardingOperations", total, OpReportType::CumulativeReport);
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     checkMetrics("countReshardingOperations", total + 1, OpReportType::CumulativeReport);
 }
 
 TEST_F(ReshardingMetricsTest, TestElapsedTime) {
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kDonor);
     const auto elapsedTime = 1;
     advanceTime(Seconds(elapsedTime));
-    checkMetrics("totalOperationTimeElapsed", elapsedTime, OpReportType::CurrentOpReportDonorRole);
+    checkMetrics(
+        "totalOperationTimeElapsedSecs", elapsedTime, OpReportType::CurrentOpReportDonorRole);
 }
 
 TEST_F(ReshardingMetricsTest, TestDonorAndRecipientMetrics) {
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    startOperation(ReshardingMetrics::Role::kDonor);
     const auto elapsedTime = 1;
 
     advanceTime(Seconds(elapsedTime));
@@ -174,6 +254,7 @@ TEST_F(ReshardingMetricsTest, TestDonorAndRecipientMetrics) {
     // Update metrics for donor
     const auto kWritesDuringCriticalSection = 7;
     getMetrics()->setDonorState(DonorStateEnum::kPreparingToBlockWrites);
+    getMetrics()->enterCriticalSection(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onWriteDuringCriticalSection(kWritesDuringCriticalSection);
     advanceTime(Seconds(elapsedTime));
 
@@ -184,26 +265,23 @@ TEST_F(ReshardingMetricsTest, TestDonorAndRecipientMetrics) {
     getMetrics()->setRecipientState(RecipientStateEnum::kCreatingCollection);
     getMetrics()->setDocumentsToCopy(kDocumentsToCopy, kBytesToCopy);
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onDocumentsCopied(kDocumentsToCopy * kCopyProgress / 100,
                                     kBytesToCopy * kCopyProgress / 100);
     advanceTime(Seconds(elapsedTime));
 
     const auto currentDonorOpReport = getReport(OpReportType::CurrentOpReportDonorRole);
     const auto currentRecipientOpReport = getReport(OpReportType::CurrentOpReportRecipientRole);
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+    completeOperation(ReshardingMetrics::Role::kDonor, ReshardingOperationStatusEnum::kSuccess);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kSuccess);
 
-    checkMetrics(currentRecipientOpReport, "totalCopyTimeElapsed", elapsedTime);
+    checkMetrics(currentRecipientOpReport, "totalCopyTimeElapsedSecs", elapsedTime);
     checkMetrics(currentRecipientOpReport, "bytesCopied", kBytesToCopy * kCopyProgress / 100);
     checkMetrics(
         currentRecipientOpReport, "documentsCopied", kDocumentsToCopy * kCopyProgress / 100);
-    checkMetrics(currentDonorOpReport, "totalCriticalSectionTimeElapsed", elapsedTime * 2);
+    checkMetrics(currentDonorOpReport, "totalCriticalSectionTimeElapsedSecs", elapsedTime * 2);
     checkMetrics(
         currentDonorOpReport, "countWritesDuringCriticalSection", kWritesDuringCriticalSection);
-
-    // Expected remaining time = totalCopyTimeElapsed + 2 * estimated time to copy remaining
-    checkMetrics(currentDonorOpReport,
-                 "remainingOperationTimeEstimated",
-                 elapsedTime + 2 * (100 - kCopyProgress) / kCopyProgress * elapsedTime);
 
     const auto cumulativeReportAfterCompletion = getReport(OpReportType::CumulativeReport);
     checkMetrics(
@@ -217,13 +295,14 @@ TEST_F(ReshardingMetricsTest, TestDonorAndRecipientMetrics) {
 
 TEST_F(ReshardingMetricsTest, CumulativeOpMetricsAreRetainedAfterCompletion) {
     auto constexpr kTag = "documentsCopied";
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     const auto kDocumentsToCopy = 2;
     const auto kBytesToCopy = 200;
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
     advanceTime();
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kFailure);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kFailure);
     advanceTime();
 
     checkMetrics(kTag,
@@ -231,88 +310,136 @@ TEST_F(ReshardingMetricsTest, CumulativeOpMetricsAreRetainedAfterCompletion) {
                  "Cumulative metrics are not retained",
                  OpReportType::CumulativeReport);
 
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    checkMetrics(
+        kTag, kDocumentsToCopy, "Cumulative metrics are reset", OpReportType::CumulativeReport);
+}
+
+TEST_F(ReshardingMetricsTest, CumulativeOpMetricsAreRetainedAfterCancellation) {
+    auto constexpr kTag = "documentsCopied";
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    const auto kDocumentsToCopy = 2;
+    const auto kBytesToCopy = 200;
+    getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
+    getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
+    advanceTime();
+    completeOperation(ReshardingMetrics::Role::kRecipient,
+                      ReshardingOperationStatusEnum::kCanceled);
+    advanceTime();
+
+    checkMetrics(kTag,
+                 kDocumentsToCopy,
+                 "Cumulative metrics are not retained",
+                 OpReportType::CumulativeReport);
+
+    startOperation(ReshardingMetrics::Role::kRecipient);
     checkMetrics(
         kTag, kDocumentsToCopy, "Cumulative metrics are reset", OpReportType::CumulativeReport);
 }
 
 TEST_F(ReshardingMetricsTest, CurrentOpMetricsAreResetAfterCompletion) {
     auto constexpr kTag = "documentsCopied";
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     const auto kDocumentsToCopy = 2;
     const auto kBytesToCopy = 200;
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
     checkMetrics(kTag,
                  kDocumentsToCopy,
                  "Current metrics are not set",
                  OpReportType::CurrentOpReportRecipientRole);
     advanceTime();
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kSuccess);
     advanceTime();
 
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     checkMetrics(
         kTag, 0, "Current metrics are not reset", OpReportType::CurrentOpReportRecipientRole);
 }
 
 TEST_F(ReshardingMetricsTest, CurrentOpMetricsAreNotRetainedAfterCompletion) {
     auto constexpr kTag = "documentsCopied";
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     const auto kDocumentsToCopy = 2;
     const auto kBytesToCopy = 200;
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
     checkMetrics(kTag,
                  kDocumentsToCopy,
                  "Current metrics are not set",
                  OpReportType::CurrentOpReportRecipientRole);
     advanceTime();
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kFailure);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kFailure);
+    advanceTime();
+
+    ASSERT_FALSE(getReport(OpReportType::CurrentOpReportRecipientRole)[kTag].ok());
+}
+
+TEST_F(ReshardingMetricsTest, CurrentOpMetricsAreNotRetainedAfterStepDown) {
+    auto constexpr kTag = "documentsCopied";
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    const auto kDocumentsToCopy = 2;
+    const auto kBytesToCopy = 200;
+    getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
+    getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
+    checkMetrics(kTag,
+                 kDocumentsToCopy,
+                 "Current metrics are not set",
+                 OpReportType::CurrentOpReportRecipientRole);
+    advanceTime();
+    stepDownOperation(ReshardingMetrics::Role::kRecipient);
     advanceTime();
 
     ASSERT_FALSE(getReport(OpReportType::CurrentOpReportRecipientRole)[kTag].ok());
 }
 
 TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTime) {
-    auto constexpr kTag = "remainingOperationTimeEstimated";
+    auto constexpr kTag = "remainingOperationTimeEstimatedSecs";
     const auto elapsedTime = 1;
 
-    getMetrics()->onStart();
-    checkMetrics(kTag, -1, OpReportType::CurrentOpReportDonorRole);
+    startOperation(ReshardingMetrics::Role::kRecipient);
+    checkMetrics(kTag, -1, OpReportType::CurrentOpReportRecipientRole);
 
     const auto kDocumentsToCopy = 2;
     const auto kBytesToCopy = 200;
     getMetrics()->setRecipientState(RecipientStateEnum::kCreatingCollection);
     getMetrics()->setDocumentsToCopy(kDocumentsToCopy, kBytesToCopy);
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onDocumentsCopied(kDocumentsToCopy / 2, kBytesToCopy / 2);
     advanceTime(Seconds(elapsedTime));
     // Since 50% of the data is copied, the remaining copy time equals the elapsed copy time, which
     // is equal to `elapsedTime` seconds.
-    checkMetrics(kTag, elapsedTime + 2 * elapsedTime, OpReportType::CurrentOpReportDonorRole);
+    checkMetrics(kTag, elapsedTime + 2 * elapsedTime, OpReportType::CurrentOpReportRecipientRole);
 
     const auto kOplogEntriesFetched = 4;
     const auto kOplogEntriesApplied = 2;
     getMetrics()->setRecipientState(RecipientStateEnum::kApplying);
+    getMetrics()->endCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
+    getMetrics()->startApplyingOplogEntries(getGlobalServiceContext()->getFastClockSource()->now());
     getMetrics()->onOplogEntriesFetched(kOplogEntriesFetched);
     getMetrics()->onOplogEntriesApplied(kOplogEntriesApplied);
     advanceTime(Seconds(elapsedTime));
     // So far, the time to apply oplog entries equals `elapsedTime` seconds.
     checkMetrics(kTag,
                  elapsedTime * (kOplogEntriesFetched / kOplogEntriesApplied - 1),
-                 OpReportType::CurrentOpReportDonorRole);
+                 OpReportType::CurrentOpReportRecipientRole);
 }
 
 TEST_F(ReshardingMetricsTest, CurrentOpReportForDonor) {
     const auto kDonorState = DonorStateEnum::kPreparingToBlockWrites;
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kDonor);
     advanceTime(Seconds(2));
     getMetrics()->setDonorState(kDonorState);
+    getMetrics()->enterCriticalSection(getGlobalServiceContext()->getFastClockSource()->now());
     advanceTime(Seconds(3));
 
     const ReshardingMetrics::ReporterOptions options(
-        ReshardingMetrics::ReporterOptions::Role::kDonor,
+        ReshardingMetrics::Role::kDonor,
         UUID::parse("12345678-1234-1234-1234-123456789abc").getValue(),
         NamespaceString("db", "collection"),
         BSON("id" << 1),
@@ -327,10 +454,9 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForDonor) {
                              "key: {2},"
                              "unique: {3},"
                              "collation: {{ locale: \"simple\" }} }},"
-                             "totalOperationTimeElapsed: 5,"
-                             "remainingOperationTimeEstimated: -1,"
+                             "totalOperationTimeElapsedSecs: 5,"
                              "countWritesDuringCriticalSection: 0,"
-                             "totalCriticalSectionTimeElapsed : 3,"
+                             "totalCriticalSectionTimeElapsedSecs : 3,"
                              "donorState: \"{4}\","
                              "opStatus: \"running\" }}",
                              options.id.toString(),
@@ -355,13 +481,14 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForRecipient) {
     static_assert(kBytesToCopy >= kBytesCopied);
 
     constexpr auto kDelayBeforeCloning = Seconds(2);
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     advanceTime(kDelayBeforeCloning);
 
     constexpr auto kTimeSpentCloning = Seconds(3);
     getMetrics()->setRecipientState(RecipientStateEnum::kCreatingCollection);
     getMetrics()->setDocumentsToCopy(kDocumentsToCopy, kBytesToCopy);
     getMetrics()->setRecipientState(kRecipientState);
+    getMetrics()->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     advanceTime(kTimeSpentCloning);
     getMetrics()->onDocumentsCopied(kDocumentsCopied, kBytesCopied);
 
@@ -371,7 +498,7 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForRecipient) {
         durationCount<Seconds>(kTimeSpentCloning) + 2 * kTimeToCopyRemainingSeconds;
 
     const ReshardingMetrics::ReporterOptions options(
-        ReshardingMetrics::ReporterOptions::Role::kRecipient,
+        ReshardingMetrics::Role::kRecipient,
         UUID::parse("12345678-1234-1234-1234-123456789def").getValue(),
         NamespaceString("db", "collection"),
         BSON("id" << 1),
@@ -386,16 +513,16 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForRecipient) {
                              "key: {2},"
                              "unique: {3},"
                              "collation: {{ locale: \"simple\" }} }},"
-                             "totalOperationTimeElapsed: {4},"
-                             "remainingOperationTimeEstimated: {5},"
+                             "totalOperationTimeElapsedSecs: {4},"
+                             "remainingOperationTimeEstimatedSecs: {5},"
                              "approxDocumentsToCopy: {6},"
                              "documentsCopied: {7},"
                              "approxBytesToCopy: {8},"
                              "bytesCopied: {9},"
-                             "totalCopyTimeElapsed: {10},"
+                             "totalCopyTimeElapsedSecs: {10},"
                              "oplogEntriesFetched: 0,"
                              "oplogEntriesApplied: 0,"
-                             "totalApplyTimeElapsed: 0,"
+                             "totalApplyTimeElapsedSecs: 0,"
                              "recipientState: \"{11}\","
                              "opStatus: \"running\" }}",
                              options.id.toString(),
@@ -419,12 +546,12 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForCoordinator) {
     const auto kCoordinatorState = CoordinatorStateEnum::kInitializing;
     const auto kSomeDuration = Seconds(10);
 
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kCoordinator);
     getMetrics()->setCoordinatorState(kCoordinatorState);
     advanceTime(kSomeDuration);
 
     const ReshardingMetrics::ReporterOptions options(
-        ReshardingMetrics::ReporterOptions::Role::kCoordinator,
+        ReshardingMetrics::Role::kCoordinator,
         UUID::parse("12345678-1234-1234-1234-123456789cba").getValue(),
         NamespaceString("db", "collection"),
         BSON("id" << 1),
@@ -439,8 +566,7 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForCoordinator) {
                              "key: {2},"
                              "unique: {3},"
                              "collation: {{ locale: \"simple\" }} }},"
-                             "totalOperationTimeElapsed: {4},"
-                             "remainingOperationTimeEstimated: -1,"
+                             "totalOperationTimeElapsedSecs: {4},"
                              "coordinatorState: \"{5}\","
                              "opStatus: \"running\" }}",
                              options.id.toString(),
@@ -457,7 +583,8 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportForCoordinator) {
 TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTimeCloning) {
     // Copy N docs @ timePerDoc. Check the progression of the estimated time remaining.
     auto m = getMetrics();
-    m->onStart();
+    m->onStart(ReshardingMetrics::Role::kRecipient,
+               getGlobalServiceContext()->getFastClockSource()->now());
     auto timePerDocument = Seconds(2);
     int64_t bytesPerDocument = 1024;
     int64_t documentsToCopy = 409;
@@ -465,6 +592,7 @@ TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTimeCloning) {
     m->setRecipientState(RecipientStateEnum::kCreatingCollection);
     m->setDocumentsToCopy(documentsToCopy, bytesToCopy);
     m->setRecipientState(RecipientStateEnum::kCloning);
+    m->startCopyingDocuments(getGlobalServiceContext()->getFastClockSource()->now());
     auto remainingTime = 2 * timePerDocument * documentsToCopy;
     double maxAbsRelErr = 0;
     for (int64_t copied = 0; copied < documentsToCopy; ++copied) {
@@ -492,8 +620,11 @@ TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTimeCloning) {
 TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTimeApplying) {
     // Perform N ops @ timePerOp. Check the progression of the estimated time remaining.
     auto m = getMetrics();
-    m->onStart();
+    m->onStart(ReshardingMetrics::Role::kRecipient,
+               getGlobalServiceContext()->getFastClockSource()->now());
     m->setRecipientState(RecipientStateEnum::kApplying);
+    m->startApplyingOplogEntries(getGlobalServiceContext()->getFastClockSource()->now());
+
     // 1 extra millisecond here because otherwise an error of just 1ms will round this down to the
     // next second.
     auto timePerOp = Milliseconds(1001);
@@ -524,21 +655,21 @@ TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTimeApplying) {
 
 TEST_F(ReshardingMetricsTest, CumulativeOpMetricsAccumulate) {
     auto constexpr kTag = "documentsCopied";
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     const auto kDocumentsToCopy1 = 2;
     const auto kBytesToCopy1 = 200;
 
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
     getMetrics()->onDocumentsCopied(kDocumentsToCopy1, kBytesToCopy1);
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kFailure);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kFailure);
 
-    getMetrics()->onStart();
+    startOperation(ReshardingMetrics::Role::kRecipient);
     const auto kDocumentsToCopy2 = 3;
     const auto kBytesToCopy2 = 400;
 
     getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
     getMetrics()->onDocumentsCopied(kDocumentsToCopy2, kBytesToCopy2);
-    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kFailure);
+    completeOperation(ReshardingMetrics::Role::kRecipient, ReshardingOperationStatusEnum::kFailure);
 
     checkMetrics(kTag,
                  kDocumentsToCopy1 + kDocumentsToCopy2,

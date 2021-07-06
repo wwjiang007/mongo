@@ -54,6 +54,13 @@ function docEqWithIgnoredFields(union, regular) {
         "restoreState",
         "works",
         "needTime",
+        "slots",
+    ]);
+}
+
+function arrayEqWithIgnoredFields(union, regular) {
+    return arrayEq(union, regular, false /* verbose */, null /* valueComparator */, [
+        "slots",
     ]);
 }
 
@@ -86,7 +93,7 @@ function assertExplainEq(unionExplain, regularExplain) {
                    buildErrorString(unionSubStats, realStats));
         } else {
             const realExplain = regularExplain.stages;
-            assert(arrayEq(unionSubExplain, realExplain),
+            assert(arrayEqWithIgnoredFields(unionSubExplain, realExplain),
                    buildErrorString(unionSubExplain, realExplain));
         }
     }

@@ -38,6 +38,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
@@ -63,10 +64,31 @@ boost::optional<CollectionType> getShardedCollection(OperationContext* opCtx,
     }
 }
 
+boost::optional<UUID> getCollectionUUID(OperationContext* opCtx,
+                                        NamespaceString const& nss,
+                                        boost::optional<CollectionType> const& optCollectionType,
+                                        bool throwOnNotFound = true) {
+    if (optCollectionType) {
+        return optCollectionType->getUuid();
+    }
+    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
+    const auto collPtr = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+    if (!collPtr && !throwOnNotFound) {
+        return boost::none;
+    }
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Collection " << nss << " doesn't exist.",
+            collPtr);
+
+    return collPtr->uuid();
+}
 }  // namespace
 
-RenameCollectionCoordinator::RenameCollectionCoordinator(const BSONObj& initialState)
-    : ShardingDDLCoordinator(initialState),
+RenameCollectionCoordinator::RenameCollectionCoordinator(ShardingDDLCoordinatorService* service,
+                                                         const BSONObj& initialState)
+    : ShardingDDLCoordinator(service, initialState),
       _doc(RenameCollectionCoordinatorDocument::parse(
           IDLParserErrorContext("RenameCollectionCoordinatorDocument"), initialState)) {}
 
@@ -79,21 +101,13 @@ void RenameCollectionCoordinator::checkIfOptionsConflict(const BSONObj& doc) con
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "Another rename collection for namespace " << nss()
-                          << "is being executed with different parameters: " << selfReq,
+                          << " is being executed with different parameters: " << selfReq,
             SimpleBSONObjComparator::kInstance.evaluate(selfReq == otherReq));
 }
 
-std::vector<DistLockManager::ScopedDistLock> RenameCollectionCoordinator::_acquireAdditionalLocks(
+std::vector<StringData> RenameCollectionCoordinator::_acquireAdditionalLocks(
     OperationContext* opCtx) {
-    const auto coorName = DDLCoordinatorType_serializer(_coorMetadata.getId().getOperationType());
-
-    auto distLockManager = DistLockManager::get(opCtx);
-    auto targetCollDistLock = uassertStatusOK(distLockManager->lock(
-        opCtx, _doc.getTo().ns(), coorName, DistLockManager::kDefaultLockTimeout));
-
-    std::vector<DistLockManager::ScopedDistLock> vec;
-    vec.push_back(targetCollDistLock.moveToAnotherThread());
-    return vec;
+    return {_doc.getTo().ns()};
 }
 
 boost::optional<BSONObj> RenameCollectionCoordinator::reportForCurrentOp(
@@ -104,38 +118,17 @@ boost::optional<BSONObj> RenameCollectionCoordinator::reportForCurrentOp(
     if (const auto& optComment = getForwardableOpMetadata().getComment()) {
         cmdBob.append(optComment.get().firstElement());
     }
+    cmdBob.appendElements(_doc.getRenameCollectionRequest().toBSON());
+
     BSONObjBuilder bob;
     bob.append("type", "op");
     bob.append("desc", "RenameCollectionCoordinator");
     bob.append("op", "command");
     bob.append("ns", nss().toString());
-    bob.append("to", _doc.getTo().toString());
     bob.append("command", cmdBob.obj());
     bob.append("currentPhase", _doc.getPhase());
     bob.append("active", true);
     return bob.obj();
-}
-
-void RenameCollectionCoordinator::_insertStateDocument(StateDoc&& doc) {
-    auto coorMetadata = doc.getShardingDDLCoordinatorMetadata();
-    coorMetadata.setRecoveredFromDisk(true);
-    doc.setShardingDDLCoordinatorMetadata(coorMetadata);
-
-    auto opCtx = cc().makeOperationContext();
-    PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
-    store.add(opCtx.get(), doc, WriteConcerns::kMajorityWriteConcern);
-    _doc = std::move(doc);
-}
-
-void RenameCollectionCoordinator::_updateStateDocument(StateDoc&& newDoc) {
-    auto opCtx = cc().makeOperationContext();
-    PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
-    store.update(opCtx.get(),
-                 BSON(StateDoc::kIdFieldName << _doc.getId().toBSON()),
-                 newDoc.toBSON(),
-                 WriteConcerns::kMajorityWriteConcern);
-
-    _doc = std::move(newDoc);
 }
 
 void RenameCollectionCoordinator::_enterPhase(Phase newPhase) {
@@ -151,10 +144,24 @@ void RenameCollectionCoordinator::_enterPhase(Phase newPhase) {
                 "oldPhase"_attr = RenameCollectionCoordinatorPhase_serializer(_doc.getPhase()));
 
     if (_doc.getPhase() == Phase::kUnset) {
-        _insertStateDocument(std::move(newDoc));
+        _doc = _insertStateDocument(std::move(newDoc));
         return;
     }
-    _updateStateDocument(std::move(newDoc));
+    _doc = _updateStateDocument(cc().makeOperationContext().get(), std::move(newDoc));
+}
+
+void RenameCollectionCoordinator::_performNoopRetryableWriteOnParticipants(
+    OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor) {
+    auto shardsAndConfigsvr = [&] {
+        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        auto participants = shardRegistry->getAllShardIds(opCtx);
+        participants.emplace_back(shardRegistry->getConfigShard()->getId());
+        return participants;
+    }();
+
+    _doc = _updateSession(opCtx, _doc);
+    sharding_ddl_util::performNoopRetryableWriteOnShards(
+        opCtx, shardsAndConfigsvr, getCurrentSession(_doc), executor);
 }
 
 ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
@@ -162,7 +169,7 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
         .then(_executePhase(
-            Phase::kCheckPreconditionsAndFreezeMigrations,
+            Phase::kCheckPreconditions,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
@@ -171,111 +178,161 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                 const auto& fromNss = nss();
                 const auto& toNss = _doc.getTo();
 
-                // Make sure the source collection exists
-                const auto optSourceCollType = getShardedCollection(opCtx, nss());
-                const bool sourceIsSharded = (bool)optSourceCollType;
-                if (sourceIsSharded) {
-                    uassert(ErrorCodes::CommandFailed,
-                            str::stream() << "Source and destination collections must be on the "
-                                             "same database because "
-                                          << fromNss << " is sharded.",
-                            fromNss.db() == toNss.db());
-                } else {
-                    Lock::DBLock dbLock(opCtx, fromNss.db(), MODE_IS);
-                    Lock::CollectionLock collLock(opCtx, fromNss, MODE_IS);
-                    const auto sourceCollPtr =
-                        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss);
+                try {
+                    // Make sure the source collection exists
+                    const auto optSourceCollType = getShardedCollection(opCtx, fromNss);
+                    const bool sourceIsSharded = (bool)optSourceCollType;
 
-                    uassert(ErrorCodes::NamespaceNotFound,
-                            str::stream() << "Collection " << fromNss << " doesn't exist.",
-                            sourceCollPtr);
-
-                    if (fromNss.db() != toNss.db()) {
+                    _doc.setSourceUUID(getCollectionUUID(opCtx, fromNss, optSourceCollType));
+                    if (sourceIsSharded) {
+                        uassert(ErrorCodes::CommandFailed,
+                                str::stream() << "Source and destination collections must be on "
+                                                 "the same database because "
+                                              << fromNss << " is sharded.",
+                                fromNss.db() == toNss.db());
+                        _doc.setOptShardedCollInfo(optSourceCollType);
+                    } else if (fromNss.db() != toNss.db()) {
                         sharding_ddl_util::checkDbPrimariesOnTheSameShard(opCtx, fromNss, toNss);
                     }
-                }
 
-                _doc.setOptShardedCollInfo(optSourceCollType);
-
-                // Make sure the target namespace is not a view
-                {
-                    Lock::DBLock dbLock(opCtx, toNss.db(), MODE_IS);
-                    const auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, toNss.db());
-                    if (db) {
-                        uassert(ErrorCodes::CommandNotSupportedOnView,
-                                str::stream() << "Can't rename to target collection `" << toNss
-                                              << "` because it is a view.",
-                                !ViewCatalog::get(db)->lookup(opCtx, toNss.ns()));
+                    // Make sure the target namespace is not a view
+                    {
+                        Lock::DBLock dbLock(opCtx, toNss.db(), MODE_IS);
+                        const auto db = DatabaseHolder::get(opCtx)->getDb(opCtx, toNss.db());
+                        if (db) {
+                            uassert(ErrorCodes::CommandNotSupportedOnView,
+                                    str::stream() << "Can't rename to target collection `" << toNss
+                                                  << "` because it is a view.",
+                                    !ViewCatalog::get(db)->lookup(opCtx, toNss));
+                        }
                     }
+
+                    const auto optTargetCollType = getShardedCollection(opCtx, toNss);
+                    _doc.setTargetIsSharded((bool)optTargetCollType);
+                    _doc.setTargetUUID(getCollectionUUID(
+                        opCtx, toNss, optTargetCollType, /*throwNotFound*/ false));
+
+                    sharding_ddl_util::checkShardedRenamePreconditions(
+                        opCtx, toNss, _doc.getDropTarget());
+
+                } catch (const DBException&) {
+                    _completeOnError = true;
+                    throw;
                 }
-
-                const auto targetIsSharded = (bool)getShardedCollection(opCtx, toNss);
-                _doc.setTargetIsSharded(targetIsSharded);
-
-                sharding_ddl_util::checkShardedRenamePreconditions(
-                    opCtx, toNss, _doc.getDropTarget());
-
-                // Block migrations on involved sharded collections
-                if (sourceIsSharded) {
-                    sharding_ddl_util::stopMigrations(opCtx, nss());
-                }
-
-                if (targetIsSharded) {
-                    sharding_ddl_util::stopMigrations(opCtx, _doc.getTo());
-                }
-
-                ShardingLogging::get(opCtx)->logChange(
-                    opCtx,
-                    "renameCollection.start",
-                    nss().ns(),
-                    BSON("source" << fromNss.toString() << "destination" << toNss.toString()),
-                    ShardingCatalogClient::kMajorityWriteConcern);
             }))
         .then(_executePhase(
-            Phase::kBlockCRUDAndRename,
+            Phase::kFreezeMigrations,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
                 const auto& fromNss = nss();
+                const auto& toNss = _doc.getTo();
+
+                ShardingLogging::get(opCtx)->logChange(
+                    opCtx,
+                    "renameCollection.start",
+                    fromNss.ns(),
+                    BSON("source" << fromNss.toString() << "destination" << toNss.toString()),
+                    ShardingCatalogClient::kMajorityWriteConcern);
+
+                // Block migrations on involved sharded collections
+                if (_doc.getOptShardedCollInfo()) {
+                    sharding_ddl_util::stopMigrations(opCtx, fromNss, _doc.getSourceUUID());
+                }
+
+                if (_doc.getTargetIsSharded()) {
+                    sharding_ddl_util::stopMigrations(opCtx, toNss, _doc.getTargetUUID());
+                }
+            }))
+        .then(_executePhase(
+            Phase::kBlockCrudAndRename,
+            [this, executor = executor, anchor = shared_from_this()] {
+                auto opCtxHolder = cc().makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                getForwardableOpMetadata().setOn(opCtx);
+
+                if (_recoveredFromDisk) {
+                    _performNoopRetryableWriteOnParticipants(opCtx, **executor);
+                }
+
+                const auto& fromNss = nss();
+
+                _doc = _updateSession(opCtx, _doc);
+                const OperationSessionInfo osi = getCurrentSession(_doc);
 
                 // On participant shards:
                 // - Block CRUD on source and target collection in case at least one
                 // of such collections is currently sharded.
                 // - Locally drop the target collection
                 // - Locally rename source to target
-                ShardsvrRenameCollectionParticipant renameCollParticipantRequest(fromNss);
+                ShardsvrRenameCollectionParticipant renameCollParticipantRequest(
+                    fromNss, _doc.getSourceUUID().get());
                 renameCollParticipantRequest.setDbName(fromNss.db());
+                renameCollParticipantRequest.setTargetUUID(_doc.getTargetUUID());
                 renameCollParticipantRequest.setRenameCollectionRequest(
                     _doc.getRenameCollectionRequest());
 
                 auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
-                // We need to send the command to all the shards because both movePrimary and
-                // moveChunk leave garbage behind for sharded collections.
-                sharding_ddl_util::sendAuthenticatedCommandToShards(
-                    opCtx,
-                    fromNss.db(),
-                    CommandHelpers::appendMajorityWriteConcern(
-                        renameCollParticipantRequest.toBSON({})),
-                    participants,
-                    **executor);
+                // We need to send the command to all the shards because both
+                // movePrimary and moveChunk leave garbage behind for sharded
+                // collections.
+                const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
+                    renameCollParticipantRequest.toBSON({}));
+
+                try {
+                    sharding_ddl_util::sendAuthenticatedCommandToShards(
+                        opCtx,
+                        fromNss.db(),
+                        cmdObj.addFields(osi.toBSON()),
+                        participants,
+                        **executor);
+
+                } catch (const ExceptionFor<ErrorCodes::NotARetryableWriteCommand>&) {
+                    // Older 5.0 binaries don't support running the command as a
+                    // retryable write yet. In that case, retry without attaching session info.
+                    sharding_ddl_util::sendAuthenticatedCommandToShards(
+                        opCtx, fromNss.db(), cmdObj, participants, **executor);
+                }
             }))
         .then(_executePhase(
             Phase::kRenameMetadata,
-            [this, anchor = shared_from_this()] {
+            [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
-                const auto& optFromCollType = _doc.getOptShardedCollInfo();
-                if (optFromCollType) {
-                    // Rename CSRS metadata
-                    auto collType = *optFromCollType;
-                    sharding_ddl_util::shardedRenameMetadata(opCtx, collType, _doc.getTo());
-                } else if (_doc.getTargetIsSharded()) {
-                    // Remove stale target CSRS metadata
-                    sharding_ddl_util::removeCollMetadataFromConfig(opCtx, _doc.getTo());
+                if (_recoveredFromDisk) {
+                    _performNoopRetryableWriteOnParticipants(opCtx, **executor);
+                }
+
+                ConfigsvrRenameCollectionMetadata req(nss(), _doc.getTo());
+                req.setOptFromCollection(_doc.getOptShardedCollInfo());
+                const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(req.toBSON({}));
+                const auto& configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
+                // For an unsharded collection the CSRS server can not verify the targetUUID.
+                // Use the session ID + txnNumber to ensure no stale requests get through.
+                _doc = _updateSession(opCtx, _doc);
+                const OperationSessionInfo osi = getCurrentSession(_doc);
+
+                try {
+                    uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(
+                        configShard->runCommand(opCtx,
+                                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                                "admin",
+                                                cmdObj.addFields(osi.toBSON()),
+                                                Shard::RetryPolicy::kIdempotent)));
+                } catch (const ExceptionFor<ErrorCodes::NotARetryableWriteCommand>&) {
+                    // Older 5.0 binaries don't support running the command as a
+                    // retryable write yet. In that case, retry without attaching session info.
+                    uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(
+                        configShard->runCommand(opCtx,
+                                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                                "admin",
+                                                cmdObj,
+                                                Shard::RetryPolicy::kIdempotent)));
                 }
             }))
         .then(_executePhase(
@@ -285,22 +342,38 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
-                const auto& fromNss = nss();
+                if (_recoveredFromDisk) {
+                    _performNoopRetryableWriteOnParticipants(opCtx, **executor);
+                }
 
+                const auto& fromNss = nss();
                 // On participant shards:
                 // - Unblock CRUD on participants for both source and destination collections
-                ShardsvrRenameCollectionUnblockParticipant unblockParticipantRequest(fromNss);
+                ShardsvrRenameCollectionUnblockParticipant unblockParticipantRequest(
+                    fromNss, _doc.getSourceUUID().get());
                 unblockParticipantRequest.setDbName(fromNss.db());
-                unblockParticipantRequest.setTo(_doc.getTo());
-
+                unblockParticipantRequest.setRenameCollectionRequest(
+                    _doc.getRenameCollectionRequest());
+                auto const cmdObj = CommandHelpers::appendMajorityWriteConcern(
+                    unblockParticipantRequest.toBSON({}));
                 auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
-                sharding_ddl_util::sendAuthenticatedCommandToShards(
-                    opCtx,
-                    fromNss.db(),
-                    CommandHelpers::appendMajorityWriteConcern(
-                        unblockParticipantRequest.toBSON({})),
-                    participants,
-                    **executor);
+
+                _doc = _updateSession(opCtx, _doc);
+                const OperationSessionInfo osi = getCurrentSession(_doc);
+
+                try {
+                    sharding_ddl_util::sendAuthenticatedCommandToShards(
+                        opCtx,
+                        fromNss.db(),
+                        cmdObj.addFields(osi.toBSON()),
+                        participants,
+                        **executor);
+                } catch (const ExceptionFor<ErrorCodes::NotARetryableWriteCommand>&) {
+                    // Older 5.0 binaries don't support running the command as a
+                    // retryable write yet. In that case, retry without attaching session info.
+                    sharding_ddl_util::sendAuthenticatedCommandToShards(
+                        opCtx, fromNss.db(), cmdObj, participants, **executor);
+                }
             }))
         .then(_executePhase(
             Phase::kSetResponse,
@@ -322,7 +395,6 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                     nss().ns(),
                     BSON("source" << nss().toString() << "destination" << _doc.getTo().toString()),
                     ShardingCatalogClient::kMajorityWriteConcern);
-
                 LOGV2(5460504, "Collection renamed", "namespace"_attr = nss());
             }))
         .onError([this, anchor = shared_from_this()](const Status& status) {

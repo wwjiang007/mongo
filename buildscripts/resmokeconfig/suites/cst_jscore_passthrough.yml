@@ -325,6 +325,7 @@ selector:
   - jstests/core/or9.js
   - jstests/core/or_inexact.js
   - jstests/core/or_inexact.js
+  - jstests/core/or_to_in.js
   - jstests/core/ora.js
   - jstests/core/orb.js
   - jstests/core/orc.js
@@ -801,7 +802,6 @@ executor:
       - ValidateCollections
   config:
     shell_options:
-      readMode: commands
       eval: load("jstests/libs/override_methods/detect_spawning_own_mongod.js");
   hooks:
   - class: ValidateCollections

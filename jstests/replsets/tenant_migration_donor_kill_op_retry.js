@@ -2,7 +2,7 @@
  * Tests that the donor will retry its steps if its OperationContext is interrupted by a killOp.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -78,8 +78,7 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
         fp.off();
         runMigrationThread.join();
 
-        const stateRes = assert.commandWorked(runMigrationThread.returnData());
-        assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
+        TenantMigrationTest.assertCommitted(runMigrationThread.returnData());
         assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
     }
 }
@@ -138,8 +137,7 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     fp.off();
     runMigrationThread.join();
 
-    const stateRes = assert.commandWorked(runMigrationThread.returnData());
-    assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
+    TenantMigrationTest.assertCommitted(runMigrationThread.returnData());
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
@@ -151,10 +149,13 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     ];
     for (let fpName of fpNames) {
         tenantMigrationTest.getDonorRst().stopSet();
-        tenantMigrationTest.getDonorRst().startSet(
-            Object.assign(migrationX509Options.donor,
-                          {setParameter: {['failpoint.' + fpName]: tojson({mode: 'alwaysOn'})}}));
-        tenantMigrationTest.getDonorRst().initiate();
+        tenantMigrationTest.getDonorRst().startSet(Object.assign({}, migrationX509Options.donor, {
+            setParameter: {['failpoint.' + fpName]: tojson({mode: 'alwaysOn'})}
+        }));
+        // The failpoints in this test run hang the TenantMigrationDonorService during service
+        // rebuild, so we need to skip waiting on PrimaryOnlyServices.
+        tenantMigrationTest.getDonorRst().initiate(
+            null, null, {doNotWaitForPrimaryOnlyServices: true});
         TenantMigrationUtil.createTenantMigrationRecipientRoleIfNotExist(
             tenantMigrationTest.getDonorRst());
 
@@ -188,8 +189,7 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
 
         runMigrationThread.join();
 
-        const stateRes = assert.commandWorked(runMigrationThread.returnData());
-        assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
+        TenantMigrationTest.assertCommitted(runMigrationThread.returnData());
         assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
     }
 }
@@ -198,14 +198,14 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     // This section is testing behavior during garbage collection.
     tenantMigrationTest.getDonorRst().stopSet();
     tenantMigrationTest.getDonorRst().startSet(
-        Object.assign(migrationX509Options.donor, {setParameter: garbageCollectionOpts}));
+        Object.assign({}, migrationX509Options.donor, {setParameter: garbageCollectionOpts}));
     tenantMigrationTest.getDonorRst().initiate();
     TenantMigrationUtil.createTenantMigrationRecipientRoleIfNotExist(
         tenantMigrationTest.getDonorRst());
 
     tenantMigrationTest.getRecipientRst().stopSet();
     tenantMigrationTest.getRecipientRst().startSet(
-        Object.assign(migrationX509Options.recipient, {setParameter: garbageCollectionOpts}));
+        Object.assign({}, migrationX509Options.recipient, {setParameter: garbageCollectionOpts}));
     tenantMigrationTest.getRecipientRst().initiate();
     TenantMigrationUtil.createTenantMigrationDonorRoleIfNotExist(
         tenantMigrationTest.getRecipientRst());
@@ -229,11 +229,10 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
 
         let fp = configureFailPoint(tenantMigrationTest.getDonorPrimary(), fpName);
 
-        const stateRes = assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tenantMigrationTest.runMigration(migrationOpts,
                                              false /* retry on retriable errors */,
                                              false /* Automatically forget migration */));
-        assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
 
         const donorPrimary = tenantMigrationTest.getDonorPrimary();
         const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());

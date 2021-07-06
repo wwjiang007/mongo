@@ -86,6 +86,12 @@ public:
 
     virtual std::unique_ptr<mongo::SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx,
+        KeyFormat rsKeyFormat,
+        StringData ident,
+        const IndexDescriptor* desc);
+
+    virtual std::unique_ptr<mongo::SortedDataInterface> getSortedDataInterface(
+        OperationContext* opCtx,
         const CollectionOptions& collOptions,
         StringData ident,
         const IndexDescriptor* desc);
@@ -197,6 +203,8 @@ public:
     }
 
     static bool instanceExists();
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) {}
 
 private:
     void _cleanHistory(WithLock);

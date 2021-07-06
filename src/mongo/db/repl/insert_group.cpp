@@ -59,11 +59,13 @@ constexpr auto kInsertGroupMaxOpCount = 64;
 InsertGroup::InsertGroup(std::vector<const OplogEntry*>* ops,
                          OperationContext* opCtx,
                          InsertGroup::Mode mode,
+                         const bool isDataConsistent,
                          ApplyFunc applyOplogEntryOrGroupedInserts)
     : _doNotGroupBeforePoint(ops->cbegin()),
       _end(ops->cend()),
       _opCtx(opCtx),
       _mode(mode),
+      _isDataConsistent(isDataConsistent),
       _applyOplogEntryOrGroupedInserts(applyOplogEntryOrGroupedInserts) {}
 
 StatusWith<InsertGroup::ConstIterator> InsertGroup::groupAndApplyInserts(
@@ -131,8 +133,8 @@ StatusWith<InsertGroup::ConstIterator> InsertGroup::groupAndApplyInserts(
     // Create an oplog entry group for grouped inserts.
     OplogEntryOrGroupedInserts groupedInserts(it, endOfGroupableOpsIterator);
     try {
-        // Apply the group of inserts by passing in groupedInserts.
-        uassertStatusOK(_applyOplogEntryOrGroupedInserts(_opCtx, groupedInserts, _mode));
+        uassertStatusOK(
+            _applyOplogEntryOrGroupedInserts(_opCtx, groupedInserts, _mode, _isDataConsistent));
         // It succeeded, advance the oplogEntriesIterator to the end of the
         // group of inserts.
         return endOfGroupableOpsIterator - 1;
@@ -141,20 +143,21 @@ StatusWith<InsertGroup::ConstIterator> InsertGroup::groupAndApplyInserts(
         // application of an individual op.
         static constexpr char message[] =
             "Error applying inserts in bulk. Trying first insert as a lone insert";
-        auto status = exceptionToStatus().withContext(
-            str::stream() << message << ". Grouped inserts: " << redact(groupedInserts.toBSON())
-                          << ". First insert: " << redact(entry.toBSONForLogging()));
+        auto status = exceptionToStatus();
 
         // It's not an error during initial sync to encounter DuplicateKey errors.
-        if (Mode::kInitialSync == _mode && ErrorCodes::DuplicateKey == status) {
+        if (Mode::kInitialSync == _mode &&
+            (ErrorCodes::DuplicateKey == status || ErrorCodes::NamespaceNotFound == status)) {
             LOGV2_DEBUG(21203,
                         2,
                         message,
+                        "error"_attr = redact(status),
                         "groupedInserts"_attr = redact(groupedInserts.toBSON()),
                         "firstInsert"_attr = redact(entry.toBSONForLogging()));
         } else {
             LOGV2_ERROR(21204,
                         message,
+                        "error"_attr = redact(status),
                         "groupedInserts"_attr = redact(groupedInserts.toBSON()),
                         "firstInsert"_attr = redact(entry.toBSONForLogging()));
         }

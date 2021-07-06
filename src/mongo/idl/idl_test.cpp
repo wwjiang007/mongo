@@ -1023,6 +1023,13 @@ TEST(IDLStructTests, TestNonStrictStruct) {
             BSON("field4" << 1234 << "1" << 12 << "2" << 123 << "3" << 1234 << "field4" << 1234);
         ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
     }
+
+    // Negative: null required field
+    {
+        auto testDoc = BSON(RequiredNonStrictField3::kCppField1FieldName << 12 << "2" << 123 << "3"
+                                                                         << BSONNULL);
+        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
+    }
 }
 
 TEST(IDLStructTests, WriteConcernTest) {
@@ -2034,7 +2041,15 @@ TEST(IDLChainedType, TestChainedStruct) {
         testStruct.serialize(&builder);
         auto loopbackDoc = builder.obj();
 
-        ASSERT_BSONOBJ_EQ(testDoc, loopbackDoc);
+        // Serializer should include fields with default values.
+        ASSERT_BSONOBJ_EQ(BSON("anyField" << 123.456 << "objectField"
+                                          << BSON("random"
+                                                  << "pair")
+                                          << "enumField"  // Should be ahead of 'field3'.
+                                          << "zero"
+                                          << "field3"
+                                          << "abc"),
+                          loopbackDoc);
     }
 }
 
@@ -3707,6 +3722,56 @@ TEST(IDLAccessCheck, TestComplexAccessCheck) {
     ac.addAccessCheck(AccessCheckEnum::kIsAuthorizedToParseNamespaceElement);
 
     verifyContract(ac, AccessCheckComplexPrivilege::kAuthorizationContract);
+}
+
+TEST(IDLFieldTests, TestOptionalBoolField) {
+    IDLParserErrorContext ctxt("root");
+
+    {
+        auto testDoc = BSON("optBoolField" << true);
+        auto parsed = OptionalBool::parseFromBSON(testDoc.firstElement());
+        ASSERT_TRUE(parsed.has_value());
+        ASSERT_TRUE(parsed);
+        BSONObjBuilder serialized;
+        parsed.serializeToBSON("optBoolField", &serialized);
+        ASSERT_BSONOBJ_EQ(serialized.obj(), testDoc);
+    }
+
+    {
+        auto testDoc = BSON("optBoolField" << false);
+        auto parsed = OptionalBool::parseFromBSON(testDoc.firstElement());
+        ASSERT_TRUE(parsed.has_value());
+        ASSERT_FALSE(parsed);
+        BSONObjBuilder serialized;
+        parsed.serializeToBSON("optBoolField", &serialized);
+        ASSERT_BSONOBJ_EQ(serialized.obj(), testDoc);
+    }
+
+    {
+        auto testDoc = BSONObj();
+        auto parsed = OptionalBool::parseFromBSON(testDoc.firstElement());
+        ASSERT_FALSE(parsed.has_value());
+        ASSERT_FALSE(parsed);
+        BSONObjBuilder serialized;
+        parsed.serializeToBSON("", &serialized);
+        ASSERT_BSONOBJ_EQ(serialized.obj(), testDoc);
+    }
+
+    {
+        auto testDoc = BSON("optBoolField" << jstNULL);
+        ASSERT_THROWS(OptionalBool::parseFromBSON(testDoc.firstElement()), AssertionException);
+    }
+
+    {
+        auto testDoc = BSON("optBoolField" << BSONUndefined);
+        ASSERT_THROWS(OptionalBool::parseFromBSON(testDoc.firstElement()), AssertionException);
+    }
+
+    {
+        auto testDoc = BSON("optBoolField"
+                            << "abc");
+        ASSERT_THROWS(OptionalBool::parseFromBSON(testDoc.firstElement()), AssertionException);
+    }
 }
 
 }  // namespace

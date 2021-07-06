@@ -34,12 +34,14 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/branch.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
+#include "mongo/db/exec/sbe/stages/hash_agg.h"
 #include "mongo/db/exec/sbe/stages/limit_skip.h"
 #include "mongo/db/exec/sbe/stages/loop_join.h"
 #include "mongo/db/exec/sbe/stages/project.h"
 #include "mongo/db/exec/sbe/stages/traverse.h"
 #include "mongo/db/exec/sbe/stages/union.h"
 #include "mongo/db/exec/sbe/stages/unwind.h"
+#include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/matcher/matcher_type_set.h"
 #include <iterator>
 #include <numeric>
@@ -292,6 +294,20 @@ std::pair<sbe::value::SlotId, EvalStage> projectEvalExpr(
     return {slot, std::move(stage)};
 }
 
+EvalStage makeProject(EvalStage stage,
+                      sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> projects,
+                      PlanNodeId planNodeId) {
+    stage = stageOrLimitCoScan(std::move(stage), planNodeId);
+
+    auto outSlots = std::move(stage.outSlots);
+    for (auto& [slot, _] : projects) {
+        outSlots.push_back(slot);
+    }
+
+    return {sbe::makeS<sbe::ProjectStage>(std::move(stage.stage), std::move(projects), planNodeId),
+            std::move(outSlots)};
+}
+
 EvalStage makeLoopJoin(EvalStage left,
                        EvalStage right,
                        PlanNodeId planNodeId,
@@ -336,20 +352,21 @@ EvalStage makeUnwind(EvalStage inputEvalStage,
     return {std::move(unwindStage), sbe::makeSV(unwindSlot)};
 }
 
-EvalStage makeBranch(std::unique_ptr<sbe::EExpression> ifExpr,
-                     EvalStage thenStage,
+EvalStage makeBranch(EvalStage thenStage,
                      EvalStage elseStage,
-                     sbe::value::SlotIdGenerator* slotIdGenerator,
+                     std::unique_ptr<sbe::EExpression> ifExpr,
+                     sbe::value::SlotVector thenVals,
+                     sbe::value::SlotVector elseVals,
+                     sbe::value::SlotVector outputVals,
                      PlanNodeId planNodeId) {
-    auto outSlots = slotIdGenerator->generateMultiple(thenStage.outSlots.size());
     auto branchStage = sbe::makeS<sbe::BranchStage>(std::move(thenStage.stage),
                                                     std::move(elseStage.stage),
                                                     std::move(ifExpr),
-                                                    thenStage.outSlots,
-                                                    elseStage.outSlots,
-                                                    outSlots,
+                                                    std::move(thenVals),
+                                                    std::move(elseVals),
+                                                    outputVals,
                                                     planNodeId);
-    return {std::move(branchStage), std::move(outSlots)};
+    return {std::move(branchStage), std::move(outputVals)};
 }
 
 EvalStage makeTraverse(EvalStage outer,
@@ -409,6 +426,45 @@ EvalStage makeUnion(std::vector<EvalStage> inputStages,
     return EvalStage{sbe::makeS<sbe::UnionStage>(
                          std::move(branches), std::move(inputVals), outputVals, planNodeId),
                      outputVals};
+}
+
+EvalStage makeHashAgg(EvalStage stage,
+                      sbe::value::SlotVector gbs,
+                      sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> aggs,
+                      boost::optional<sbe::value::SlotId> collatorSlot,
+                      PlanNodeId planNodeId) {
+    stage.outSlots = gbs;
+    for (auto& [slot, _] : aggs) {
+        stage.outSlots.push_back(slot);
+    }
+    stage.stage = sbe::makeS<sbe::HashAggStage>(
+        std::move(stage.stage), std::move(gbs), std::move(aggs), collatorSlot, planNodeId);
+    return stage;
+}
+
+EvalStage makeMkBsonObj(EvalStage stage,
+                        sbe::value::SlotId objSlot,
+                        boost::optional<sbe::value::SlotId> rootSlot,
+                        boost::optional<sbe::MakeObjFieldBehavior> fieldBehavior,
+                        std::vector<std::string> fields,
+                        std::vector<std::string> projectFields,
+                        sbe::value::SlotVector projectVars,
+                        bool forceNewObject,
+                        bool returnOldObject,
+                        PlanNodeId planNodeId) {
+    stage.stage = sbe::makeS<sbe::MakeBsonObjStage>(std::move(stage.stage),
+                                                    objSlot,
+                                                    rootSlot,
+                                                    fieldBehavior,
+                                                    std::move(fields),
+                                                    std::move(projectFields),
+                                                    std::move(projectVars),
+                                                    forceNewObject,
+                                                    returnOldObject,
+                                                    planNodeId);
+    stage.outSlots.push_back(objSlot);
+
+    return stage;
 }
 
 EvalExprStagePair generateUnion(std::vector<EvalExprStagePair> branches,
@@ -570,9 +626,26 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
                 std::move(scanStage), std::move(projections), kEmptyPlanNodeId)};
 }
 
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONObj& bo) {
+    return sbe::value::copyValue(sbe::value::TypeTags::bsonObject,
+                                 sbe::value::bitcastFrom<const char*>(bo.objdata()));
+}
+
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba) {
     return sbe::value::copyValue(sbe::value::TypeTags::bsonArray,
                                  sbe::value::bitcastFrom<const char*>(ba.objdata()));
+}
+
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const Value& val) {
+    // TODO: Either make this conversion unnecessary by changing the value representation in
+    // ExpressionConstant, or provide a nicer way to convert directly from Document/Value to
+    // sbe::Value.
+    BSONObjBuilder bob;
+    val.addToBsonObj(&bob, ""_sd);
+    auto obj = bob.done();
+    auto be = obj.objdata();
+    auto end = be + obj.objsize();
+    return sbe::bson::convertFrom<false>(be + 4, end, 0);
 }
 
 uint32_t dateTypeMask() {
@@ -666,5 +739,18 @@ sbe::value::SlotVector makeIndexKeyOutputSlotsMatchingParentReqs(
     }
 
     return newIndexKeySlots;
+}
+
+sbe::value::SlotId StageBuilderState::getGlobalVariableSlot(Variables::Id variableId) {
+    if (auto it = globalVariables.find(variableId); it != globalVariables.end()) {
+        return it->second;
+    }
+
+    // Convert value of variable into SBE value.
+    auto [tag, val] = makeValue(variables.getValue(variableId));
+
+    auto slotId = env->registerSlot(tag, val, true, slotIdGenerator);
+    globalVariables.emplace(variableId, slotId);
+    return slotId;
 }
 }  // namespace mongo::stage_builder

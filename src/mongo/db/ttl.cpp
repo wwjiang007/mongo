@@ -54,7 +54,6 @@
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/ttl_gen.h"
@@ -305,7 +304,7 @@ private:
                               const CollectionPtr& coll,
                               std::int64_t expireAfterSeconds) const {
         if (auto timeseries = coll->getTimeseriesOptions()) {
-            const auto bucketMaxSpan = Seconds(timeseries->getBucketMaxSpanSeconds());
+            const auto bucketMaxSpan = Seconds(*timeseries->getBucketMaxSpanSeconds());
 
             // Don't delete data unless it is safely out of range of the bucket maximum time
             // range. On time-series collections, the _id (and thus RecordId) is the minimum
@@ -326,21 +325,18 @@ private:
                                 TTLCollectionCache* ttlCollectionCache,
                                 const CollectionPtr& collection,
                                 std::string indexName) {
-        if (!DurableCatalog::get(opCtx)->isIndexPresent(
-                opCtx, collection->getCatalogId(), indexName)) {
+        if (!collection->isIndexPresent(indexName)) {
             ttlCollectionCache->deregisterTTLInfo(collection->uuid(), indexName);
             return;
         }
 
-        BSONObj spec =
-            DurableCatalog::get(opCtx)->getIndexSpec(opCtx, collection->getCatalogId(), indexName);
+        BSONObj spec = collection->getIndexSpec(indexName);
         if (!spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
             ttlCollectionCache->deregisterTTLInfo(collection->uuid(), indexName);
             return;
         }
 
-        if (!DurableCatalog::get(opCtx)->isIndexReady(
-                opCtx, collection->getCatalogId(), indexName)) {
+        if (!collection->isIndexReady(indexName)) {
             return;
         }
 
@@ -386,7 +382,7 @@ private:
         const Date_t kDawnOfTime =
             Date_t::fromMillisSinceEpoch(std::numeric_limits<long long>::min());
         const auto expirationDate =
-            safeExpirationDate(opCtx, collection, secondsExpireElt.numberLong());
+            safeExpirationDate(opCtx, collection, secondsExpireElt.safeNumberLong());
         const BSONObj startKey = BSON("" << kDawnOfTime);
         const BSONObj endKey = BSON("" << expirationDate);
         // The canonical check as to whether a key pattern element is "ascending" or
@@ -451,14 +447,13 @@ private:
     void deleteExpiredWithCollscan(OperationContext* opCtx,
                                    TTLCollectionCache* ttlCollectionCache,
                                    const CollectionPtr& collection) {
-        auto collOptions =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, collection->getCatalogId());
+        const auto& collOptions = collection->getCollectionOptions();
         uassert(5400701,
                 "collection is not clustered by _id but is described as being TTL",
                 collOptions.clusteredIndex);
         invariant(collection->isClustered());
 
-        auto expireAfterSeconds = collOptions.clusteredIndex->getExpireAfterSeconds();
+        auto expireAfterSeconds = collOptions.expireAfterSeconds;
         if (!expireAfterSeconds) {
             ttlCollectionCache->deregisterTTLInfo(collection->uuid(),
                                                   TTLCollectionCache::ClusteredId{});

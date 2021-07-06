@@ -1032,8 +1032,9 @@ public:
                            size_t size) {
         _damages.push_back(DamageEvent());
         _damages.back().targetOffset = targetOffset;
+        _damages.back().targetSize = size;
         _damages.back().sourceOffset = sourceOffset;
-        _damages.back().size = size;
+        _damages.back().sourceSize = size;
         if (kDebugBuild && paranoid) {
             // Force damage events to new addresses to catch invalidation errors.
             DamageVector new_damages(_damages);
@@ -1122,7 +1123,7 @@ private:
     // creating and destroying a string and its buffer each time.
     std::string _fieldNameScratch;
 
-    // Queue of damage events and status bit for whether  in-place updates are possible.
+    // Queue of damage events and status bit for whether in-place updates are possible.
     DamageVector _damages;
     Document::InPlaceMode _inPlaceMode;
 };
@@ -2277,14 +2278,14 @@ Document::Document(const BSONObj& value, InPlaceMode inPlaceMode)
 
 void Document::reset() {
     _impl->reset(Document::kInPlaceDisabled);
-    MONGO_COMPILER_VARIABLE_UNUSED const Element newRoot = makeRootElement();
+    [[maybe_unused]] const Element newRoot = makeRootElement();
     dassert(newRoot._repIdx == _root._repIdx);
     dassert(_root._repIdx == kRootRepIdx);
 }
 
 void Document::reset(const BSONObj& value, InPlaceMode inPlaceMode) {
     _impl->reset(inPlaceMode);
-    MONGO_COMPILER_VARIABLE_UNUSED const Element newRoot = makeRootElement(value);
+    [[maybe_unused]] const Element newRoot = makeRootElement(value);
     dassert(newRoot._repIdx == _root._repIdx);
     dassert(_root._repIdx == kRootRepIdx);
 }

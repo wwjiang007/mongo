@@ -16,7 +16,6 @@ load("jstests/libs/parallelTester.js");
 
 const kExternalKeysTTLIndexName = "ExternalKeysTTLIndex";
 const kTenantIdPrefix = "testTenantId";
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 const ttlMonitorOptions = {
     ttlMonitorSleepSecs: 1
 };
@@ -109,9 +108,9 @@ function makeTestParams() {
     {
         const [tenantId, migrationId, migrationOpts] = makeTestParams();
 
-        assert.commandWorked(tmt.runMigration(migrationOpts,
-                                              false /* retryOnRetryableErrors */,
-                                              false /* automaticForgetMigration */));
+        TenantMigrationTest.assertCommitted(tmt.runMigration(migrationOpts,
+                                                             false /* retryOnRetryableErrors */,
+                                                             false /* automaticForgetMigration */));
 
         // The keys should have been created without a TTL deadline.
         verifyExternalKeys(tmt.getDonorPrimary(), {migrationId, expectTTLValue: false});
@@ -125,9 +124,9 @@ function makeTestParams() {
             tenantId: makeTenantId(),
         };
 
-        assert.commandWorked(tmt.runMigration(otherMigrationOpts,
-                                              false /* retryOnRetryableErrors */,
-                                              false /* automaticForgetMigration */));
+        TenantMigrationTest.assertCommitted(tmt.runMigration(otherMigrationOpts,
+                                                             false /* retryOnRetryableErrors */,
+                                                             false /* automaticForgetMigration */));
 
         // The keys should have been created without a TTL deadline.
         verifyExternalKeys(tmt.getDonorPrimary(),
@@ -166,9 +165,9 @@ function makeTestParams() {
         assert.eq(origDonorKeysExpirationParam, 60 * 60 * 24);      // 1 day.
         assert.eq(origRecipientKeysExpirationParam, 60 * 60 * 24);  // 1 day.
 
-        assert.commandWorked(tmt.runMigration(migrationOpts,
-                                              false /* retryOnRetryableErrors */,
-                                              false /* automaticForgetMigration */));
+        TenantMigrationTest.assertCommitted(tmt.runMigration(migrationOpts,
+                                                             false /* retryOnRetryableErrors */,
+                                                             false /* automaticForgetMigration */));
 
         // The keys should have been created without a TTL deadline.
         verifyExternalKeys(tmt.getDonorPrimary(), {migrationId, expectTTLValue: false});
@@ -199,6 +198,7 @@ function makeTestParams() {
 //
 
 (() => {
+    const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
     const donorRst = new ReplSetTest({
         nodes: 3,
         name: "donorRst",
@@ -240,7 +240,7 @@ function makeTestParams() {
         assert.commandWorked(donorPrimary.adminCommand({replSetFreeze: 0}));
         fp.off();
 
-        assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tmt.waitForMigrationToComplete(migrationOpts, true /* retryOnRetryableErrors */));
 
         // The keys should have been created without a TTL deadline.
@@ -271,7 +271,7 @@ function makeTestParams() {
         assert.commandWorked(recipientPrimary.adminCommand({replSetFreeze: 0}));
         fp.off();
 
-        assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tmt.waitForMigrationToComplete(migrationOpts, true /* retryOnRetryableErrors */));
 
         // The keys should have been created without a TTL deadline.
@@ -293,7 +293,7 @@ function makeTestParams() {
         const donorPrimary = tmt.getDonorPrimary();
 
         assert.commandWorked(tmt.startMigration(migrationOpts));
-        assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tmt.waitForMigrationToComplete(migrationOpts, true /* retryOnRetryableErrors */));
 
         // The keys should have been created without a TTL deadline.
@@ -329,7 +329,7 @@ function makeTestParams() {
         const recipientPrimary = tmt.getRecipientPrimary();
 
         assert.commandWorked(tmt.startMigration(migrationOpts));
-        assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tmt.waitForMigrationToComplete(migrationOpts, true /* retryOnRetryableErrors */));
 
         // The keys should have been created without a TTL deadline.
@@ -370,7 +370,7 @@ function makeTestParams() {
         const donorPrimary = tmt.getDonorPrimary();
 
         assert.commandWorked(tmt.startMigration(migrationOpts));
-        assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tmt.waitForMigrationToComplete(migrationOpts, true /* retryOnRetryableErrors */));
 
         // The keys should have been created without a TTL deadline.
@@ -407,7 +407,7 @@ function makeTestParams() {
         const recipientPrimary = tmt.getRecipientPrimary();
 
         assert.commandWorked(tmt.startMigration(migrationOpts));
-        assert.commandWorked(
+        TenantMigrationTest.assertCommitted(
             tmt.waitForMigrationToComplete(migrationOpts, true /* retryOnRetryableErrors */));
 
         // The keys should have been created without a TTL deadline.

@@ -43,11 +43,7 @@ using boost::intrusive_ptr;
 
 REGISTER_ACCUMULATOR(mergeObjects,
                      genericParseSingleExpressionAccumulator<AccumulatorMergeObjects>);
-REGISTER_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
-
-const char* AccumulatorMergeObjects::getOpName() const {
-    return "$mergeObjects";
-}
+REGISTER_STABLE_EXPRESSION(mergeObjects, ExpressionFromAccumulator<AccumulatorMergeObjects>::parse);
 
 intrusive_ptr<AccumulatorState> AccumulatorMergeObjects::create(ExpressionContext* const expCtx) {
     return new AccumulatorMergeObjects(expCtx);
@@ -80,7 +76,7 @@ void AccumulatorMergeObjects::processInternal(const Value& input, bool merging) 
         if (pair.second.missing())
             continue;
 
-        _output.setField(pair.first, pair.second);
+        _output.setField(pair.first, std::move(pair.second));
     }
     _memUsageBytes = sizeof(*this) + _output.getApproximateSize();
 }

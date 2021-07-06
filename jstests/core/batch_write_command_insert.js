@@ -8,6 +8,7 @@
 //
 //   # Uses index building in background
 //   requires_background_index,
+//   requires_fcv_50,
 // ]
 //
 //
@@ -18,8 +19,6 @@ load("jstests/libs/get_index_helpers.js");
 
 var coll = db.getCollection("batch_write_insert");
 coll.drop();
-
-assert(coll.getDB().getMongo().useWriteCommands(), "test is not running with write commands");
 
 var request;
 var result;
@@ -96,22 +95,6 @@ result = coll.runCommand(request);
 assert(resultOK(result), tojson(result));
 assert.eq(1, result.n);
 assert.eq(coll.count(), 1);
-
-//
-// Document with illegal key should fail
-coll.drop();
-request = {
-    insert: coll.getName(),
-    documents: [{$set: {a: 1}}],
-    writeConcern: {w: 1},
-    ordered: false
-};
-result = coll.runCommand(request);
-assert(result.ok, tojson(result));
-assert(result.writeErrors != null);
-assert.eq(1, result.writeErrors.length);
-assert.eq(0, result.n);
-assert.eq(coll.count(), 0);
 
 //
 // Document with valid nested key should insert (op log format)

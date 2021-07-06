@@ -4,18 +4,10 @@
 (function() {
 "use strict";
 
-const getParam = db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1});
-jsTestLog(getParam);
-const featureEnabled = assert.commandWorked(getParam).featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
-
 const coll = db.setWindowFields_derivative;
 
-// Like most other window functions, the default window for $derivative is [unbounded, unbounded].
-// This may be a surprising default.
+// The default window is usually [unbounded, unbounded], but this would be surprising for
+// $derivative, so instead it has no default (it requires an explicit window).
 coll.drop();
 assert.commandWorked(coll.insert([
     {time: 0, y: 0},
@@ -125,6 +117,23 @@ assert.docEq(result, [
     // time: 4 and time: 7.
     {time: 7, y: 118, dy: +3 / 3},
 ]);
+// Because the derivative is the same irrespective of sort order (as long as we reexpress the
+// bounds) we can compare this result with the result of the previous aggregation.
+const resultDesc =
+    coll.aggregate([
+            {
+                $setWindowFields: {
+                    sortBy: {time: -1},
+                    output: {
+                        dy: {$derivative: {input: "$y"}, window: {documents: [-1, +3]}},
+                    }
+                }
+            },
+            {$unset: "_id"},
+            {$sort: {time: 1}},
+        ])
+        .toArray();
+assert.docEq(result, resultDesc);
 
 // Example with range-based bounds.
 coll.drop();
@@ -158,29 +167,30 @@ assert.docEq(result, [
     {time: 20, y: 30, dy: (30 - 12) / (20 - 10)},
 ]);
 
-// 'outputUnit' only supports 'week' and smaller.
+// 'unit' only supports 'week' and smaller.
 coll.drop();
-function explainUnit(outputUnit) {
-    return coll.runCommand({
-        explain: {
-            aggregate: coll.getName(),
-            cursor: {},
-            pipeline: [{
-                $setWindowFields: {
-                    sortBy: {time: 1},
-                    output: {
-                        dy: {
-                            $derivative: {
-                                input: "$y",
-                                outputUnit: outputUnit,
-                            },
-                            window: {documents: [-1, 0]}
-                        },
-                    }
-                }
-            }]
+function derivativeStage(unit) {
+    const stage = {
+        $setWindowFields: {
+            sortBy: {time: 1},
+            output: {
+                dy: {
+                    $derivative: {
+                        input: "$y",
+                    },
+                    window: {documents: [-1, 0]}
+                },
+            }
         }
-    });
+    };
+    if (unit) {
+        stage.$setWindowFields.output.dy.$derivative.unit = unit;
+    }
+    return stage;
+}
+function explainUnit(unit) {
+    return coll.runCommand(
+        {explain: {aggregate: coll.getName(), cursor: {}, pipeline: [derivativeStage(unit)]}});
 }
 assert.commandFailedWithCode(explainUnit('year'), 5490704);
 assert.commandFailedWithCode(explainUnit('quarter'), 5490704);
@@ -192,69 +202,46 @@ assert.commandWorked(explainUnit('minute'));
 assert.commandWorked(explainUnit('second'));
 assert.commandWorked(explainUnit('millisecond'));
 
-// 'outputUnit' is only valid if the time values are ISODate objects.
+// When the time field is numeric, 'unit' is not allowed.
 coll.drop();
 assert.commandWorked(coll.insert([
     {time: 0, y: 100},
     {time: 1, y: 100},
     {time: 2, y: 100},
+]));
+assert.throwsWithCode(() => coll.aggregate(derivativeStage('millisecond')).toArray(), 5624900);
+result = coll.aggregate([derivativeStage(), {$unset: '_id'}]).toArray();
+assert.sameMembers(result, [
+    {time: 0, y: 100, dy: null},
+    {time: 1, y: 100, dy: 0},
+    {time: 2, y: 100, dy: 0},
+]);
+
+// When the time field is a Date, 'unit' is required.
+coll.drop();
+assert.commandWorked(coll.insert([
     {time: ISODate("2020-01-01T00:00:00.000Z"), y: 5},
     {time: ISODate("2020-01-01T00:00:00.001Z"), y: 4},
     {time: ISODate("2020-01-01T00:00:00.002Z"), y: 6},
     {time: ISODate("2020-01-01T00:00:00.003Z"), y: 5},
 ]));
-result = coll.aggregate([
-                 {
-                     $setWindowFields: {
-                         sortBy: {time: 1},
-                         output: {
-                             dy: {
-                                 $derivative: {input: "$y", outputUnit: 'millisecond'},
-                                 window: {documents: [-1, 0]}
-                             },
-                         }
-                     }
-                 },
-                 {$unset: "_id"},
-             ])
-             .toArray();
+assert.throwsWithCode(() => coll.aggregate(derivativeStage()).toArray(), 5624901);
+result = coll.aggregate([derivativeStage('millisecond'), {$unset: '_id'}]).toArray();
 assert.sameMembers(result, [
-    // 'outputUnit' applied to an ISODate expresses the output in terms of that unit.
     {time: ISODate("2020-01-01T00:00:00.000Z"), y: 5, dy: null},
     {time: ISODate("2020-01-01T00:00:00.001Z"), y: 4, dy: -1},
     {time: ISODate("2020-01-01T00:00:00.002Z"), y: 6, dy: +2},
     {time: ISODate("2020-01-01T00:00:00.003Z"), y: 5, dy: -1},
-    // 'outputUnit' applied to a non-ISODate is not allowed... we render it as null.
-    {time: 0, y: 100, dy: null},
-    {time: 1, y: 100, dy: null},
-    {time: 2, y: 100, dy: null},
 ]);
+
 // The change per minute is 60*1000 larger than the change per millisecond.
-result = coll.aggregate([
-                 {
-                     $setWindowFields: {
-                         sortBy: {time: 1},
-                         output: {
-                             dy: {
-                                 $derivative: {input: "$y", outputUnit: 'minute'},
-                                 window: {documents: [-1, 0]}
-                             },
-                         }
-                     }
-                 },
-                 {$unset: "_id"},
-             ])
-             .toArray();
+result = coll.aggregate([derivativeStage('minute'), {$unset: "_id"}]).toArray();
 assert.sameMembers(result, [
-    // 'outputUnit' applied to an ISODate expresses the output in terms of that unit.
+    // 'unit' applied to an ISODate expresses the output in terms of that unit.
     {time: ISODate("2020-01-01T00:00:00.000Z"), y: 5, dy: null},
     {time: ISODate("2020-01-01T00:00:00.001Z"), y: 4, dy: -1 * 60 * 1000},
     {time: ISODate("2020-01-01T00:00:00.002Z"), y: 6, dy: +2 * 60 * 1000},
     {time: ISODate("2020-01-01T00:00:00.003Z"), y: 5, dy: -1 * 60 * 1000},
-    // It's still null for the non-ISODates.
-    {time: 0, y: 100, dy: null},
-    {time: 1, y: 100, dy: null},
-    {time: 2, y: 100, dy: null},
 ]);
 
 // Going the other direction: if the events are spaced far apart, expressing the answer in
@@ -272,7 +259,7 @@ result = coll.aggregate([
                          sortBy: {time: 1},
                          output: {
                              dy: {
-                                 $derivative: {input: "$y", outputUnit: 'millisecond'},
+                                 $derivative: {input: "$y", unit: 'millisecond'},
                                  window: {documents: [-1, 0]}
                              },
                          }
@@ -286,6 +273,82 @@ assert.sameMembers(result, [
     {time: ISODate("2020-01-01T00:01:00.000Z"), y: 4, dy: -1 / (60 * 1000)},
     {time: ISODate("2020-01-01T00:02:00.000Z"), y: 6, dy: +2 / (60 * 1000)},
     {time: ISODate("2020-01-01T00:03:00.000Z"), y: 5, dy: -1 / (60 * 1000)},
+]);
+
+// When the sortBy field is a mixture of dates and numbers, it's an error:
+// whether or not you specify unit, either the date or the number values
+// will be an invalid type.
+coll.drop();
+assert.commandWorked(coll.insert([
+    {time: ISODate("2020-01-01T00:00:00.000Z"), y: 0},
+    {time: ISODate("2020-01-01T00:01:00.000Z"), y: 0},
+    {time: 12, y: 0},
+    {time: 13, y: 0},
+]));
+assert.throwsWithCode(() => coll.aggregate(derivativeStage()).toArray(), 5624901);
+assert.throwsWithCode(() => coll.aggregate(derivativeStage('second')).toArray(), 5624900);
+
+// Some examples of unbounded windows.
+coll.drop();
+assert.commandWorked(coll.insert([
+    {time: 0, y: 0},
+    {time: 1, y: 1},
+    {time: 2, y: 4},
+    {time: 3, y: 9},
+]));
+result = coll.aggregate([
+                 {
+                     $setWindowFields: {
+                         sortBy: {time: 1},
+                         output: {
+                             dy: {
+                                 $derivative: {input: "$y"},
+                                 window: {
+                                     documents: ['unbounded', 'unbounded'],
+                                 }
+                             }
+                         }
+                     }
+                 },
+                 {$unset: '_id'},
+             ])
+             .toArray();
+assert.sameMembers(result, [
+    {time: 0, y: 0, dy: 9 / 3},
+    {time: 1, y: 1, dy: 9 / 3},
+    {time: 2, y: 4, dy: 9 / 3},
+    {time: 3, y: 9, dy: 9 / 3},
+]);
+
+coll.drop();
+assert.commandWorked(coll.insert([
+    {time: ISODate('2020-01-01T00:00:00Z'), y: 0},
+    {time: ISODate('2020-01-01T00:00:01Z'), y: 1},
+    {time: ISODate('2020-01-01T00:00:02Z'), y: 4},
+    {time: ISODate('2020-01-01T00:00:03Z'), y: 9},
+]));
+result = coll.aggregate([
+                 {
+                     $setWindowFields: {
+                         sortBy: {time: 1},
+                         output: {
+                             dy: {
+                                 $derivative: {input: "$y", unit: 'second'},
+                                 window: {
+                                     documents: ['unbounded', 'unbounded'],
+                                 }
+                             }
+                         }
+                     }
+                 },
+                 {$unset: '_id'},
+             ])
+             .toArray();
+assert.sameMembers(result, [
+    {time: ISODate('2020-01-01T00:00:00Z'), y: 0, dy: 9 / 3},
+    {time: ISODate('2020-01-01T00:00:01Z'), y: 1, dy: 9 / 3},
+    {time: ISODate('2020-01-01T00:00:02Z'), y: 4, dy: 9 / 3},
+    {time: ISODate('2020-01-01T00:00:03Z'), y: 9, dy: 9 / 3},
 ]);
 
 // Example with time-based bounds.
@@ -304,7 +367,7 @@ result = coll.aggregate([
                          sortBy: {time: 1},
                          output: {
                              dy: {
-                                 $derivative: {input: "$y", outputUnit: 'second'},
+                                 $derivative: {input: "$y", unit: 'second'},
                                  window: {range: [-10, 0], unit: 'second'}
                              },
                          }

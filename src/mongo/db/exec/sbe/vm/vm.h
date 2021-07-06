@@ -154,6 +154,24 @@ std::pair<value::TypeTags, value::Value> genericCompare(
         auto rhsCode = value::getBsonJavascriptView(rhsValue);
         return {value::TypeTags::Boolean,
                 value::bitcastFrom<bool>(op(lhsCode.compare(rhsCode), 0))};
+    } else if (lhsTag == value::TypeTags::bsonCodeWScope &&
+               rhsTag == value::TypeTags::bsonCodeWScope) {
+        auto lhsCws = value::getBsonCodeWScopeView(lhsValue);
+        auto rhsCws = value::getBsonCodeWScopeView(rhsValue);
+        if (auto threeWayResult = lhsCws.code.compare(rhsCws.code); threeWayResult != 0) {
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
+        }
+
+        // Special string comparison semantics do not apply to strings nested inside the
+        // CodeWScope scope object, so we do not pass through the string comparator.
+        auto [tag, val] = value::compareValue(value::TypeTags::bsonObject,
+                                              value::bitcastFrom<const char*>(lhsCws.scope),
+                                              value::TypeTags::bsonObject,
+                                              value::bitcastFrom<const char*>(rhsCws.scope));
+        if (tag == value::TypeTags::NumberInt32) {
+            auto result = op(value::bitcastTo<int32_t>(val), 0);
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
+        }
     }
 
     return {value::TypeTags::Nothing, 0};
@@ -277,6 +295,7 @@ enum class Builtin : uint8_t {
     datePartsWeekYear,
     dropFields,
     newArray,
+    newArrayFromRange,
     newObj,
     ksToString,  // KeyString to string
     newKs,       // new KeyString
@@ -315,6 +334,7 @@ enum class Builtin : uint8_t {
     sinh,
     tan,
     tanh,
+    round,
     isMember,
     collIsMember,
     indexOfBytes,
@@ -559,8 +579,6 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> genericNumConvert(value::TypeTags lhsTag,
                                                                       value::Value lhsValue,
                                                                       value::TypeTags rhsTag);
-    std::pair<value::TypeTags, value::Value> genericNumConvertToPreciseInt64(value::TypeTags lhsTag,
-                                                                             value::Value lhsValue);
 
     std::pair<value::TypeTags, value::Value> compare3way(
         value::TypeTags lhsTag,
@@ -625,10 +643,6 @@ private:
                                                                value::TypeTags fieldTag,
                                                                value::Value fieldValue);
 
-    std::tuple<bool, value::TypeTags, value::Value> convertBitTestValue(value::TypeTags maskTag,
-                                                                        value::Value maskValue,
-                                                                        value::TypeTags valueTag,
-                                                                        value::Value value);
     std::tuple<bool, value::TypeTags, value::Value> genericAcos(value::TypeTags operandTag,
                                                                 value::Value operandValue);
     std::tuple<bool, value::TypeTags, value::Value> genericAcosh(value::TypeTags operandTag,
@@ -694,6 +708,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinReplaceOne(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDropFields(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinNewArray(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinNewArrayFromRange(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinNewObj(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinKeyStringToString(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinNewKeyString(ArityType arity);
@@ -731,6 +746,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinSinh(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinTan(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinTanh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRound(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinConcat(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIsMember(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinCollIsMember(ArityType arity);

@@ -56,8 +56,7 @@ assert.lt(preMigrationTimestamp, donorDoc.blockTimestamp);
 waitForRejectReadsBeforeTsFp.off();
 // Wait for the migration to complete.
 jsTest.log("Waiting for migration to complete");
-const stateRes = assert.commandWorked(migrationThread.returnData());
-assert.eq(stateRes.state, TenantMigrationTest.DonorState.kCommitted);
+TenantMigrationTest.assertCommitted(migrationThread.returnData());
 
 tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString);
 
@@ -95,16 +94,15 @@ const migration2Thread =
 migration2Thread.start();
 // At this point, 'donor2Primary' should have both a recipient and donor access blocker. The donor
 // access blocker has entered the blocking state, and the recipient access blocker should
-// still be blocking reads with timestamps < blocktimestamp from the previous migration.
+// still be blocking reads with timestamps < rejectReadsBeforeTimestamp from the previous migration.
 waitAfterCreatingMtab.wait();
 // Check that the current serverStatus reflects the recipient access blocker.
 const mtabStatus = tenantMigrationTest.getTenantMigrationAccessBlocker(donor2Primary, kTenantId);
-assert.eq(mtabStatus.state, TenantMigrationTest.RecipientAccessState.kRejectBefore, mtabStatus);
-assert(mtabStatus.hasOwnProperty("rejectBeforeTimestamp"), mtabStatus);
-assert.eq(mtabStatus["rejectBeforeTimestamp"], donorDoc.blockTimestamp, mtabStatus);
+assert.eq(
+    mtabStatus.recipient.state, TenantMigrationTest.RecipientAccessState.kRejectBefore, mtabStatus);
+assert(mtabStatus.recipient.hasOwnProperty("rejectBeforeTimestamp"), mtabStatus);
 
 // The server value representation of the donor blocking state.
-// TODO (SERVER-55913): Check that serverStatus returns both recipient and donor states.
 const kBlocking = 3;
 const res = assert.commandWorked(
     donor2Primary.adminCommand({currentOp: true, desc: "tenant donor migration"}));
@@ -114,6 +112,11 @@ assert.eq(res.inprog[0].lastDurableState, kBlocking, tojson(res.inprog));
 // Get the block timestamp for this new migration.
 const donorDoc2 =
     donor2Primary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({tenantId: kTenantId});
+assert.eq(
+    mtabStatus.donor.state, TenantMigrationTest.DonorAccessState.kBlockWritesAndReads, mtabStatus);
+assert(mtabStatus.donor.hasOwnProperty("blockTimestamp"), mtabStatus);
+assert.eq(mtabStatus.donor["blockTimestamp"], donorDoc2.blockTimestamp, mtabStatus);
+
 const blockTimestamp2 = donorDoc2.blockTimestamp;
 
 // The donor access blocker should block reads after the blockTimestamp of the new migration.
@@ -146,7 +149,7 @@ newDonorRst.nodes.forEach(node => {
 });
 
 waitAfterCreatingMtab.off();
-migration2Thread.join();
+TenantMigrationTest.assertCommitted(migration2Thread.returnData());
 
 tenantMigrationTest2.stop();
 tenantMigrationTest.stop();

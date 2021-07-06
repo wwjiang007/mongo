@@ -45,7 +45,6 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
@@ -114,8 +113,6 @@ void _finishDropDatabase(OperationContext* opCtx,
     auto databaseHolder = DatabaseHolder::get(opCtx);
     databaseHolder->dropDb(opCtx, db);
     dropPendingGuard.dismiss();
-
-    BucketCatalog::get(opCtx).clear(dbName);
 
     LOGV2(20336,
           "dropDatabase {dbName} - finished, dropped {numCollections} collection(s)",
@@ -333,7 +330,7 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
 
         // The user-supplied wTimeout should be used when waiting for majority write concern.
         const auto& userWriteConcern = opCtx->getWriteConcern();
-        const auto wTimeout = !userWriteConcern.usedDefault
+        const auto wTimeout = !userWriteConcern.isImplicitDefaultWriteConcern()
             ? Milliseconds{userWriteConcern.wTimeout}
             : duration_cast<Milliseconds>(Minutes(10));
 
@@ -358,7 +355,7 @@ Status _dropDatabase(OperationContext* opCtx, const std::string& dbName, bool ab
         auto result = replCoord->awaitReplication(opCtx, awaitOpTime, dropDatabaseWriteConcern);
 
         // If the user-provided write concern is weaker than majority, this is effectively a no-op.
-        if (result.status.isOK() && !userWriteConcern.usedDefault) {
+        if (result.status.isOK() && !userWriteConcern.usedDefaultConstructedWC) {
             LOGV2(20341,
                   "dropDatabase {dbName} waiting for {awaitOpTime} to be replicated at "
                   "{userWriteConcern}",

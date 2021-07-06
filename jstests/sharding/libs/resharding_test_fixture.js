@@ -29,7 +29,8 @@ var ReshardingTest = class {
         reshardInPlace: reshardInPlace = false,
         minimumOperationDurationMS: minimumOperationDurationMS = undefined,
         criticalSectionTimeoutMS: criticalSectionTimeoutMS = 24 * 60 * 60 * 1000 /* 1 day */,
-        commitImplicitly: commitImplicitly = true,
+        periodicNoopIntervalSecs: periodicNoopIntervalSecs = undefined,
+        writePeriodicNoops: writePeriodicNoops = undefined,
     } = {}) {
         // The @private JSDoc comments cause VS Code to not display the corresponding properties and
         // methods in its autocomplete list. This makes it simpler for test authors to know what the
@@ -49,7 +50,9 @@ var ReshardingTest = class {
         /** @private */
         this._criticalSectionTimeoutMS = criticalSectionTimeoutMS;
         /** @private */
-        this._commitImplicitly = commitImplicitly;
+        this._periodicNoopIntervalSecs = periodicNoopIntervalSecs;
+        /** @private */
+        this._writePeriodicNoops = writePeriodicNoops;
 
         // Properties set by setup().
         /** @private */
@@ -71,7 +74,7 @@ var ReshardingTest = class {
         /** @private */
         this._newShardKey = undefined;
         /** @private */
-        this._pauseCoordinatorInSteadyStateFailpoint = undefined;
+        this._pauseCoordinatorBeforeBlockingWrites = undefined;
         /** @private */
         this._pauseCoordinatorBeforeDecisionPersistedFailpoint = undefined;
         /** @private */
@@ -85,35 +88,38 @@ var ReshardingTest = class {
     }
 
     setup() {
-        let config = {setParameter: {featureFlagResharding: true}};
+        const mongosOptions = {setParameter: {}};
+        const configOptions = {setParameter: {}};
+        const rsOptions = {setParameter: {}};
 
         if (this._minimumOperationDurationMS !== undefined) {
-            config.setParameter.reshardingMinimumOperationDurationMillis =
+            configOptions.setParameter.reshardingMinimumOperationDurationMillis =
                 this._minimumOperationDurationMS;
         }
 
         if (this._criticalSectionTimeoutMS !== -1) {
-            config.setParameter.reshardingCriticalSectionTimeoutMillis =
+            configOptions.setParameter.reshardingCriticalSectionTimeoutMillis =
                 this._criticalSectionTimeoutMS;
+        }
+
+        if (this._periodicNoopIntervalSecs !== undefined) {
+            rsOptions.setParameter.periodicNoopIntervalSecs = this._periodicNoopIntervalSecs;
+        }
+
+        if (this._writePeriodicNoops !== undefined) {
+            rsOptions.setParameter.writePeriodicNoops = this._writePeriodicNoops;
         }
 
         this._st = new ShardingTest({
             mongos: 1,
-            mongosOptions: {setParameter: {featureFlagResharding: true}},
+            mongosOptions,
             config: 1,
-            configOptions: config,
+            configOptions,
             shards: this._numShards,
             rs: {nodes: 2},
-            rsOptions: {setParameter: {featureFlagResharding: true}},
+            rsOptions,
             manualAddShard: true,
         });
-
-        if (this._commitImplicitly) {
-            // The failpoint is enabled unless the caller opts out.
-            // This is a temporary situation until reshard can complete on its own.
-            this._canEnterCriticalFailpoint = configureFailPoint(
-                this._st.configRS.getPrimary(), "reshardingCoordinatorCanEnterCriticalImplicitly");
-        }
 
         for (let i = 0; i < this._numShards; ++i) {
             const isDonor = i < this._numDonors;
@@ -177,6 +183,15 @@ var ReshardingTest = class {
         const sourceCollection = this._st.s.getCollection(ns);
         const sourceDB = sourceCollection.getDB();
 
+        assert.commandWorked(sourceDB.adminCommand({enableSharding: sourceDB.getName()}));
+
+        // mongos won't know about the temporary resharding collection and will therefore assume the
+        // collection is unsharded. We configure one of the recipient shards to be the primary shard
+        // for the database so mongos still ends up routing operations to a shard which owns the
+        // temporary resharding collection.
+        this._st.ensurePrimaryShard(sourceDB.getName(), primaryShardName);
+        this._primaryShardName = primaryShardName;
+
         CreateShardedCollectionUtil.shardCollectionWithChunks(
             sourceCollection, shardKeyPattern, chunks);
 
@@ -185,13 +200,6 @@ var ReshardingTest = class {
         const sourceCollectionUUIDString = extractUUIDFromObject(this._sourceCollectionUUID);
 
         this._tempNs = `${sourceDB.getName()}.system.resharding.${sourceCollectionUUIDString}`;
-
-        // mongos won't know about the temporary resharding collection and will therefore assume the
-        // collection is unsharded. We configure one of the recipient shards to be the primary shard
-        // for the database so mongos still ends up routing operations to a shard which owns the
-        // temporary resharding collection.
-        this._st.ensurePrimaryShard(sourceDB.getName(), primaryShardName);
-        this._primaryShardName = primaryShardName;
 
         return sourceCollection;
     }
@@ -219,8 +227,8 @@ var ReshardingTest = class {
         this._newShardKey = Object.assign({}, newShardKeyPattern);
 
         const configPrimary = this._st.configRS.getPrimary();
-        this._pauseCoordinatorInSteadyStateFailpoint =
-            configureFailPoint(configPrimary, "reshardingPauseCoordinatorInSteadyState");
+        this._pauseCoordinatorBeforeBlockingWrites =
+            configureFailPoint(configPrimary, "reshardingPauseCoordinatorBeforeBlockingWrites");
         this._pauseCoordinatorBeforeDecisionPersistedFailpoint =
             configureFailPoint(configPrimary, "reshardingPauseCoordinatorBeforeDecisionPersisted");
         this._pauseCoordinatorBeforeCompletionFailpoint = configureFailPoint(
@@ -313,9 +321,9 @@ var ReshardingTest = class {
     /**
      * Wrapper around invoking a 0-argument function to make test failures less confusing.
      *
-     * This helper attempts to disable the reshardingPauseCoordinatorInSteadyState failpoint when an
-     * exception is thrown to prevent the mongo shell from hanging (really the config server) on top
-     * of having a JavaScript error.
+     * This helper attempts to disable the reshardingPauseCoordinatorBeforeBlockingWrites
+     * failpoint when an exception is thrown to prevent the mongo shell from hanging (really the
+     * config server) on top of having a JavaScript error.
      *
      * This helper attempts to interrupt and join the resharding thread when an exception is thrown
      * to prevent the mongo shell from aborting on top of having a JavaScript error.
@@ -326,7 +334,7 @@ var ReshardingTest = class {
         try {
             fn();
         } catch (duringReshardingError) {
-            for (const fp of [this._pauseCoordinatorInSteadyStateFailpoint,
+            for (const fp of [this._pauseCoordinatorBeforeBlockingWrites,
                               this._pauseCoordinatorBeforeDecisionPersistedFailpoint,
                               this._pauseCoordinatorBeforeCompletionFailpoint]) {
                 try {
@@ -405,16 +413,17 @@ var ReshardingTest = class {
         let performCorrectnessChecks = true;
         if (expectedErrorCode === ErrorCodes.OK) {
             this._callFunctionSafely(() => {
-                // We use the reshardingPauseCoordinatorInSteadyState failpoint so that any
-                // intervening writes performed on the sharded collection (from when the resharding
-                // operation had started until now) are eventually applied by the recipient shards.
-                // We then use the reshardingPauseCoordinatorBeforeDecisionPersisted failpoint to
-                // wait for all of the recipient shards to have applied through all of the oplog
-                // entries from all of the donor shards.
-                if (!this._waitForFailPoint(this._pauseCoordinatorInSteadyStateFailpoint)) {
+                // We use the reshardingPauseCoordinatorBeforeBlockingWrites failpoint so that
+                // any intervening writes performed on the sharded collection (from when the
+                // resharding operation had started until now) are eventually applied by the
+                // recipient shards. We then use the
+                // reshardingPauseCoordinatorBeforeDecisionPersisted failpoint to wait for all of
+                // the recipient shards to have applied through all of the oplog entries from all of
+                // the donor shards.
+                if (!this._waitForFailPoint(this._pauseCoordinatorBeforeBlockingWrites)) {
                     performCorrectnessChecks = false;
                 }
-                this._pauseCoordinatorInSteadyStateFailpoint.off();
+                this._pauseCoordinatorBeforeBlockingWrites.off();
 
                 // A resharding command that returned a failure will not hit the "Decision
                 // Persisted" failpoint. If the command has returned, don't require that the
@@ -440,7 +449,7 @@ var ReshardingTest = class {
             });
         } else {
             this._callFunctionSafely(() => {
-                this._pauseCoordinatorInSteadyStateFailpoint.off();
+                this._pauseCoordinatorBeforeBlockingWrites.off();
                 postCheckConsistencyFn();
                 this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
                 postDecisionPersistedFn();
@@ -461,11 +470,7 @@ var ReshardingTest = class {
             expectedErrorCode: expectedErrorCode
         });
 
-        // TODO SERVER-52838: Call _checkPostState() when donor and recipient shards clean up their
-        // local metadata on error.
-        if (expectedErrorCode === ErrorCodes.OK) {
-            this._checkPostState(expectedErrorCode);
-        }
+        this._checkPostState(expectedErrorCode);
     }
 
     /** @private */
@@ -499,9 +504,6 @@ var ReshardingTest = class {
         // shard would appear as extra documents.
         const tempColl = this._st.s.getCollection(this._tempNs);
         const localReadCursor = tempColl.find().sort({_id: 1});
-        // tempColl.find().readConcern("available") would be an error when the mongo shell is
-        // started with --readMode=legacy. We call runCommand() directly to avoid needing to tag
-        // every test which uses ReshardingTest with "requires_find_command".
         const availableReadCursor =
             new DBCommandCursor(tempColl.getDB(), assert.commandWorked(tempColl.runCommand("find", {
                 sort: {_id: 1},
@@ -556,6 +558,11 @@ var ReshardingTest = class {
         assert.eq([],
                   this._st.config.collections.find({_id: this._tempNs}).toArray(),
                   "expected there to not be a config.collections entry for the temporary" +
+                      " resharding collection");
+
+        assert.eq([],
+                  this._st.config.chunks.find({ns: this._tempNs}).toArray(),
+                  "expected there to not be any config.chunks entry for the temporary" +
                       " resharding collection");
 
         const collEntry = this._st.config.collections.findOne({_id: this._ns});
@@ -657,10 +664,8 @@ var ReshardingTest = class {
         const isAlsoRecipient =
             this._recipientShards().includes(donor) || donor.shardName === this._primaryShardName;
         if (expectedErrorCode === ErrorCodes.OK && !isAlsoRecipient) {
-            assert.eq(
-                null,
-                collInfo,
-                `collection exists on ${donor.shardName} despite resharding having succeeded`);
+            assert(collInfo == null,
+                   `collection exists on ${donor.shardName} despite resharding having succeeded`);
         } else if (expectedErrorCode !== ErrorCodes.OK) {
             assert.neq(
                 null,

@@ -247,6 +247,23 @@ public:
                                          const boost::optional<Timestamp>& validAfter);
 
     /**
+     * Updates metadata in the config.chunks collection so the chunks within the specified key range
+     * are seen merged into a single larger chunk.
+     * If 'validAfter' is not set, this means the commit request came from an older server version,
+     * which is not history-aware.
+     *
+     * Returns a BSON object with the newly produced chunk versions after the migration:
+     *   - shardVersion - The new shard version of the source shard
+     *   - collectionVersion - The new collection version after the commit
+     */
+    StatusWith<BSONObj> commitChunksMerge(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const UUID& requestCollectionUUID,
+                                          const ChunkRange& chunkRange,
+                                          const ShardId& shardId,
+                                          const boost::optional<Timestamp>& validAfter);
+
+    /**
      * Updates metadata in config.chunks collection to show the given chunk in its new shard.
      * If 'validAfter' is not set, this means the commit request came from an older server version,
      * which is not history-aware.
@@ -273,8 +290,14 @@ public:
     /**
      * If a chunk matching 'requestedChunk' exists, bumps the chunk's version to one greater than
      * the current collection version.
+     *
+     * 'nss' and 'collUUID' were added to the ConfigsvrEnsureChunkVersionIsGreaterThanCommand
+     * in 5.0. They are optional in 5.0 because the request may come from a previous version (4.4)
+     * that doesn't pass these extra fields.
      */
     void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
+                                         const boost::optional<NamespaceString>& nss,
+                                         const boost::optional<UUID>& collUUID,
                                          const BSONObj& minKey,
                                          const BSONObj& maxKey,
                                          const ChunkVersion& version);
@@ -312,6 +335,7 @@ public:
      */
     void setAllowMigrationsAndBumpOneChunk(OperationContext* opCtx,
                                            const NamespaceString& nss,
+                                           const boost::optional<UUID>& collectionUUID,
                                            bool allowMigrations);
 
     //
@@ -439,6 +463,18 @@ public:
      */
     void downgradeMetadataToPre50Phase2(OperationContext* opCtx);
 
+    /*
+     * Rename collection metadata as part of a renameCollection operation.
+     *
+     * - Updates the FROM collection entry if the source collection is sharded
+     * - Removes the TO collection entry if the target collection was sharded
+     */
+    void renameShardedMetadata(OperationContext* opCtx,
+                               const NamespaceString& from,
+                               const NamespaceString& to,
+                               const WriteConcernOptions& writeConcern,
+                               boost::optional<CollectionType> optFromCollType);
+
     //
     // For Diagnostics
     //
@@ -465,6 +501,11 @@ private:
      * Builds all the expected indexes on the config server.
      */
     Status _initConfigIndexes(OperationContext* opCtx);
+
+    /**
+     * Ensure that config.collections exists upon configsvr startup
+     */
+    Status _initConfigCollections(OperationContext* opCtx);
 
     /**
      * Used during addShard to determine if there is already an existing shard that matches the
@@ -544,6 +585,8 @@ private:
      */
     StatusWith<ChunkType> _findChunkOnConfig(OperationContext* opCtx,
                                              const NamespaceStringOrUUID& nsOrUUID,
+                                             const OID& epoch,
+                                             const boost::optional<Timestamp>& timestamp,
                                              const BSONObj& key);
 
     /**
@@ -671,6 +714,16 @@ private:
      * taking this.
      */
     Lock::ResourceMutex _kZoneOpLock;
+
+    /**
+     * Lock for local database operations. This should be acquired when executing
+     * 'commitMovePrimary' and 'setFeatureCompatibilityVersion' commands which affect the
+     * config.databases collection. No other locks should be held when locking this. If an operation
+     * needs to take database locks (for example to write to a local collection) those locks should
+     * be taken after taking this.
+     * TODO (SERVER-53283): Remove once version 5.0 has been released.
+     */
+    Lock::ResourceMutex _kDatabaseOpLock;
 };
 
 }  // namespace mongo

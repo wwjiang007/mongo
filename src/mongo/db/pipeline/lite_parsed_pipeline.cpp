@@ -39,6 +39,7 @@ namespace mongo {
 
 ReadConcernSupportResult LiteParsedPipeline::supportsReadConcern(
     repl::ReadConcernLevel level,
+    bool isImplicitDefault,
     boost::optional<ExplainOptions::Verbosity> explain,
     bool enableMajorityReadConcern) const {
     // Start by assuming that we will support both readConcern and cluster-wide default.
@@ -77,7 +78,7 @@ ReadConcernSupportResult LiteParsedPipeline::supportsReadConcern(
         if (!result.readConcernSupport.isOK() && !result.defaultReadConcernPermit.isOK()) {
             break;
         }
-        result.merge(spec->supportsReadConcern(level));
+        result.merge(spec->supportsReadConcern(level, isImplicitDefault));
     }
 
     return result;
@@ -127,62 +128,34 @@ void LiteParsedPipeline::tickGlobalStageCounters() const {
 
 void LiteParsedPipeline::validate(const OperationContext* opCtx,
                                   bool performApiVersionChecks) const {
-    // An internal client could be one of the following :
-    //     - Does not have any transport session
-    //     - The transport session tag is internal
-    auto client = opCtx->getClient();
-    const auto isInternalClient =
-        !client->session() || (client->session()->getTags() & transport::Session::kInternalClient);
-
-    const auto apiParameters = APIParameters::get(opCtx);
-    auto apiVersion = apiParameters.getAPIVersion().value_or("");
-    auto apiStrict = apiParameters.getAPIStrict().value_or(false);
-    using AllowanceFlags = LiteParsedDocumentSource::AllowedWithApiStrict;
 
     int internalUnpackBucketCount = 0;
     for (auto&& stage : _stageSpecs) {
         const auto& stageName = stage->getParseTimeName();
         const auto& stageInfo = LiteParsedDocumentSource::getInfo(stageName);
 
-        uassert(5491300,
-                str::stream() << "The stage '" << stageName << "' is not allowed in user requests",
-                !(stageInfo.allowedWithClientType ==
-                      LiteParsedDocumentSource::AllowedWithClientType::kInternal &&
-                  !isInternalClient));
-
         // Validate that the stage is API version compatible.
-        if (performApiVersionChecks && apiStrict) {
-            switch (stageInfo.allowedWithApiStrict) {
-                case AllowanceFlags::kNeverInVersion1: {
-                    uassert(ErrorCodes::APIStrictError,
-                            str::stream()
-                                << "stage " << stageName
-                                << " is not allowed with 'apiStrict: true' in API Version "
-                                << apiVersion,
-                            apiVersion != "1");
-                    break;
-                }
-                case AllowanceFlags::kInternal: {
-                    uassert(ErrorCodes::APIStrictError,
-                            str::stream()
-                                << "Internal stage " << stageName
-                                << " cannot be specified with 'apiStrict: true' in API Version "
-                                << apiVersion,
-                            isInternalClient);
-                    break;
-                }
-                case AllowanceFlags::kSometimes: {
+        if (performApiVersionChecks) {
+
+            std::function<void(const APIParameters&)> sometimesCallback =
+                [&](const APIParameters& apiParameters) {
+                    tassert(5807600,
+                            "Expected callback only if allowed 'sometimes'",
+                            stageInfo.allowedWithApiStrict == AllowedWithApiStrict::kSometimes);
                     stage->assertPermittedInAPIVersion(apiParameters);
-                    break;
-                }
-                case AllowanceFlags::kAlways: {
-                    break;
-                }
-            }
+                };
+            assertLanguageFeatureIsAllowed(opCtx,
+                                           stageName,
+                                           stageInfo.allowedWithApiStrict,
+                                           stageInfo.allowedWithClientType,
+                                           sometimesCallback);
         }
 
         internalUnpackBucketCount +=
-            (DocumentSourceInternalUnpackBucket::kStageName == stageName) ? 1 : 0;
+            (DocumentSourceInternalUnpackBucket::kStageNameInternal == stageName ||
+             DocumentSourceInternalUnpackBucket::kStageNameExternal == stageName)
+            ? 1
+            : 0;
 
         for (auto&& subPipeline : stage->getSubPipelines()) {
             subPipeline.validate(opCtx, performApiVersionChecks);
@@ -190,10 +163,12 @@ void LiteParsedPipeline::validate(const OperationContext* opCtx,
     }
 
 
-    // Validates that the pipeline contains at most one $_internalUnpackBucket stage.
+    // Validates that the pipeline contains at most one $_internalUnpackBucket or $_unpackBucket
+    // stage.
     uassert(5348302,
             str::stream() << "Encountered pipeline with more than one "
-                          << DocumentSourceInternalUnpackBucket::kStageName << " stage",
+                          << DocumentSourceInternalUnpackBucket::kStageNameInternal << " or "
+                          << DocumentSourceInternalUnpackBucket::kStageNameExternal << " stage",
             internalUnpackBucketCount <= 1);
 }
 

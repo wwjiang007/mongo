@@ -33,50 +33,105 @@
 
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 
-#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_ddl_coordinator_gen.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/future_util.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeRunningCoordinatorInstance);
+
+namespace {
+
+const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
+
+}
 
 ShardingDDLCoordinatorMetadata extractShardingDDLCoordinatorMetadata(const BSONObj& coorDoc) {
     return ShardingDDLCoordinatorMetadata::parse(
         IDLParserErrorContext("ShardingDDLCoordinatorMetadata"), coorDoc);
 }
 
-ShardingDDLCoordinator::ShardingDDLCoordinator(const BSONObj& coorDoc)
-    : _coorMetadata(extractShardingDDLCoordinatorMetadata(coorDoc)),
-      _recoveredFromDisk(_coorMetadata.getRecoveredFromDisk()) {}
+ShardingDDLCoordinator::ShardingDDLCoordinator(ShardingDDLCoordinatorService* service,
+                                               const BSONObj& coorDoc)
+    : _service(service),
+      _coordId(extractShardingDDLCoordinatorMetadata(coorDoc).getId()),
+      _recoveredFromDisk(extractShardingDDLCoordinatorMetadata(coorDoc).getRecoveredFromDisk()),
+      _firstExecution(!_recoveredFromDisk) {}
 
 ShardingDDLCoordinator::~ShardingDDLCoordinator() {
     invariant(_constructionCompletionPromise.getFuture().isReady());
     invariant(_completionPromise.getFuture().isReady());
 }
 
-void ShardingDDLCoordinator::_removeDocument(OperationContext* opCtx) {
-    PersistentTaskStore<ShardingDDLCoordinatorMetadata> store(
-        NamespaceString::kShardingDDLCoordinatorsNamespace);
-    LOGV2_DEBUG(5565601,
-                2,
-                "Removing sharding DDL coordinator document",
-                "coordinatorId"_attr = _coorMetadata.getId());
-    store.remove(
-        opCtx,
-        BSON(ShardingDDLCoordinatorMetadata::kIdFieldName << _coorMetadata.getId().toBSON()),
-        WriteConcerns::kMajorityWriteConcern);
+bool ShardingDDLCoordinator::_removeDocument(OperationContext* opCtx) {
+    DBDirectClient dbClient(opCtx);
+    auto commandResponse = dbClient.runCommand([&] {
+        write_ops::DeleteCommandRequest deleteOp(
+            NamespaceString::kShardingDDLCoordinatorsNamespace);
+
+        deleteOp.setDeletes({[&] {
+            write_ops::DeleteOpEntry entry;
+            entry.setQ(BSON(ShardingDDLCoordinatorMetadata::kIdFieldName << _coordId.toBSON()));
+            entry.setMulti(true);
+            return entry;
+        }()});
+
+        return deleteOp.serialize({});
+    }());
+
+    const auto commandReply = commandResponse->getCommandReply();
+    uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
+
+    BatchedCommandResponse batchedResponse;
+    std::string unusedErrmsg;
+    batchedResponse.parseBSON(commandReply, &unusedErrmsg);
+
+    WriteConcernResult ignoreResult;
+    const WriteConcernOptions majorityWriteConcern{
+        WriteConcernOptions::kMajority,
+        WriteConcernOptions::SyncMode::UNSET,
+        WriteConcernOptions::kWriteConcernTimeoutSharding};
+    auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(opCtx, latestOpTime, majorityWriteConcern, &ignoreResult));
+
+    return batchedResponse.getN() > 0;
+}
+
+
+ExecutorFuture<void> ShardingDDLCoordinator::_acquireLockAsync(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token,
+    StringData resource) {
+    return AsyncTry([this, resource = resource.toString()] {
+               auto opCtxHolder = cc().makeOperationContext();
+               auto* opCtx = opCtxHolder.get();
+               auto distLockManager = DistLockManager::get(opCtx);
+
+               const auto coorName = DDLCoordinatorType_serializer(_coordId.getOperationType());
+               auto dbDistLock = uassertStatusOK(distLockManager->lock(
+                   opCtx, resource, coorName, DistLockManager::kDefaultLockTimeout));
+               _scopedLocks.emplace(dbDistLock.moveToAnotherThread());
+           })
+        .until([this](Status status) { return (!_recoveredFromDisk) || status.isOK(); })
+        .withBackoffBetweenIterations(kExponentialBackoff)
+        .on(**executor, token);
 }
 
 void ShardingDDLCoordinator::interrupt(Status status) {
     LOGV2_DEBUG(5390535,
                 1,
                 "Sharding DDL Coordinator received an interrupt",
-                "coordinatorId"_attr = _coorMetadata.getId(),
+                "coordinatorId"_attr = _coordId,
                 "reason"_attr = redact(status));
-
-    _interrupt(status);
 
     // Resolve any unresolved promises to avoid hanging.
     stdx::lock_guard<Latch> lg(_mutex);
@@ -93,79 +148,127 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
 
     return ExecutorFuture<void>(**executor)
         .then([this, executor, token, anchor = shared_from_this()] {
-            auto opCtxHolder = cc().makeOperationContext();
-            auto* opCtx = opCtxHolder.get();
-            const auto coorName =
-                DDLCoordinatorType_serializer(_coorMetadata.getId().getOperationType());
-
-            auto distLockManager = DistLockManager::get(opCtx);
-            auto dbDistLock = uassertStatusOK(distLockManager->lock(
-                opCtx, nss().db(), coorName, DistLockManager::kDefaultLockTimeout));
-            _scopedLocks.emplace(dbDistLock.moveToAnotherThread());
-
-            if (!nss().isConfigDB() && !_coorMetadata.getRecoveredFromDisk()) {
-                invariant(_coorMetadata.getDatabaseVersion());
+            return _acquireLockAsync(executor, token, nss().db());
+        })
+        .then([this, executor, token, anchor = shared_from_this()] {
+            if (!nss().isConfigDB() && !_recoveredFromDisk) {
+                auto opCtxHolder = cc().makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                invariant(metadata().getDatabaseVersion());
 
                 OperationShardingState::get(opCtx).initializeClientRoutingVersions(
-                    nss(), boost::none /* ChunkVersion */, _coorMetadata.getDatabaseVersion());
+                    nss(), boost::none /* ChunkVersion */, metadata().getDatabaseVersion());
                 // Check under the dbLock if this is still the primary shard for the database
                 DatabaseShardingState::checkIsPrimaryShardForDb(opCtx, nss().db());
             };
-
-            if (!nss().ns().empty()) {
-                auto collDistLock = uassertStatusOK(distLockManager->lock(
-                    opCtx, nss().ns(), coorName, DistLockManager::kDefaultLockTimeout));
-                _scopedLocks.emplace(collDistLock.moveToAnotherThread());
+        })
+        .then([this, executor, token, anchor = shared_from_this()] {
+            if (!nss().coll().empty()) {
+                return _acquireLockAsync(executor, token, nss().ns());
             }
-
-            for (auto& lock : _acquireAdditionalLocks(opCtx)) {
-                _scopedLocks.emplace(lock.moveToAnotherThread());
+            return ExecutorFuture<void>(**executor);
+        })
+        .then([this, executor, token, anchor = shared_from_this()] {
+            auto opCtxHolder = cc().makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+            auto additionalLocks = _acquireAdditionalLocks(opCtx);
+            if (!additionalLocks.empty()) {
+                invariant(additionalLocks.size() == 1);
+                return _acquireLockAsync(executor, token, additionalLocks.front());
             }
-
+            return ExecutorFuture<void>(**executor);
+        })
+        .then([this, anchor = shared_from_this()] {
             stdx::lock_guard<Latch> lg(_mutex);
             if (!_constructionCompletionPromise.getFuture().isReady()) {
                 _constructionCompletionPromise.emplaceValue();
             }
+
+            hangBeforeRunningCoordinatorInstance.pauseWhileSet();
         })
         .onError([this, anchor = shared_from_this()](const Status& status) {
             static constexpr auto& errorMsg =
                 "Failed to complete construction of sharding DDL coordinator";
-            LOGV2_ERROR(5390530,
-                        errorMsg,
-                        "coordinatorId"_attr = _coorMetadata.getId(),
-                        "reason"_attr = redact(status));
-            interrupt(status.withContext(errorMsg));
+            LOGV2_ERROR(
+                5390530, errorMsg, "coordinatorId"_attr = _coordId, "reason"_attr = redact(status));
+
+            stdx::lock_guard<Latch> lg(_mutex);
+            if (!_constructionCompletionPromise.getFuture().isReady()) {
+                _constructionCompletionPromise.setError(status);
+            }
+
             return status;
         })
         .then([this, executor, token, anchor = shared_from_this()] {
-            return _runImpl(executor, token);
+            return AsyncTry([this, executor, token] { return _runImpl(executor, token); })
+                .until([this, token](Status status) {
+                    // Retry until either:
+                    //  - The coordinator succeed
+                    //  - The coordinator failed with non-retryable error determined by the
+                    //  coordinator, or an already known retryable error
+                    //
+                    //  If the token is not cancelled we retry because it could have been generated
+                    //  by a remote node.
+                    if (!status.isOK() && !_completeOnError &&
+                        (status.isA<ErrorCategory::CursorInvalidatedError>() ||
+                         status.isA<ErrorCategory::ShutdownError>() ||
+                         status.isA<ErrorCategory::RetriableError>() ||
+                         status.isA<ErrorCategory::CancellationError>() ||
+                         status.isA<ErrorCategory::ExceededTimeLimitError>() ||
+                         status == ErrorCodes::Interrupted ||
+                         status == ErrorCodes::CommandNotFound) &&
+                        !token.isCanceled()) {
+                        LOGV2_DEBUG(5656000,
+                                    1,
+                                    "Re-executing sharding DDL coordinator",
+                                    "coordinatorId"_attr = _coordId,
+                                    "reason"_attr = redact(status));
+                        _firstExecution = false;
+                        return false;
+                    }
+                    return true;
+                })
+                .withBackoffBetweenIterations(kExponentialBackoff)
+                .on(**executor, CancellationToken::uncancelable());
         })
         .onCompletion([this, anchor = shared_from_this()](const Status& status) {
             auto opCtxHolder = cc().makeOperationContext();
             auto* opCtx = opCtxHolder.get();
 
-            const auto completionStatus = [&] {
-                if (!status.isOK() &&
-                    (status.isA<ErrorCategory::NotPrimaryError>() ||
-                     status.isA<ErrorCategory::ShutdownError>())) {
-                    // Do not remove the coordinator document
-                    // if we had a stepdown related error.
-                    return status;
-                }
+            auto completionStatus = status;
 
+            // Release the coordinator only if we are not stepping down
+            if (!status.isA<ErrorCategory::NotPrimaryError>() &&
+                !status.isA<ErrorCategory::ShutdownError>()) {
                 try {
-                    _removeDocument(opCtx);
-                    return status;
+                    LOGV2(5565601,
+                          "Releasing sharding DDL coordinator",
+                          "coordinatorId"_attr = _coordId);
+
+                    auto session = metadata().getSession();
+                    const auto docWasRemoved = _removeDocument(opCtx);
+
+                    if (!docWasRemoved) {
+                        // Release the instance without interrupting it
+                        _service->releaseInstance(
+                            BSON(ShardingDDLCoordinatorMetadata::kIdFieldName << _coordId.toBSON()),
+                            Status::OK());
+                    }
+
+                    if (status.isOK() && session) {
+                        // Return lsid to the SessionCache. If status is not OK, let the lsid be
+                        // discarded.
+                        SessionCache::get(opCtx)->release(*session);
+                    }
                 } catch (DBException& ex) {
-                    static constexpr auto& errMsg =
-                        "Failed to remove sharding DDL coordinator document";
+                    static constexpr auto errMsg = "Failed to release sharding DDL coordinator";
                     LOGV2_WARNING(5565605,
                                   errMsg,
-                                  "coordinatorId"_attr = _coorMetadata.getId(),
+                                  "coordinatorId"_attr = _coordId,
                                   "error"_attr = redact(ex));
-                    return ex.toStatus(errMsg);
+                    completionStatus = ex.toStatus(errMsg);
                 }
-            }();
+            }
 
             while (!_scopedLocks.empty()) {
                 _scopedLocks.top().assignNewOpCtx(opCtx);
@@ -198,6 +301,51 @@ SemiFuture<void> ShardingDDLCoordinator_NORESILIENT::run(OperationContext* opCtx
         DatabaseShardingState::checkIsPrimaryShardForDb(opCtx, _nss.db());
     }
     return runImpl(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor());
+}
+
+const auto serviceDecorator =
+    ServiceContext::declareDecoration<ShardingDDLCoordinator::SessionCache>();
+
+auto ShardingDDLCoordinator::SessionCache::get(ServiceContext* serviceContext) -> SessionCache* {
+    return &serviceDecorator(serviceContext);
+}
+
+auto ShardingDDLCoordinator::SessionCache::get(OperationContext* opCtx) -> SessionCache* {
+    return get(opCtx->getServiceContext());
+}
+
+ShardingDDLSession ShardingDDLCoordinator::SessionCache::acquire() {
+    const ShardingDDLSession session = [&] {
+        stdx::unique_lock<Latch> lock(_cacheMutex);
+
+        if (!_cache.empty()) {
+            auto session = std::move(_cache.top());
+            _cache.pop();
+            return session;
+        } else {
+            return ShardingDDLSession(makeSystemLogicalSessionId(), TxnNumber(0));
+        }
+    }();
+
+    LOGV2_DEBUG(5565606,
+                2,
+                "Acquired new DDL logical session",
+                "lsid"_attr = session.getLsid(),
+                "txnNumber"_attr = session.getTxnNumber());
+
+    return session;
+}
+
+void ShardingDDLCoordinator::SessionCache::release(ShardingDDLSession session) {
+    LOGV2_DEBUG(5565607,
+                2,
+                "Released DDL logical session",
+                "lsid"_attr = session.getLsid(),
+                "highestUsedTxnNumber"_attr = session.getTxnNumber());
+
+    session.setTxnNumber(session.getTxnNumber() + 1);
+    stdx::unique_lock<Latch> lock(_cacheMutex);
+    _cache.push(std::move(session));
 }
 
 }  // namespace mongo

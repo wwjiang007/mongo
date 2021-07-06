@@ -2,6 +2,9 @@
 // shard key since the document needs to be fetched in order to apply the SHARDING_FILTER stage.
 // @tags: [
 //   assumes_unsharded_collection,
+//   # This test makes assertions about the types of plans produced by the query engine, which has
+//   # changed from the classic engine starting in version 5.0.
+//   requires_fcv_50,
 // ]
 
 /**
@@ -12,11 +15,10 @@
 "use strict";
 
 load("jstests/libs/analyze_plan.js");
+load("jstests/libs/sbe_util.js");             // For checkSBEEnabled.
+load("jstests/aggregation/extras/utils.js");  // arrayEq
 
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSBEEnabled = checkSBEEnabled(db);
 
 let coll = db["projection_dotted_paths"];
 coll.drop();
@@ -42,7 +44,7 @@ assert(isIndexOnly(db, getWinningPlan(explain.queryPlanner)));
 // Project exactly the set of fields in the index but also include _id. Verify that the
 // projection is computed correctly and that the plan cannot be covered.
 resultDoc = coll.findOne({a: 1}, {_id: 1, a: 1, "b.c": 1, "b.d": 1, c: 1});
-assert.eq(resultDoc, {_id: 1, a: 1, b: {c: 1, d: 1}, c: 1});
+assert.docEq(resultDoc, {_id: 1, a: 1, b: {c: 1, d: 1}, c: 1});
 explain = coll.find({a: 1}, {_id: 0, "b.c": 1, c: 1}).explain("queryPlanner");
 explain = coll.find({a: 1}, {_id: 1, a: 1, "b.c": 1, "b.d": 1, c: 1}).explain("queryPlanner");
 assert(isIxscan(db, getWinningPlan(explain.queryPlanner)));
@@ -50,7 +52,7 @@ assert(!isIndexOnly(db, getWinningPlan(explain.queryPlanner)));
 
 // Project a not-indexed field that exists in the collection. The plan should not be covered.
 resultDoc = coll.findOne({a: 1}, {_id: 0, "b.c": 1, "b.e": 1, c: 1});
-assert.eq(resultDoc, {b: {c: 1, e: 1}, c: 1});
+assert.docEq(resultDoc, {b: {c: 1, e: 1}, c: 1});
 explain = coll.find({a: 1}, {_id: 0, "b.c": 1, "b.e": 1, c: 1}).explain("queryPlanner");
 assert(isIxscan(db, getWinningPlan(explain.queryPlanner)));
 assert(!isIndexOnly(db, getWinningPlan(explain.queryPlanner)));
@@ -58,14 +60,14 @@ assert(!isIndexOnly(db, getWinningPlan(explain.queryPlanner)));
 // Project a not-indexed field that does not exist in the collection. The plan should not be
 // covered.
 resultDoc = coll.findOne({a: 1}, {_id: 0, "b.c": 1, "b.z": 1, c: 1});
-assert.eq(resultDoc, {b: {c: 1}, c: 1});
+assert.docEq(resultDoc, {b: {c: 1}, c: 1});
 explain = coll.find({a: 1}, {_id: 0, "b.c": 1, "b.z": 1, c: 1}).explain("queryPlanner");
 assert(isIxscan(db, getWinningPlan(explain.queryPlanner)));
 assert(!isIndexOnly(db, getWinningPlan(explain.queryPlanner)));
 
 // Verify that the correct projection is computed with an idhack query.
 resultDoc = coll.findOne({_id: 1}, {_id: 0, "b.c": 1, "b.e": 1, c: 1});
-assert.eq(resultDoc, {b: {c: 1, e: 1}, c: 1});
+assert.docEq(resultDoc, {b: {c: 1, e: 1}, c: 1});
 explain = coll.find({_id: 1}, {_id: 0, "b.c": 1, "b.e": 1, c: 1}).explain("queryPlanner");
 if (isSBEEnabled) {
     assert(isIxscan(db, getWinningPlan(explain.queryPlanner)), explain);
@@ -125,5 +127,15 @@ assert.eq(resultDoc, {x: {y: {y: null, z: null}, z: null}});
     assert(isIxscan(db, getWinningPlan(explain.queryPlanner)));
     assert(isIndexOnly(db, getWinningPlan(explain.queryPlanner)));
     assert.eq(coll.findOne(filter, {_id: 0, "a.b": 1}), {a: {b: {c: 1, d: 1}}});
+}
+
+{
+    assert(coll.drop());
+
+    assert.commandWorked(coll.insert({a: {x: 1, b: {x: 2}}, b: {c: 3}}));
+
+    assert(arrayEq(coll.find({}, {_id: 0, "a": "$p", "b.c": "$q"}).toArray(), [{b: {}}]));
+    assert(arrayEq(coll.find({}, {_id: 0, "a.x": "$a.x", "a.b.x": "$a.x"}).toArray(),
+                   [{a: {x: 1, b: {x: 1}}}]));
 }
 }());

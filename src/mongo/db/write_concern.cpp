@@ -40,6 +40,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
@@ -92,13 +93,14 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
 
     WriteConcernOptions writeConcern = wcResult.getValue();
 
-    bool clientSuppliedWriteConcern = !writeConcern.usedDefault;
+    // This is the WC extracted from the command object, so the CWWC or implicit default hasn't been
+    // applied yet, which is why "usedDefaultConstructedWC" flag can be used an indicator of whether
+    // the client supplied a WC or not.
+    bool clientSuppliedWriteConcern = !writeConcern.usedDefaultConstructedWC;
     bool customDefaultWasApplied = false;
-    bool getLastErrorDefaultsWasApplied = false;
 
     // If no write concern is specified in the command, then use the cluster-wide default WC (if
-    // there is one), or else the default WC from the ReplSetConfig (which takes the
-    // ReplicationCoordinator mutex).
+    // there is one), or else the default WC {w:1}.
     if (!clientSuppliedWriteConcern) {
         writeConcern = ([&]() {
             // WriteConcern defaults can only be applied on regular replica set members.  Operations
@@ -110,10 +112,20 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                  isTransactionCommand(cmdObj.firstElementFieldName())) &&
                 !opCtx->getClient()->isInDirectClient() && !isInternalClient) {
 
-                auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                     .getDefaultWriteConcern(opCtx);
+                const auto rwcDefaults =
+                    ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
+                auto wcDefault = rwcDefaults.getDefaultWriteConcern();
                 if (wcDefault) {
-                    customDefaultWasApplied = true;
+                    if (repl::feature_flags::gDefaultWCMajority.isEnabled(
+                            serverGlobalParams.featureCompatibility)) {
+                        const auto defaultWriteConcernSource =
+                            rwcDefaults.getDefaultWriteConcernSource();
+                        customDefaultWasApplied = defaultWriteConcernSource &&
+                            defaultWriteConcernSource == DefaultWriteConcernSourceEnum::kGlobal;
+                    } else {
+                        customDefaultWasApplied = true;
+                    }
+
                     LOGV2_DEBUG(22548,
                                 2,
                                 "Applying default writeConcern on {cmdObj_firstElementFieldName} "
@@ -124,35 +136,13 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                     return *wcDefault;
                 }
             }
-
-            auto getLastErrorDefault =
-                repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault();
-            // Since replication configs always include all fields (explicitly setting them to the
-            // default value if necessary), usedDefault and usedDefaultW are always false here, even
-            // if the getLastErrorDefaults has never actually been set (because the
-            // getLastErrorDefaults writeConcern has been explicitly read out of the replset
-            // config).
-            //
-            // In this case, where the getLastErrorDefault is "conceptually unset" (ie. identical to
-            // the implicit server default of { w: 1, wtimeout: 0 }), we would prefer if downstream
-            // code behaved as if no writeConcern had been applied (since in addition to "no"
-            // getLastErrorDefaults, there is no ReadWriteConcernDefaults writeConcern and the user
-            // did not specify a writeConcern).
-            //
-            // Therefore when the getLastErrorDefault is { w: 1, wtimeout: 0 } we force usedDefault
-            // and usedDefaultW to be true.
-            if (getLastErrorDefault.wNumNodes == 1 && getLastErrorDefault.wTimeout == 0) {
-                getLastErrorDefault.usedDefault = true;
-                getLastErrorDefault.usedDefaultW = true;
-            } else {
-                getLastErrorDefaultsWasApplied = true;
-            }
-            return getLastErrorDefault;
+            return writeConcern;
         })();
         if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
             writeConcern.wNumNodes = 1;
         }
-        writeConcern.usedDefaultW = true;
+
+        writeConcern.notExplicitWValue = true;
     }
 
     // It's fine for clients to provide any provenance value to mongod. But if they haven't, then an
@@ -163,8 +153,6 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
             provenance.setSource(ReadWriteConcernProvenance::Source::clientSupplied);
         } else if (customDefaultWasApplied) {
             provenance.setSource(ReadWriteConcernProvenance::Source::customDefault);
-        } else if (getLastErrorDefaultsWasApplied) {
-            provenance.setSource(ReadWriteConcernProvenance::Source::getLastErrorDefaults);
         } else if (opCtx->getClient()->isInDirectClient() || isInternalClient) {
             provenance.setSource(ReadWriteConcernProvenance::Source::internalWriteDefault);
         } else {
@@ -172,7 +160,8 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
         }
     }
 
-    if (writeConcern.usedDefault && serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+    if (!clientSuppliedWriteConcern &&
+        serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         !opCtx->getClient()->isInDirectClient() &&
         (opCtx->getClient()->session() &&
          (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient))) {
@@ -268,7 +257,7 @@ void WriteConcernResult::appendTo(BSONObjBuilder* result) const {
  */
 void waitForNoOplogHolesIfNeeded(OperationContext* opCtx) {
     auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoord->getConfig().votingMembers().size() == 1) {
+    if (replCoord->getConfigVotingMembers().size() == 1) {
         // It is safe for secondaries in multi-node single voter replica sets to truncate writes if
         // there are oplog holes. They can catch up again.
         repl::StorageInterface::get(opCtx)->waitForAllEarlierOplogWritesToBeVisible(

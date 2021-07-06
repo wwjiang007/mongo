@@ -195,6 +195,10 @@ private:
  * setFCV takes this lock in exclusive mode when changing the FCV value.
  */
 Lock::ResourceMutex fcvLock("featureCompatibilityVersionLock");
+// lastFCVUpdateTimestamp contains the latest oplog entry timestamp which updated the FCV.
+// It is reset on rollback.
+Timestamp lastFCVUpdateTimestamp;
+SimpleMutex lastFCVUpdateTimestampMutex;
 
 bool isWriteableStorageEngine() {
     return !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
@@ -224,8 +228,9 @@ void runUpdateCommand(OperationContext* opCtx, const FeatureCompatibilityVersion
             updateSpec.appendBool("upsert", true);
         }
     }
-    auto timeout = opCtx->getWriteConcern().usedDefault ? WriteConcernOptions::kNoTimeout
-                                                        : opCtx->getWriteConcern().wTimeout;
+    auto timeout = opCtx->getWriteConcern().isImplicitDefaultWriteConcern()
+        ? WriteConcernOptions::kNoTimeout
+        : opCtx->getWriteConcern().wTimeout;
     auto newWC = WriteConcernOptions(
         WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, timeout);
     updateCmd.append(WriteConcernOptions::kWriteConcernField, newWC.toBSON());
@@ -241,7 +246,8 @@ void runUpdateCommand(OperationContext* opCtx, const FeatureCompatibilityVersion
 
 boost::optional<BSONObj> FeatureCompatibilityVersion::findFeatureCompatibilityVersionDocument(
     OperationContext* opCtx) {
-    AutoGetOrCreateDb autoDb(opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_IX);
+    AutoGetCollection autoColl(opCtx, NamespaceString::kServerConfigurationNamespace, MODE_IX);
+    invariant(autoColl.ensureDbExists(), NamespaceString::kServerConfigurationNamespace.ns());
 
     const auto query = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName);
     const auto swFcv = repl::StorageInterface::get(opCtx)->findById(
@@ -281,10 +287,10 @@ void FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
         uassert(
             5563501,
             "Shard received a timestamp for phase 1 of the 'setFeatureCompatibilityVersion' "
-            "command which is too old, so the request is discarded. This may indicate that it is a "
-            "request related to a previous invocation of the 'setFeatureCompatibilityVersion' "
-            "command which, for example, was temporarily stuck on a router.",
-            previousTimestamp && previousTimestamp > changeTimestamp);
+            "command which is too old, so the request is discarded. This may indicate that the "
+            "request is related to a previous invocation of the 'setFeatureCompatibilityVersion' "
+            "command which, for example, was temporarily stuck on network.",
+            !previousTimestamp || previousTimestamp <= changeTimestamp);
     } else {
         uassert(5563601,
                 "Cannot transition to fully upgraded or fully downgraded state if the shard is not "
@@ -292,20 +298,19 @@ void FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
                 serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
 
         tassert(5563502,
-                "Shard received a timestamp for phase-2 of the 'setFeatureCompatibilityVersion' "
-                "command that does not match the one received for phase-1, so the request is "
-                "discarded. This may indicate that it is a request related to a previous "
-                "invocation of the 'setFeatureCompatibilityVersion' command which, for example, "
-                "was temporarily stuck on a router.",
-                !previousTimestamp || previousTimestamp < changeTimestamp);
+                "Shard received a request for phase 2 of the 'setFeatureCompatibilityVersion' "
+                "command that cannot be correlated with the previous one, so the request is "
+                "discarded. This may indicate that the request for step 1 was not received or "
+                "processed properly.",
+                previousTimestamp);
 
-        uassert(
-            5563503,
-            "Shard received a timestamp for phase-2 of the 'setFeatureCompatibilityVersion' "
-            "command which is too old, so the request is discarded. This may indicate that it is a "
-            "request related to a previous invocation of the 'setFeatureCompatibilityVersion' "
-            "command which, for example, was temporarily stuck on a router.",
-            previousTimestamp > changeTimestamp);
+        uassert(5563503,
+                "Shard received a timestamp for phase 2 of the 'setFeatureCompatibilityVersion' "
+                "command that does not match the one received for phase 1, so the request is "
+                "discarded. This could indicate, for example, that the request is related to a "
+                "previous invocation of the 'setFeatureCompatibilityVersion' command which, for "
+                "example, was temporarily stuck on network.",
+                previousTimestamp == changeTimestamp);
     }
 }
 
@@ -502,6 +507,19 @@ Lock::ExclusiveLock FeatureCompatibilityVersion::enterFCVChangeRegion(OperationC
     return Lock::ExclusiveLock(opCtx->lockState(), fcvLock);
 }
 
+void FeatureCompatibilityVersion::advanceLastFCVUpdateTimestamp(Timestamp fcvUpdateTimestamp) {
+    stdx::lock_guard lk(lastFCVUpdateTimestampMutex);
+    if (fcvUpdateTimestamp > lastFCVUpdateTimestamp) {
+        lastFCVUpdateTimestamp = fcvUpdateTimestamp;
+    }
+}
+
+void FeatureCompatibilityVersion::clearLastFCVUpdateTimestamp() {
+    stdx::lock_guard lk(lastFCVUpdateTimestampMutex);
+    lastFCVUpdateTimestamp = Timestamp();
+}
+
+
 /**
  * Read-only server parameter for featureCompatibilityVersion.
  */
@@ -522,6 +540,31 @@ void FeatureCompatibilityVersionParameter::append(OperationContext* opCtx,
     auto version = serverGlobalParams.featureCompatibility.getVersion();
     FeatureCompatibilityVersionDocument fcvDoc = fcvTransitions.getFCVDocument(version);
     featureCompatibilityVersionBuilder.appendElements(fcvDoc.toBSON().removeField("_id"));
+    if (!fcvDoc.getTargetVersion()) {
+        // If the FCV has been recently set to the fully upgraded FCV but is not part of the
+        // majority snapshot, then if we do a binary upgrade, we may see the old FCV at startup.  It
+        // is not safe to do oplog application on the new binary at that point.  So we make sure
+        // that when we report the FCV, it is in the majority snapshot.
+        // (The same consideration applies at downgrade, where if a recently-set fully downgraded
+        // FCV is not part of the majority snapshot, the downgraded binary will see the upgrade FCV
+        // and fail.)
+        const auto replCoordinator = repl::ReplicationCoordinator::get(opCtx);
+        const bool isReplSet = replCoordinator &&
+            replCoordinator->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+        auto neededMajorityTimestamp = [] {
+            stdx::lock_guard lk(lastFCVUpdateTimestampMutex);
+            return lastFCVUpdateTimestamp;
+        }();
+        if (isReplSet && !neededMajorityTimestamp.isNull()) {
+            auto status = replCoordinator->awaitTimestampCommitted(opCtx, neededMajorityTimestamp);
+            // If majority reads are not supported, we will take a full snapshot on clean shutdown
+            // and the new FCV will be included, so upgrade is possible.
+            if (status.code() != ErrorCodes::CommandNotSupported)
+                uassertStatusOK(
+                    status.withContext("Most recent 'featureCompatibilityVersion' was not in the "
+                                       "majority snapshot on this node"));
+        }
+    }
 }
 
 Status FeatureCompatibilityVersionParameter::setFromString(const std::string&) {
@@ -534,6 +577,7 @@ Status FeatureCompatibilityVersionParameter::setFromString(const std::string&) {
 FixedFCVRegion::FixedFCVRegion(OperationContext* opCtx)
     : _lk([&] {
           invariant(!opCtx->lockState()->isLocked());
+          invariant(!opCtx->lockState()->isRSTLLocked());
           return Lock::SharedLock(opCtx->lockState(), fcvLock);
       }()) {}
 

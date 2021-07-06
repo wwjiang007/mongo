@@ -11,14 +11,9 @@
 "use strict";
 
 load("jstests/libs/assert_schema_match.js");
+load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
 
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSBEEnabled = checkSBEEnabled(db);
 
 let coll = db.jstests_json_schema;
 coll.drop();
@@ -288,7 +283,7 @@ res = coll.runCommand({
 });
 assert.commandFailedWithCode(res, [ErrorCodes.FailedToParse, 40415]);
 
-// Test that the following whitelisted keywords are verified as strings but otherwise ignored
+// Test that the following allowlisted keywords are verified as strings but otherwise ignored
 // in a top-level schema:
 // - description
 // - title
@@ -308,7 +303,7 @@ let listCollectionsOutput = db.runCommand({listCollections: 1, filter: {name: co
 assert.commandWorked(listCollectionsOutput);
 assert.eq(listCollectionsOutput.cursor.firstBatch[0].options.validator, {$jsonSchema: schema});
 
-// Repeat the test above using the whitelisted metadata keywords.
+// Repeat the test above using the allowlisted metadata keywords.
 coll.drop();
 schema = {
     title: "Test schema",

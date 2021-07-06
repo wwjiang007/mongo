@@ -123,51 +123,6 @@ def _get_bson_type_check(bson_element, ctxt_name, ast_type):
         return '%s.checkAndAssertTypes(%s, %s)' % (ctxt_name, bson_element, type_list)
 
 
-def _get_comparison(field, rel_op, left, right):
-    # type: (ast.Field, str, str, str) -> str
-    """Generate a comparison for a field."""
-    name = _get_field_member_name(field)
-    if "BSONObj" not in field.type.cpp_type:
-        return "%s.%s %s %s.%s" % (left, name, rel_op, right, name)
-
-    access = name
-    if field.optional:
-        access = name + ".get()"
-
-    comp = "(SimpleBSONObjComparator::kInstance.compare(%s.%s, %s.%s) %s 0)" % (left, access, right,
-                                                                                access, rel_op)
-
-    # boost::optional implements the various operator comparisons but we need to reimplement them
-    # for BSONObj
-    if field.optional:
-        if rel_op == "==":
-            # optional values are equal if they do not contain values otherwise compare the values
-            pred = "( (static_cast<bool>(${left}.${name}) == static_cast<bool>(${right}.${name}))" +\
-                " && (!static_cast<bool>(${left}.${name}) || ${comp}) )"
-        elif rel_op == "!=":
-            pred = "( (static_cast<bool>(${left}.${name}) != static_cast<bool>(${right}.${name}))" +\
-                " && (static_cast<bool>(${left}.${name}) && ${comp}) )"
-        elif rel_op == "<":
-            pred = "( static_cast<bool>(${right}.${name}) && (!static_cast<bool>(${left}.${name})" +\
-                " || ${comp}) )"
-
-        comp = common.template_args(pred, name=name, comp=comp, left=left, right=right)
-
-    return comp
-
-
-def _get_comparison_less(fields):
-    # type: (List[ast.Field]) -> str
-    """Generate a less than comparison for a list of fields recursively."""
-    field = fields[0]
-    if len(fields) == 1:
-        return _get_comparison(field, "<", "left", "right")
-
-    return "%s || (!(%s) && (%s))" % (_get_comparison(field, "<", "left", "right"),
-                                      _get_comparison(field, "<", "right", "left"),
-                                      _get_comparison_less(fields[1:]))
-
-
 def _get_all_fields(struct):
     # type: (ast.Struct) -> List[ast.Field]
     """Get a list of all the fields, including the command field."""
@@ -206,57 +161,6 @@ class _FieldUsageCheckerBase(object, metaclass=ABCMeta):
         # type: () -> None
         """Output the code to check for missing fields."""
         pass
-
-
-class _SlowFieldUsageChecker(_FieldUsageCheckerBase):
-    """
-    Check for duplicate fields, and required fields as needed.
-
-    Detects duplicate extra fields.
-    Generates code with a C++ std::set to maintain a set of fields seen while parsing a BSON
-    document. The std::set has O(N lg N) lookup, and allocates memory in the heap.
-    """
-
-    def __init__(self, indented_writer):
-        # type: (writer.IndentedTextWriter) -> None
-        super(_SlowFieldUsageChecker, self).__init__(indented_writer)
-
-        self._writer.write_line('std::set<StringData> usedFields;')
-
-    def add_store(self, field_name):
-        # type: (str) -> None
-        self._writer.write_line('auto push_result = usedFields.insert(%s);' % (field_name))
-        with writer.IndentedScopedBlock(self._writer,
-                                        'if (MONGO_unlikely(push_result.second == false)) {', '}'):
-            self._writer.write_line('ctxt.throwDuplicateField(%s);' % (field_name))
-
-    def add(self, field, bson_element_variable):
-        # type: (ast.Field, str) -> None
-        if not field in self._fields:
-            self._fields.append(field)
-
-    def add_final_checks(self):
-        # type: () -> None
-        for field in self._fields:
-            if (not field.optional) and (not field.ignore) and (not field.chained):
-                pred = 'if (MONGO_unlikely(usedFields.find(%s) == usedFields.end())) {' % \
-                    (_get_field_constant_name(field))
-                with writer.IndentedScopedBlock(self._writer, pred, '}'):
-                    if field.default:
-                        if field.chained_struct_field:
-                            self._writer.write_line('%s.%s(%s);' % (_get_field_member_name(
-                                field.chained_struct_field), _get_field_member_setter_name(field),
-                                                                    field.default))
-                        elif field.type.is_enum:
-                            self._writer.write_line(
-                                '%s = %s::%s;' % (_get_field_member_name(field),
-                                                  field.type.cpp_type, field.default))
-                        else:
-                            self._writer.write_line(
-                                '%s = %s;' % (_get_field_member_name(field), field.default))
-                    else:
-                        self._writer.write_line(
-                            'ctxt.throwMissingField(%s);' % (_get_field_constant_name(field)))
 
 
 def _gen_field_usage_constant(field):
@@ -331,21 +235,38 @@ class _FastFieldUsageChecker(_FieldUsageCheckerBase):
                             self._writer,
                             'if (!usedFields[%s]) {' % (_gen_field_usage_constant(field)), '}'):
                         if field.default:
+                            default_value = (field.type.cpp_type + "::" + field.default) \
+                                if field.type.is_enum else field.default
                             if field.chained_struct_field:
                                 self._writer.write_line(
                                     '%s.%s(%s);' %
                                     (_get_field_member_name(field.chained_struct_field),
-                                     _get_field_member_setter_name(field), field.default))
-                            elif field.type.is_enum:
-                                self._writer.write_line(
-                                    '%s = %s::%s;' % (_get_field_member_name(field),
-                                                      field.type.cpp_type, field.default))
+                                     _get_field_member_setter_name(field), default_value))
                             else:
                                 self._writer.write_line(
-                                    '%s = %s;' % (_get_field_member_name(field), field.default))
+                                    '%s = %s;' % (_get_field_member_name(field), default_value))
                         else:
                             self._writer.write_line(
                                 'ctxt.throwMissingField(%s);' % (_get_field_constant_name(field)))
+
+
+class _SlowFieldUsageChecker(_FastFieldUsageChecker):
+    """
+    Check for duplicate fields, and required fields as needed.
+
+    Generates code with a C++ std::set to maintain a set of fields seen while parsing a BSON
+    document. The std::set has O(N lg N) lookup, and allocates memory in the heap.
+    The fast and slow duplicate/field usage checkers are merged together through
+    inheritance. The fast checker assumes it only needs to check a finite list of
+    fields for duplicates. The slow checker simply uses the fast check for all known
+    fields and a std::set for other fields to detect duplication.
+    """
+
+    def __init__(self, indented_writer, fields):
+        # type: (writer.IndentedTextWriter, List[ast.Field]) -> None
+        super(_SlowFieldUsageChecker, self).__init__(indented_writer, fields)
+
+        self._writer.write_line('std::set<StringData> usedFieldSet;')
 
 
 def _get_field_usage_checker(indented_writer, struct):
@@ -356,7 +277,7 @@ def _get_field_usage_checker(indented_writer, struct):
     if struct.strict:
         return _FastFieldUsageChecker(indented_writer, struct.fields)
 
-    return _SlowFieldUsageChecker(indented_writer)
+    return _SlowFieldUsageChecker(indented_writer, struct.fields)
 
 
 # Turn a python string into a C++ literal.
@@ -446,7 +367,7 @@ class _CppFileWriterBase(object):
     def get_initializer_lambda(self, decl, unused=False, return_type=None):
         # type: (str, bool, str) -> writer.IndentedScopedBlock
         """Generate an indented block lambda initializing an outer scope variable."""
-        prefix = 'MONGO_COMPILER_VARIABLE_UNUSED ' if unused else ''
+        prefix = '[[maybe_unused]] ' if unused else ''
         prefix = prefix + decl + ' = ([]'
         if return_type:
             prefix = prefix + '() -> ' + return_type
@@ -492,6 +413,14 @@ class _CppFileWriterBase(object):
             conditional = conditional + ' constexpr'
 
         return writer.IndentedScopedBlock(self._writer, '%s (%s) {' % (conditional, check_str), '}')
+
+    def _else(self, check_bool):
+        # type: (bool) -> Union[writer.IndentedScopedBlock,writer.EmptyBlock]
+        """Generate an else block if check_bool is true."""
+        if not check_bool:
+            return writer.EmptyBlock()
+
+        return writer.IndentedScopedBlock(self._writer, 'else {', '}')
 
     def _condition(self, condition, preprocessor_only=False):
         # type: (ast.Condition, bool) -> writer.WriterBlock
@@ -817,44 +746,23 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
         # type: (ast.Struct) -> None
         """Generate comparison operators declarations for the type."""
         # pylint: disable=invalid-name
-        sorted_fields = sorted([
-            field for field in struct.fields if (not field.ignore) and field.comparison_order != -1
-        ], key=lambda f: f.comparison_order)
 
-        for rel_op in [('==', " && "), ('!=', " || ")]:
-            self.write_empty_line()
-            decl = common.template_args(
-                "friend bool operator${rel_op}(const ${class_name}& left, const ${class_name}& right) {",
-                rel_op=rel_op[0], class_name=common.title_case(struct.name))
+        with self._block("auto _relopTuple() const {", "}"):
+            sorted_fields = sorted([
+                field
+                for field in struct.fields if (not field.ignore) and field.comparison_order != -1
+            ], key=lambda f: f.comparison_order)
+            self._writer.write_line("return std::tuple({});".format(", ".join(
+                map(lambda f: "idl::relop::Ordering{{{}}}".format(_get_field_member_name(f)),
+                    sorted_fields))))
 
-            with self._block(decl, "}"):
-                self._writer.write_line('return %s;' % (rel_op[1].join(
-                    [_get_comparison(field, rel_op[0], "left", "right")
-                     for field in sorted_fields])))
-
-        decl = common.template_args(
-            "friend bool operator<(const ${class_name}& left, const ${class_name}& right) {",
-            class_name=common.title_case(struct.name))
-        with self._block(decl, "}"):
-            self._writer.write_line("return %s;" % (_get_comparison_less(sorted_fields)))
-
-        decl = common.template_args(
-            "friend bool operator>(const ${class_name}& left, const ${class_name}& right) {",
-            class_name=common.title_case(struct.name))
-        with self._block(decl, "}"):
-            self._writer.write_line('return right < left;')
-
-        decl = common.template_args(
-            "friend bool operator<=(const ${class_name}& left, const ${class_name}& right) {",
-            class_name=common.title_case(struct.name))
-        with self._block(decl, "}"):
-            self._writer.write_line('return !(right < left);')
-
-        decl = common.template_args(
-            "friend bool operator>=(const ${class_name}& left, const ${class_name}& right) {",
-            class_name=common.title_case(struct.name))
-        with self._block(decl, "}"):
-            self._writer.write_line('return !(left < right);')
+        for op in ['==', '!=', '<', '>', '<=', '>=']:
+            with self._block(
+                    common.template_args(
+                        "friend bool operator${op}(const ${cls}& a, const ${cls}& b) {", op=op,
+                        cls=common.title_case(struct.name)), "}"):
+                self._writer.write_line(
+                    common.template_args('return a._relopTuple() ${op} b._relopTuple();', op=op))
 
         self.write_empty_line()
 
@@ -1140,6 +1048,14 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
                 with self.gen_class_declaration_block(struct.cpp_name):
                     self.write_unindented_line('public:')
 
+                    if isinstance(struct, ast.Command):
+                        if struct.reply_type:
+                            # Alias the reply type as a named type for commands
+                            self.gen_type_alias_declaration("Reply",
+                                                            struct.reply_type.type.cpp_type)
+                        else:
+                            self._writer.write_line('using Reply = void;')
+
                     # Generate a sorted list of string constants
                     self.gen_string_constants_declarations(struct)
                     self.write_empty_line()
@@ -1164,10 +1080,6 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
                             self.gen_getter(struct, field)
                             if not struct.immutable and not field.chained_struct_field:
                                 self.gen_setter(field)
-
-                    if struct.generate_comparison_operators:
-                        self.gen_comparison_operators_declarations(struct)
-
                     self.write_unindented_line('protected:')
                     self.gen_protected_serializer_methods(struct)
 
@@ -1179,6 +1091,9 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
                                 self.gen_validators(field)
 
                     self.write_unindented_line('private:')
+
+                    if struct.generate_comparison_operators:
+                        self.gen_comparison_operators_declarations(struct)
 
                     # Write command member variables
                     if isinstance(struct, ast.Command):
@@ -1580,13 +1495,12 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         if default_init:
             for field in struct.fields:
                 needs_init = (field.type and field.type.cpp_type and not field.type.is_array
-                              and cpp_types.is_primitive_scalar_type(field.type.cpp_type))
-
-                if _is_required_serializer_field(field) and needs_init:
+                              and _is_required_serializer_field(field)
+                              and field.cpp_name != 'dbName')
+                if needs_init:
                     initializers.append(
-                        '%s(%s)' % (_get_field_member_name(field),
-                                    cpp_types.get_primitive_scalar_type_default_value(
-                                        field.type.cpp_type)))
+                        '%s(mongo::idl::preparsedValue<decltype(%s)>())' %
+                        (_get_field_member_name(field), _get_field_member_name(field)))
 
         # Serialize the _dbName field second
         initializes_db_name = False
@@ -1694,7 +1608,6 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                     self._writer.write_line('firstFieldFound = true;')
                     self._writer.write_line('continue;')
 
-            field_usage_check.add_store("fieldName")
             self._writer.write_empty_line()
 
             first_field = True
@@ -1721,15 +1634,22 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             # End of for fields
             # Generate strict check for extranous fields
             if struct.strict:
-                with self._block('else {', '}'):
-                    # For commands, check if this a well known command field that the IDL parser
-                    # should ignore regardless of strict mode.
-                    command_predicate = None
-                    if isinstance(struct, ast.Command):
-                        command_predicate = "!mongo::isGenericArgument(fieldName)"
+                # For commands, check if this is a well known command field that the IDL parser
+                # should ignore regardless of strict mode.
+                command_predicate = None
+                if isinstance(struct, ast.Command):
+                    command_predicate = "!mongo::isGenericArgument(fieldName)"
 
+                with self._block('else {', '}'):
                     with self._predicate(command_predicate):
                         self._writer.write_line('ctxt.throwUnknownField(fieldName);')
+            else:
+                with self._else(not first_field):
+                    self._writer.write_line('auto push_result = usedFieldSet.insert(fieldName);')
+                    with writer.IndentedScopedBlock(
+                            self._writer, 'if (MONGO_unlikely(push_result.second == false)) {',
+                            '}'):
+                        self._writer.write_line('ctxt.throwDuplicateField(fieldName);')
 
         # Parse chained structs if not inlined
         # Parse chained types always here
@@ -1760,13 +1680,13 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
                     if struct.command_field.type.cpp_type and cpp_types.is_primitive_scalar_type(
                             struct.command_field.type.cpp_type):
-                        self._writer.write_line('%s localCmdType(%s);' %
-                                                (cpp_type_info.get_storage_type(),
-                                                 cpp_types.get_primitive_scalar_type_default_value(
-                                                     struct.command_field.type.cpp_type)))
+                        self._writer.write_line(
+                            'auto localCmdType = mongo::idl::preparsedValue<%s>();' %
+                            (cpp_type_info.get_storage_type()))
                     else:
                         self._writer.write_line(
-                            '%s localCmdType;' % (cpp_type_info.get_storage_type()))
+                            'auto localCmdType = mongo::idl::preparsedValue<%s>();' %
+                            (cpp_type_info.get_storage_type()))
                     self._writer.write_line(
                         '%s object(localCmdType);' % (common.title_case(struct.cpp_name)))
                 elif struct.namespace in (common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB,
@@ -1777,7 +1697,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 else:
                     assert False, "Missing case"
             else:
-                self._writer.write_line('%s object;' % common.title_case(struct.cpp_name))
+                self._writer.write_line('auto object = mongo::idl::preparsedValue<%s>();' %
+                                        common.title_case(struct.cpp_name))
 
             self._writer.write_line(method_info.get_call('object'))
             self._writer.write_line('return object;')
@@ -1913,9 +1834,17 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
                     # End of for fields
                     # Generate strict check for extranous fields
-                    if struct.strict:
-                        with self._block('else {', '}'):
+                    with self._block('else {', '}'):
+                        if struct.strict:
                             self._writer.write_line('ctxt.throwUnknownField(sequence.name);')
+                        else:
+                            self._writer.write_line(
+                                'auto push_result = usedFieldSet.insert(sequence.name);')
+                            with writer.IndentedScopedBlock(
+                                    self._writer,
+                                    'if (MONGO_unlikely(push_result.second == false)) {', '}'):
+                                self._writer.write_line('ctxt.throwDuplicateField(sequence.name);')
+
                 self._writer.write_empty_line()
 
             # Check for required fields
@@ -2417,9 +2346,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             self._writer.write_line(
                 common.template_args(
                     '${unused} auto* ${alias_var} = new IDLServerParameterDeprecatedAlias(${name}, ${param_var});',
-                    unused='MONGO_COMPILER_VARIABLE_UNUSED',
-                    alias_var='scp_%d_%d' % (param_no, alias_no), name=_encaps(alias),
-                    param_var='scp_%d' % (param_no)))
+                    unused='[[maybe_unused]]', alias_var='scp_%d_%d' % (param_no, alias_no),
+                    name=_encaps(alias), param_var='scp_%d' % (param_no)))
 
     def gen_server_parameters(self, params, header_file_name):
         # type: (List[ast.ServerParameter], str) -> None
@@ -2637,7 +2565,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                             '}'):
                         # If all options are guarded by non-passing #ifdefs, then params will be unused.
                         self._writer.write_line(
-                            'MONGO_COMPILER_VARIABLE_UNUSED const auto& params = optionenvironment::startupOptionsParsed;'
+                            '[[maybe_unused]] const auto& params = optionenvironment::startupOptionsParsed;'
                         )
                         self._gen_config_options_store(spec.configs, False)
 

@@ -224,7 +224,7 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
-        AutoGetOrCreateDb db(opCtx, ns.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, ns.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
         assertCanWrite_inlock(opCtx, ns);
@@ -236,7 +236,8 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
                 unsafeCreateCollection(opCtx);
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions defaultCollectionOptions;
-            uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, defaultCollectionOptions));
+            auto db = autoDb.ensureDbExists();
+            uassertStatusOK(db->userCreateNS(opCtx, ns, defaultCollectionOptions));
             wuow.commit();
         }
     });
@@ -381,6 +382,12 @@ Status checkIfTransactionOnCappedColl(OperationContext* opCtx, const CollectionP
     return Status::OK();
 }
 
+void assertTimeseriesBucketsCollectionNotFound(const NamespaceString& ns) {
+    uasserted(ErrorCodes::NamespaceNotFound,
+              str::stream() << "Buckets collection not found for time-series collection "
+                            << ns.getTimeseriesViewNamespace());
+}
+
 /**
  * Returns true if caller should try to insert more documents. Does nothing else if batch is empty.
  */
@@ -420,8 +427,12 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                 opCtx,
                 wholeOp.getNamespace(),
                 fixLockModeForSystemDotViewsChanges(wholeOp.getNamespace(), MODE_IX));
-            if (collection->getCollection())
+            if (*collection)
                 break;
+
+            if (source == OperationSource::kTimeseries) {
+                assertTimeseriesBucketsCollectionNotFound(wholeOp.getNamespace());
+            }
 
             collection.reset();  // unlock.
             makeCollection(opCtx, wholeOp.getNamespace());
@@ -617,7 +628,8 @@ WriteResult performInserts(OperationContext* opCtx,
 
     for (auto&& doc : wholeOp.getDocuments()) {
         const bool isLastDoc = (&doc == &wholeOp.getDocuments().back());
-        auto fixedDoc = fixDocumentForInsert(opCtx, doc);
+        bool containsDotsAndDollarsField = false;
+        auto fixedDoc = fixDocumentForInsert(opCtx, doc, &containsDotsAndDollarsField);
         const StmtId stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
         const bool wasAlreadyExecuted = opCtx->getTxnNumber() &&
             !opCtx->inMultiDocumentTransaction() &&
@@ -632,6 +644,9 @@ WriteResult performInserts(OperationContext* opCtx,
             // current batch to preserve the error results order.
         } else {
             BSONObj toInsert = fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue());
+
+            if (containsDotsAndDollarsField)
+                dotsAndDollarsFieldsCounters.inserts.increment();
 
             // A time-series insert can combine multiple writes into a single operation, and thus
             // can have multiple statement ids associated with it if it is retryable.
@@ -691,7 +706,8 @@ WriteResult performInserts(OperationContext* opCtx,
 static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                const UpdateRequest& updateRequest,
-                                               OperationSource source) {
+                                               OperationSource source,
+                                               bool* containsDotsAndDollarsField) {
     const ExtensionsCallbackReal extensionsCallback(opCtx, &updateRequest.getNamespaceString());
     ParsedUpdate parsedUpdate(opCtx, &updateRequest, extensionsCallback);
     uassertStatusOK(parsedUpdate.parseRequest());
@@ -717,10 +733,17 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     boost::optional<AutoGetCollection> collection;
     while (true) {
         collection.emplace(opCtx, ns, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
+        if (*collection) {
+            break;
+        }
+
+        if (source == OperationSource::kTimeseries) {
+            assertTimeseriesBucketsCollectionNotFound(ns);
+        }
 
         // If this is an upsert, which is an insert, we must have a collection.
         // An update on a non-existant collection is okay and handled later.
-        if (collection->getCollection() || !updateRequest.isUpsert())
+        if (!updateRequest.isUpsert())
             break;
 
         collection.reset();  // unlock.
@@ -783,6 +806,10 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     result.setNModified(updateResult.numDocsModified);
     result.setUpsertedId(updateResult.upsertedId);
 
+    if (containsDotsAndDollarsField && updateResult.containsDotsAndDollarsField) {
+        *containsDotsAndDollarsField = true;
+    }
+
     return result;
 }
 
@@ -830,7 +857,16 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(
         ++numAttempts;
 
         try {
-            return performSingleUpdateOp(opCtx, ns, request, source);
+            bool containsDotsAndDollarsField = false;
+            const auto ret =
+                performSingleUpdateOp(opCtx, ns, request, source, &containsDotsAndDollarsField);
+
+            if (containsDotsAndDollarsField) {
+                // If it's an upsert, increment 'inserts' metric, otherwise increment 'updates'.
+                dotsAndDollarsFieldsCounters.incrementForUpsert(!ret.getUpsertedId().isEmpty());
+            }
+
+            return ret;
         } catch (ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
             const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
             ParsedUpdate parsedUpdate(opCtx, &request, extensionsCallback);
@@ -1124,7 +1160,7 @@ WriteResult performDeletes(OperationContext* opCtx,
 Status performAtomicTimeseriesWrites(
     OperationContext* opCtx,
     const std::vector<write_ops::InsertCommandRequest>& insertOps,
-    const std::vector<write_ops::UpdateCommandRequest>& updateOps) {
+    const std::vector<write_ops::UpdateCommandRequest>& updateOps) try {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
     invariant(!opCtx->inMultiDocumentTransaction());
     invariant(!insertOps.empty() || !updateOps.empty());
@@ -1138,103 +1174,108 @@ Status performAtomicTimeseriesWrites(
     lastOpFixer.startingOp();
 
     AutoGetCollection coll{opCtx, ns, MODE_IX};
-    invariant(coll);
+    if (!coll) {
+        assertTimeseriesBucketsCollectionNotFound(ns);
+    }
 
     auto curOp = CurOp::get(opCtx);
     curOp->raiseDbProfileLevel(CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
 
     assertCanWrite_inlock(opCtx, ns);
 
-    try {
-        WriteUnitOfWork wuow{opCtx};
+    WriteUnitOfWork wuow{opCtx};
 
-        std::vector<repl::OpTime> oplogSlots;
-        boost::optional<std::vector<repl::OpTime>::iterator> slot;
-        if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, ns)) {
-            oplogSlots = repl::getNextOpTimes(opCtx, insertOps.size() + updateOps.size());
-            slot = oplogSlots.begin();
-        }
-
-        std::vector<InsertStatement> inserts;
-        inserts.reserve(insertOps.size());
-
-        for (auto& op : insertOps) {
-            invariant(op.getDocuments().size() == 1);
-
-            inserts.emplace_back(op.getStmtIds() ? *op.getStmtIds()
-                                                 : std::vector<StmtId>{kUninitializedStmtId},
-                                 op.getDocuments().front(),
-                                 slot ? *(*slot)++ : OplogSlot{});
-        }
-
-        if (!insertOps.empty()) {
-            auto status =
-                coll->insertDocuments(opCtx, inserts.begin(), inserts.end(), &curOp->debug());
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-
-        for (auto& op : updateOps) {
-            invariant(op.getUpdates().size() == 1);
-            auto& update = op.getUpdates().front();
-
-            // TODO (SERVER-56270): Remove handling for non-clustered time-series collections.
-            auto recordId = coll->isClustered()
-                ? record_id_helpers::keyForOID(update.getQ()["_id"].OID())
-                : Helpers::findOne(opCtx, *coll, update.getQ(), false);
-            if (recordId.isNull()) {
-                return {ErrorCodes::TimeseriesBucketCleared, "Could not find time-series bucket"};
-            }
-
-            auto record = coll->getCursor(opCtx)->seekExact(recordId);
-            if (!record) {
-                return {ErrorCodes::TimeseriesBucketCleared, "Could not find time-series bucket"};
-            }
-
-            auto original = record->data.toBson();
-            auto [updated, indexesAffected] =
-                doc_diff::applyDiff(original,
-                                    update.getU().getDiff(),
-                                    &CollectionQueryInfo::get(*coll).getIndexKeys(opCtx));
-
-            CollectionUpdateArgs args;
-            if (const auto& stmtIds = op.getStmtIds()) {
-                args.stmtIds = *stmtIds;
-            }
-            args.preImageDoc = original;
-            args.update = update_oplog_entry::makeDeltaOplogEntry(update.getU().getDiff());
-            args.criteria = update.getQ();
-            args.source = OperationSource::kTimeseries;
-            if (slot) {
-                args.oplogSlot = *(*slot)++;
-                fassert(5481600,
-                        opCtx->recoveryUnit()->setTimestamp(args.oplogSlot->getTimestamp()));
-            }
-
-            coll->updateDocument(
-                opCtx,
-                recordId,
-                Snapshotted<BSONObj>{opCtx->recoveryUnit()->getSnapshotId(), std::move(original)},
-                updated,
-                indexesAffected,
-                &curOp->debug(),
-                &args);
-        }
-
-        if (MONGO_unlikely(failAtomicTimeseriesWrites.shouldFail())) {
-            return {ErrorCodes::FailPointEnabled,
-                    "Failing time-series writes due to failAtomicTimeseriesWrites fail point"};
-        }
-
-        wuow.commit();
-    } catch (const DBException& ex) {
-        return ex.toStatus();
+    std::vector<repl::OpTime> oplogSlots;
+    boost::optional<std::vector<repl::OpTime>::iterator> slot;
+    if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, ns)) {
+        oplogSlots = repl::getNextOpTimes(opCtx, insertOps.size() + updateOps.size());
+        slot = oplogSlots.begin();
     }
+
+    auto participant = TransactionParticipant::get(opCtx);
+    // Since we are manually updating the "lastWriteOpTime" before committing, we'll also need to
+    // manually reset if the storage transaction is aborted.
+    if (slot && participant) {
+        opCtx->recoveryUnit()->onRollback([opCtx] {
+            TransactionParticipant::get(opCtx).setLastWriteOpTime(opCtx, repl::OpTime());
+        });
+    }
+
+    std::vector<InsertStatement> inserts;
+    inserts.reserve(insertOps.size());
+
+    for (auto& op : insertOps) {
+        invariant(op.getDocuments().size() == 1);
+
+        inserts.emplace_back(op.getStmtIds() ? *op.getStmtIds()
+                                             : std::vector<StmtId>{kUninitializedStmtId},
+                             op.getDocuments().front(),
+                             slot ? *(*slot)++ : OplogSlot{});
+    }
+
+    if (!insertOps.empty()) {
+        auto status = coll->insertDocuments(opCtx, inserts.begin(), inserts.end(), &curOp->debug());
+        if (!status.isOK()) {
+            return status;
+        }
+        if (slot && participant) {
+            // Manually sets the timestamp so that the "prevOpTime" field in the oplog entry is
+            // correctly chained to the previous operations.
+            participant.setLastWriteOpTime(opCtx, *(std::prev(*slot)));
+        }
+    }
+
+    for (auto& op : updateOps) {
+        invariant(op.getUpdates().size() == 1);
+        auto& update = op.getUpdates().front();
+
+        invariant(coll->isClustered());
+        auto recordId = record_id_helpers::keyForOID(update.getQ()["_id"].OID());
+
+        auto original = coll->docFor(opCtx, recordId);
+        auto [updated, indexesAffected] =
+            doc_diff::applyDiff(original.value(),
+                                update.getU().getDiff(),
+                                &CollectionQueryInfo::get(*coll).getIndexKeys(opCtx),
+                                static_cast<bool>(repl::tenantMigrationRecipientInfo(opCtx)));
+
+        CollectionUpdateArgs args;
+        if (const auto& stmtIds = op.getStmtIds()) {
+            args.stmtIds = *stmtIds;
+        }
+        args.preImageDoc = original.value();
+        args.update = update_oplog_entry::makeDeltaOplogEntry(update.getU().getDiff());
+        args.criteria = update.getQ();
+        args.source = OperationSource::kTimeseries;
+        if (slot) {
+            args.oplogSlot = **slot;
+            fassert(5481600, opCtx->recoveryUnit()->setTimestamp(args.oplogSlot->getTimestamp()));
+        }
+
+        coll->updateDocument(
+            opCtx, recordId, original, updated, indexesAffected, &curOp->debug(), &args);
+        if (slot) {
+            if (participant) {
+                // Manually sets the timestamp so that the "prevOpTime" field in the oplog entry is
+                // correctly chained to the previous operations.
+                participant.setLastWriteOpTime(opCtx, **slot);
+            }
+            ++(*slot);
+        }
+    }
+
+    if (MONGO_unlikely(failAtomicTimeseriesWrites.shouldFail())) {
+        return {ErrorCodes::FailPointEnabled,
+                "Failing time-series writes due to failAtomicTimeseriesWrites fail point"};
+    }
+
+    wuow.commit();
 
     lastOpFixer.finishedOpSuccessfully();
 
     return Status::OK();
+} catch (const DBException& ex) {
+    return ex.toStatus();
 }
 
 void recordUpdateResultInOpDebug(const UpdateResult& updateResult, OpDebug* opDebug) {

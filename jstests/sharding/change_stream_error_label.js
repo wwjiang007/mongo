@@ -2,9 +2,7 @@
  * Test that a change stream pipeline which encounters a retryable exception responds to the client
  * with an error object that includes the "ResumableChangeStreamError" label.
  * @tags: [
- *   requires_find_command,
  *   requires_sharding,
- *   sbe_incompatible,
  *   uses_change_streams,
  * ]
  */
@@ -42,7 +40,8 @@ const expectedStopShardErrors = [
 
 // First, verify that the 'failGetMoreAfterCursorCheckout' failpoint can effectively exercise the
 // error label generation logic for change stream getMores.
-function testFailGetMoreAfterCursorCheckoutFailpoint({errorCode, expectedLabel}) {
+function testFailGetMoreAfterCursorCheckoutFailpoint({mongos, errorCode, expectedLabel}) {
+    errorCode = ErrorCodes.doMongosRewrite(mongos, errorCode);
     // Activate the failpoint and set the exception that it will throw.
     assert.commandWorked(testDB.adminCommand({
         configureFailPoint: "failGetMoreAfterCursorCheckout",
@@ -70,9 +69,9 @@ function testFailGetMoreAfterCursorCheckoutFailpoint({errorCode, expectedLabel})
 }
 // Test the expected output for both resumable and non-resumable error codes.
 testFailGetMoreAfterCursorCheckoutFailpoint(
-    {errorCode: ErrorCodes.ShutdownInProgress, expectedLabel: true});
+    {mongos: st.s, errorCode: ErrorCodes.ShutdownInProgress, expectedLabel: true});
 testFailGetMoreAfterCursorCheckoutFailpoint(
-    {errorCode: ErrorCodes.FailedToParse, expectedLabel: false});
+    {mongos: st.s, errorCode: ErrorCodes.FailedToParse, expectedLabel: false});
 
 // Now test both aggregate and getMore under conditions of an actual cluster outage. Shard the
 // collection on shard0, split at {_id: 0}, and move the upper chunk to the other shard.

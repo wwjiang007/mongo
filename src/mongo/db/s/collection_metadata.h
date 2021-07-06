@@ -83,14 +83,6 @@ public:
     void throwIfReshardingInProgress(NamespaceString const& nss) const;
 
     /**
-     * The caller should disallow writes when
-     *      1. The coordinator is in the mirroring state, OR
-     *      2. The coordinator is in the decision persisted state, but the UUID is still the
-     *         original UUID.
-     */
-    bool disallowWritesForResharding(const UUID& currentCollectionUUID) const;
-
-    /**
      * Returns the current shard version for the collection or UNSHARDED if it is not sharded.
      *
      * Will throw ShardInvalidatedForTargeting if _thisShardId is marked as stale by
@@ -157,6 +149,10 @@ public:
     bool uuidMatches(UUID uuid) const {
         invariant(isSharded());
         return _cm->uuidMatches(uuid);
+    }
+
+    boost::optional<UUID> getUUID() const {
+        return _cm->getUUID();
     }
 
     /**

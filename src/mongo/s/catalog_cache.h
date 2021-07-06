@@ -35,6 +35,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/type_collection_timeseries_fields_gen.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/read_through_cache.h"
 
@@ -170,17 +171,6 @@ public:
         const NamespaceString& nss,
         const boost::optional<ChunkVersion>& wantedVersion,
         const ShardId& shardId);
-
-    /**
-     * Throws a StaleConfigException if this catalog cache does not have an entry for the given
-     * namespace, or if the entry for the given namespace does not have the same epoch as
-     * 'targetCollectionVersion'. Does not perform any refresh logic. Ignores everything except the
-     * epoch of 'targetCollectionVersion' when performing the check, but needs the entire target
-     * version to throw a StaleConfigException.
-     */
-    void checkEpochOrThrow(const NamespaceString& nss,
-                           const ChunkVersion& targetCollectionVersion,
-                           const ShardId& shardId);
 
     /**
      * Non-blocking method, which invalidates all namespaces which contain data on the specified

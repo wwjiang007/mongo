@@ -32,7 +32,7 @@
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
-#include "mongo/db/s/resharding/resharding_critical_section.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 
@@ -58,10 +58,7 @@ public:
         return NamespaceString::kDonorReshardingOperationsNamespace;
     }
 
-    ThreadPool::Limits getThreadPoolLimits() const override {
-        // TODO Limit the size of ReshardingDonorService thread pool.
-        return ThreadPool::Limits();
-    }
+    ThreadPool::Limits getThreadPoolLimits() const override;
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
 };
@@ -73,10 +70,11 @@ public:
 class ReshardingDonorService::DonorStateMachine final
     : public repl::PrimaryOnlyService::TypedInstance<DonorStateMachine> {
 public:
-    explicit DonorStateMachine(const ReshardingDonorDocument& donorDoc,
+    explicit DonorStateMachine(const ReshardingDonorService* donorService,
+                               const ReshardingDonorDocument& donorDoc,
                                std::unique_ptr<DonorStateMachineExternalState> externalState);
 
-    ~DonorStateMachine();
+    ~DonorStateMachine() = default;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                          const CancellationToken& stepdownToken) noexcept override;
@@ -98,10 +96,34 @@ public:
     void onReshardingFieldsChanges(OperationContext* opCtx,
                                    const TypeCollectionReshardingFields& reshardingFields);
 
+    SharedSemiFuture<void> awaitCriticalSectionAcquired();
+
+    SharedSemiFuture<void> awaitCriticalSectionPromoted();
+
     SharedSemiFuture<void> awaitFinalOplogEntriesWritten();
+
+    /**
+     * Returns a Future fulfilled once the donor locally persists its final state before the
+     * coordinator makes its decision to commit or abort (DonorStateEnum::kError or
+     * DonorStateEnum::kBlockingWrites).
+     */
+    SharedSemiFuture<void> awaitInBlockingWritesOrError() const {
+        return _inBlockingWritesOrError.getFuture();
+    }
 
     static void insertStateDocument(OperationContext* opCtx,
                                     const ReshardingDonorDocument& donorDoc);
+
+    /**
+     * Indicates that the coordinator has persisted a decision. Unblocks the
+     * _coordinatorHasDecisionPersisted promise.
+     */
+    void commit();
+
+    /**
+     * Initiates the cancellation of the resharding operation.
+     */
+    void abort(bool isUserCancelled);
 
 private:
     /**
@@ -128,6 +150,12 @@ private:
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& stepdownToken,
         bool aborted) noexcept;
+
+    /**
+     * The work inside this function must be run regardless of any work on _scopedExecutor ever
+     * running.
+     */
+    Status _runMandatoryCleanup(Status status, const CancellationToken& stepdownToken);
 
     // The following functions correspond to the actions to take at a particular donor state.
     void _transitionToPreparingToDonate();
@@ -170,7 +198,13 @@ private:
     void _updateDonorDocument(DonorShardContext&& newDonorCtx);
 
     // Removes the local donor document from disk.
-    void _removeDonorDocument();
+    void _removeDonorDocument(const CancellationToken& stepdownToken, bool aborted);
+
+    // Accesses the ReshardingMetrics module for this donor's underlying mongod process.
+    ReshardingMetrics* _metrics() const;
+
+    // Starts the metrics subsystem for this donor's underlying mongod process.
+    void _startMetrics();
 
     // Initializes the _abortSource and generates a token from it to return back the caller. If an
     // abort was reported prior to the initialization, automatically cancels the _abortSource before
@@ -179,8 +213,8 @@ private:
     // Should only be called once per lifetime.
     CancellationToken _initAbortSource(const CancellationToken& stepdownToken);
 
-    // Initiates the cancellation of the resharding operation.
-    void _onAbortEncountered(const Status& abortReason);
+    // The primary-only service instance corresponding to the donor instance. Not owned.
+    const ReshardingDonorService* const _donorService;
 
     // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.donor.
@@ -190,6 +224,9 @@ private:
     // The in-memory representation of the mutable portion of the document in
     // config.localReshardingOperations.donor.
     DonorShardContext _donorCtx;
+
+    // This is only used to restore metrics on a stepup.
+    const ReshardingDonorMetrics _donorMetricsToRestore;
 
     const std::unique_ptr<DonorStateMachineExternalState> _externalState;
 
@@ -207,11 +244,11 @@ private:
     // cancels the parent CancellationSource upon stepdown/failover.
     boost::optional<CancellationSource> _abortSource;
 
-    // Holds the unrecoverable error reported by the coordinator that caused the entire resharding
-    // operation to fail.
-    boost::optional<Status> _abortReason;
+    // The identifier associated to the recoverable critical section.
+    const BSONObj _critSecReason;
 
-    boost::optional<ReshardingCriticalSection> _critSec;
+    // It states whether the current node has also the recipient role.
+    const bool _isAlsoRecipient;
 
     // Each promise below corresponds to a state on the donor state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled -
@@ -222,9 +259,15 @@ private:
 
     SharedPromise<void> _finalOplogEntriesWritten;
 
+    SharedPromise<void> _inBlockingWritesOrError;
+
     SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;
+
+    // Promises used to synchronize the acquisition/promotion of the recoverable critical section.
+    SharedPromise<void> _critSecWasAcquired;
+    SharedPromise<void> _critSecWasPromoted;
 };
 
 /**

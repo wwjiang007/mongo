@@ -128,6 +128,23 @@ var $config = (function() {
     };
 
     function setup(db, collName, cluster) {
+        // The default WC is majority and this workload may not be able to satisfy majority writes.
+        if (cluster.isSharded()) {
+            cluster.executeOnMongosNodes(function(db) {
+                assert.commandWorked(db.adminCommand({
+                    setDefaultRWConcern: 1,
+                    defaultWriteConcern: {w: 1},
+                    writeConcern: {w: "majority"}
+                }));
+            });
+        } else if (cluster.isReplication()) {
+            assert.commandWorked(db.adminCommand({
+                setDefaultRWConcern: 1,
+                defaultWriteConcern: {w: 1},
+                writeConcern: {w: "majority"}
+            }));
+        }
+
         assertWhenOwnColl.commandWorked(db.runCommand({create: collName}));
         for (let i = 0; i < this.numIds; ++i) {
             const res = db[collName].insert({_id: i, value: i});

@@ -1,7 +1,6 @@
 // @tags: [
 //   requires_journaling,
 //   requires_persistence,
-//   sbe_incompatible,
 // ]
 (function() {
 "use strict";
@@ -23,6 +22,7 @@ assert.commandWorked(db.adminCommand({
 }));
 
 let coll = db.getCollection(collName);
+assert.commandWorked(db.createCollection(collName, {writeConcern: {w: "majority"}}));
 assert.commandWorked(coll.createIndex({a: 1, b: 1}));
 
 // Corrupt the collection by inserting a document and then deleting it without deleting its index
@@ -47,10 +47,9 @@ function createDanglingIndexEntry(doc) {
     const sessionDB = session.getDatabase(dbName);
     session.startTransaction();
 
-    const error = assert.throws(() => {
+    assert.throwsWithCode(() => {
         sessionDB[collName].find(doc).toArray();
-    });
-    assert.eq(error.code, ErrorCodes.DataCorruptionDetected);
+    }, ErrorCodes.DataCorruptionDetected);
     session.abortTransaction_forTesting();
 }
 

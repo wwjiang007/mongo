@@ -42,20 +42,24 @@
 namespace mongo {
 
 TemporaryKVRecordStore::~TemporaryKVRecordStore() {
-    invariant(_recordStoreHasBeenFinalized);
+    if (!_recordStoreHasBeenFinalized) {
+        LOGV2_WARNING(
+            5643013, "Temporary record store was not finalized", "ident"_attr = _rs->getIdent());
+    }
 }
 
 void TemporaryKVRecordStore::finalizeTemporaryTable(OperationContext* opCtx,
                                                     FinalizationAction action) {
     invariant(!_recordStoreHasBeenFinalized);
 
-    _recordStoreHasBeenFinalized = true;
-
     // This function is added as an onCommit() handler in certain places, at which point it is not
     // possible to get a WriteConflictException. We're only concerned when calling this function in
     // a WriteUnitOfWork that can still be rolled back.
     if (opCtx->recoveryUnit()->isActive()) {
-        opCtx->recoveryUnit()->onRollback([this]() { _recordStoreHasBeenFinalized = false; });
+        opCtx->recoveryUnit()->onCommit(
+            [this](boost::optional<Timestamp>) { _recordStoreHasBeenFinalized = true; });
+    } else {
+        _recordStoreHasBeenFinalized = true;
     }
 
     if (action == FinalizationAction::kKeep)

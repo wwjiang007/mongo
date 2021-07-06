@@ -51,7 +51,7 @@ protected:
         auto coordinatorDoc = ReshardingCoordinatorDocument();
         coordinatorDoc.setRecipientShards(std::move(recipients));
         coordinatorDoc.setDonorShards(std::move(donors));
-        emplaceAbortReasonIfExists(coordinatorDoc, abortReason);
+        emplaceTruncatedAbortReasonIfExists(coordinatorDoc, abortReason);
         return coordinatorDoc;
     }
 
@@ -69,11 +69,10 @@ protected:
         RecipientStateEnum recipientState,
         boost::optional<Timestamp> timestamp = boost::none,
         boost::optional<Status> abortReason = boost::none) {
-        // TODO SERVER-55511: Make the mock state here simulate only one recipient shard errored
-        // locally.
-        return {makeRecipientShard(ShardId{"s1"}, recipientState, abortReason),
+        // The mock state here is simulating only one donor shard having errored locally.
+        return {makeRecipientShard(ShardId{"s1"}, recipientState),
                 makeRecipientShard(ShardId{"s2"}, recipientState, abortReason),
-                makeRecipientShard(ShardId{"s3"}, recipientState, abortReason)};
+                makeRecipientShard(ShardId{"s3"}, recipientState)};
     }
 };
 
@@ -206,14 +205,14 @@ TEST_F(ReshardingCoordinatorObserverTest, onReshardingRecipientsOutOfSync) {
     auto donorShards = makeMockDonorsInState(DonorStateEnum::kDonatingInitialData, Timestamp(1, 1));
     std::vector<RecipientShardEntry> recipientShards0{
         makeRecipientShard(ShardId{"s1"}, RecipientStateEnum::kUnused),
-        makeRecipientShard(ShardId{"s2"}, RecipientStateEnum::kSteadyState)};
+        makeRecipientShard(ShardId{"s2"}, RecipientStateEnum::kStrictConsistency)};
     auto coordinatorDoc0 = makeCoordinatorDocWithRecipientsAndDonors(recipientShards0, donorShards);
     reshardingObserver->onReshardingParticipantTransition(coordinatorDoc0);
     ASSERT_FALSE(fut.isReady());
 
     std::vector<RecipientShardEntry> recipientShards1{
         makeRecipientShard(ShardId{"s1"}, RecipientStateEnum::kApplying),
-        makeRecipientShard(ShardId{"s2"}, RecipientStateEnum::kSteadyState)};
+        makeRecipientShard(ShardId{"s2"}, RecipientStateEnum::kStrictConsistency)};
     auto coordinatorDoc1 = makeCoordinatorDocWithRecipientsAndDonors(recipientShards1, donorShards);
     reshardingObserver->onReshardingParticipantTransition(coordinatorDoc1);
     ASSERT_TRUE(fut.isReady());

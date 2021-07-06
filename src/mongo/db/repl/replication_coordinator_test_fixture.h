@@ -32,6 +32,7 @@
 #include <string>
 
 #include "mongo/db/client.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
@@ -318,6 +319,8 @@ protected:
      * Timeout all heartbeat requests for primary catch-up.
      */
     void simulateCatchUpAbort();
+
+    ReadWriteConcernDefaultsLookupMock lookupMock;
 
 private:
     std::unique_ptr<ReplicationCoordinatorImpl> _repl;

@@ -2,12 +2,11 @@
  * Tests basic index creation and operations on a time-series bucket collection.
  *
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -39,15 +38,11 @@ TimeseriesTest.run((insert) => {
     assert.eq(buckets.length, 1, 'Expected one bucket but found ' + tojson(buckets));
     const bucketId = buckets[0]._id;
     const minTime = buckets[0].control.min.time;
-    const maxTime = buckets[0].control.min.time;
+    const maxTime = buckets[0].control.max.time;
 
     assert.docEq(buckets, bucketsColl.find({_id: bucketId}).toArray());
     let explain = bucketsColl.find({_id: bucketId}).explain();
-    assert(planHasStage(
-               db,
-               explain,
-               TimeseriesTest.supportsClusteredIndexes(db.getMongo()) ? "COLLSCAN" : "IDHACK"),
-           explain);
+    assert(planHasStage(db, explain, "COLLSCAN"), explain);
 
     assert.docEq(buckets, bucketsColl.find({"control.max.time": maxTime}).toArray());
     explain = bucketsColl.find({"control.max.time": minTime}).explain();

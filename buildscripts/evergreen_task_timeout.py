@@ -29,11 +29,25 @@ SPECIFIC_TASK_OVERRIDES = {
         "replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30),
         "replica_sets_update_v1_oplog_jscore_passthrough": timedelta(hours=2, minutes=30),
     },
+    "enterprise-windows-inmem": {
+        "replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30),
+    },
+    "enterprise-windows": {"replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30), },
     "windows-debug-suggested": {
+        "replica_sets_initsync_jscore_passthrough": timedelta(hours=2, minutes=30),
         "replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30),
         "replica_sets_update_v1_oplog_jscore_passthrough": timedelta(hours=2, minutes=30),
     },
-    "windows": {"replica_sets": timedelta(hours=3)},
+    "windows": {
+        "replica_sets": timedelta(hours=3),
+        "replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30),
+    },
+    "ubuntu1804-debug-suggested": {
+        "replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30),
+    },
+    "enterprise-rhel-80-64-bit-coverage": {
+        "replica_sets_jscore_passthrough": timedelta(hours=2, minutes=30),
+    },
 
     # unittests outliers
     # repeated execution runs a suite 10 times
@@ -105,15 +119,15 @@ def determine_timeout(task_name: str, variant: str, idle_timeout: Optional[timed
     return determined_timeout
 
 
-def output_timeout(timeout: timedelta, output_file: Optional[str]) -> None:
+def output_timeout(task_timeout: timedelta, output_file: Optional[str]) -> None:
     """
     Output timeout configuration to the specified location.
 
-    :param timeout: Timeout to output.
+    :param task_timeout: Timeout to output.
     :param output_file: Location of output file to write.
     """
     output = {
-        "timeout_secs": math.ceil(timeout.total_seconds()),
+        "exec_timeout_secs": math.ceil(task_timeout.total_seconds()),
     }
 
     if output_file:
@@ -142,9 +156,9 @@ def main():
     timeout_override = timedelta(seconds=options.timeout) if options.timeout else None
     exec_timeout_override = timedelta(
         seconds=options.exec_timeout) if options.exec_timeout else None
-    timeout = determine_timeout(options.task, options.variant, timeout_override,
-                                exec_timeout_override, options.evg_alias)
-    output_timeout(timeout, options.outfile)
+    task_timeout = determine_timeout(options.task, options.variant, timeout_override,
+                                     exec_timeout_override, options.evg_alias)
+    output_timeout(task_timeout, options.outfile)
 
 
 if __name__ == "__main__":

@@ -44,16 +44,24 @@
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_check_invalidate.h"
+#include "mongo/db/pipeline/document_source_change_stream_check_resumability.h"
+#include "mongo/db/pipeline/document_source_change_stream_ensure_resume_token_present.h"
+#include "mongo/db/pipeline/document_source_change_stream_lookup_post_image.h"
+#include "mongo/db/pipeline/document_source_change_stream_lookup_pre_image.h"
+#include "mongo/db/pipeline/document_source_change_stream_oplog_match.h"
 #include "mongo/db/pipeline/document_source_change_stream_transform.h"
-#include "mongo/db/pipeline/document_source_check_resume_token.h"
+#include "mongo/db/pipeline/document_source_change_stream_unwind_transactions.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/transaction_history_iterator.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/uuid.h"
@@ -206,12 +214,12 @@ public:
                              const std::vector<repl::OplogEntry> transactionEntries = {},
                              std::vector<Document> documentsForLookup = {}) {
         vector<intrusive_ptr<DocumentSource>> stages = makeStages(entry.getEntry().toBSON(), spec);
-        auto closeCursor = stages.back();
+        auto lastStage = stages.back();
 
         getExpCtx()->mongoProcessInterface = std::make_unique<MockMongoInterface>(
             docKeyFields, transactionEntries, std::move(documentsForLookup));
 
-        auto next = closeCursor->getNext();
+        auto next = lastStage->getNext();
         // Match stage should pass the doc down if expectedDoc is given.
         ASSERT_EQ(next.isAdvanced(), static_cast<bool>(expectedDoc));
         if (expectedDoc) {
@@ -219,11 +227,17 @@ public:
         }
 
         if (expectedInvalidate) {
-            next = closeCursor->getNext();
+            next = lastStage->getNext();
             ASSERT_TRUE(next.isAdvanced());
             ASSERT_DOCUMENT_EQ(next.releaseDocument(), *expectedInvalidate);
+
             // Then throw an exception on the next call of getNext().
-            ASSERT_THROWS(closeCursor->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
+            if (!feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV()) {
+                ASSERT_THROWS(lastStage->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
+            } else {
+                ASSERT_THROWS(lastStage->getNext(),
+                              ExceptionFor<ErrorCodes::ChangeStreamInvalidated>);
+            }
         }
     }
 
@@ -238,12 +252,12 @@ public:
         getExpCtx()->mongoProcessInterface =
             std::make_unique<MockMongoInterface>(std::vector<FieldPath>{});
 
-        // This match stage is a DocumentSourceOplogMatch, which we explicitly disallow from
-        // executing as a safety mechanism, since it needs to use the collection-default collation,
-        // even if the rest of the pipeline is using some other collation. To avoid ever executing
-        // that stage here, we'll up-convert it from the non-executable DocumentSourceOplogMatch to
-        // a fully-executable DocumentSourceMatch. This is safe because all of the unit tests will
-        // use the 'simple' collation.
+        // This match stage is a DocumentSourceChangeStreamOplogMatch, which we explicitly disallow
+        // from executing as a safety mechanism, since it needs to use the collection-default
+        // collation, even if the rest of the pipeline is using some other collation. To avoid ever
+        // executing that stage here, we'll up-convert it from the non-executable
+        // DocumentSourceChangeStreamOplogMatch to a fully-executable DocumentSourceMatch. This is
+        // safe because all of the unit tests will use the 'simple' collation.
         auto match = dynamic_cast<DocumentSourceMatch*>(stages[0].get());
         ASSERT(match);
         auto executableMatch = DocumentSourceMatch::create(match->getQuery(), getExpCtx());
@@ -253,22 +267,26 @@ public:
         // Check the oplog entry is transformed correctly.
         auto transform = stages[2].get();
         ASSERT(transform);
-        ASSERT_EQ(string(transform->getSourceName()), DSChangeStream::kStageName);
+        ASSERT(dynamic_cast<DocumentSourceChangeStreamTransform*>(transform));
 
         // Create mock stage and insert at the front of the stages.
         auto mock = DocumentSourceMock::createForTest(D(entry), getExpCtx());
         stages.insert(stages.begin(), mock);
 
+        // Remove the DSEnsureResumeTokenPresent stage since it will swallow the result.
+        auto newEnd = std::remove_if(stages.begin(), stages.end(), [](auto& stage) {
+            return dynamic_cast<DocumentSourceChangeStreamEnsureResumeTokenPresent*>(stage.get());
+        });
+        stages.erase(newEnd, stages.end());
+
         // Wire up the stages by setting the source stage.
-        auto prevStage = stages[0].get();
+        auto prevIt = stages.begin();
         for (auto stageIt = stages.begin() + 1; stageIt != stages.end(); stageIt++) {
             auto stage = (*stageIt).get();
-            // Do not include the check resume token stage since it will swallow the result.
-            if (dynamic_cast<DocumentSourceEnsureResumeTokenPresent*>(stage))
-                continue;
-            stage->setSource(prevStage);
-            prevStage = stage;
+            stage->setSource((*prevIt).get());
+            prevIt = stageIt;
         }
+
         return stages;
     }
 
@@ -389,7 +407,8 @@ public:
                                     preImageOpTime,  // pre-image optime
                                     boost::none,     // post-image optime
                                     boost::none,     // ShardId of resharding recipient
-                                    boost::none)};   // _id
+                                    boost::none,     // _id
+                                    boost::none)};   // needsRetryImage
     }
 
     /**
@@ -416,6 +435,72 @@ public:
             },
         };
         checkTransformation(deltaOplog, expectedUpdateField);
+    }
+};
+
+bool getCSOptimizationFeatureFlagValue() {
+    return feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV();
+}
+
+/**
+ * Runs the tests with feature flag 'featureFlagChangeStreamsOptimization' true and false.
+ */
+class ChangeStreamStageWithDualFeatureFlagValueTest : public ChangeStreamStageTest {
+public:
+    ChangeStreamStageWithDualFeatureFlagValueTest() : ChangeStreamStageTest() {}
+
+
+    void run() {
+        {
+            RAIIServerParameterControllerForTest controller("featureFlagChangeStreamsOptimization",
+                                                            true);
+            ASSERT(getCSOptimizationFeatureFlagValue());
+            ChangeStreamStageTest::run();
+        }
+        {
+            RAIIServerParameterControllerForTest controller("featureFlagChangeStreamsOptimization",
+                                                            false);
+            ASSERT_FALSE(getCSOptimizationFeatureFlagValue());
+            ChangeStreamStageTest::run();
+        }
+    }
+};
+
+class ChangeStreamPipelineOptimizationTest : public ChangeStreamStageTest {
+public:
+    explicit ChangeStreamPipelineOptimizationTest() : ChangeStreamStageTest() {}
+
+    void run() {
+        RAIIServerParameterControllerForTest controller("featureFlagChangeStreamsOptimization",
+                                                        true);
+        ASSERT(getCSOptimizationFeatureFlagValue());
+        ChangeStreamStageTest::run();
+    }
+
+    std::unique_ptr<Pipeline, PipelineDeleter> buildTestPipeline(
+        const std::vector<BSONObj>& rawPipeline) {
+        auto expCtx = getExpCtx();
+        expCtx->ns = NamespaceString("a.collection");
+        expCtx->inMongos = true;
+
+        auto pipeline = Pipeline::parse(rawPipeline, expCtx);
+        pipeline->optimizePipeline();
+
+        return pipeline;
+    }
+
+    void assertStagesNameOrder(std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
+                               const std::vector<std::string> expectedStages) {
+        ASSERT_EQ(pipeline->getSources().size(), expectedStages.size());
+
+        auto stagesItr = pipeline->getSources().begin();
+        auto expectedStagesItr = expectedStages.begin();
+
+        while (expectedStagesItr != expectedStages.end()) {
+            ASSERT_EQ(*expectedStagesItr, stagesItr->get()->getSourceName());
+            ++expectedStagesItr;
+            ++stagesItr;
+        }
     }
 };
 
@@ -472,7 +557,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectUnrecognizedFullDocumentOption) {
                                            .firstElement(),
                                        expCtx),
         AssertionException,
-        40575);
+        ErrorCodes::BadValue);
 }
 
 TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndResumeAfterOptions) {
@@ -566,6 +651,39 @@ TEST_F(ChangeStreamStageTestNoSetup, FailsWithNoReplicationCoordinator) {
     ASSERT_THROWS_CODE(DocumentSourceChangeStream::createFromBson(spec.firstElement(), getExpCtx()),
                        AssertionException,
                        40573);
+}
+
+TEST_F(ChangeStreamStageTest, CannotCreateStageForSystemCollection) {
+    auto expressionContext = getExpCtx();
+    expressionContext->ns = NamespaceString{"db", "system.namespace"};
+    const auto spec = fromjson("{$changeStream: {allowToRunOnSystemNS: false}}");
+    ASSERT_THROWS_CODE(DocumentSourceChangeStream::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ChangeStreamStageTest, CanCreateStageForSystemCollectionWhenAllowToRunOnSystemNSIsTrue) {
+    auto expressionContext = getExpCtx();
+    expressionContext->ns = NamespaceString{"db", "system.namespace"};
+    expressionContext->inMongos = false;
+    const auto spec = fromjson("{$changeStream: {allowToRunOnSystemNS: true}}");
+    DocumentSourceChangeStream::createFromBson(spec.firstElement(), getExpCtx());
+}
+
+TEST_F(ChangeStreamStageTest,
+       CannotCreateStageForSystemCollectionWhenAllowToRunOnSystemNSIsTrueAndInMongos) {
+    auto expressionContext = getExpCtx();
+    expressionContext->ns = NamespaceString{"db", "system.namespace"};
+    expressionContext->inMongos = true;
+    const auto spec = fromjson("{$changeStream: {allowToRunOnSystemNS: true}}");
+    ASSERT_THROWS_CODE(DocumentSourceChangeStream::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ChangeStreamStageTest, CanCreateStageForNonSystemCollection) {
+    const auto spec = fromjson("{$changeStream: {}}");
+    DocumentSourceChangeStream::createFromBson(spec.firstElement(), getExpCtx());
 }
 
 TEST_F(ChangeStreamStageTest, ShowMigrationsFailsOnMongos) {
@@ -1231,7 +1349,8 @@ TEST_F(ChangeStreamStageTest, CommitCommandReturnsOperationsFromPreparedTransact
                                 boost::none,     // pre-image optime
                                 boost::none,     // post-image optime
                                 boost::none,     // ShardId of resharding recipient
-                                boost::none);    // _id
+                                boost::none,     // _id
+                                boost::none);    // needsRetryImage
 
     // When the DocumentSourceChangeStreamTransform sees the "commitTransaction" oplog entry, we
     // expect it to return the insert op within our 'preparedApplyOps' oplog entry.
@@ -1640,7 +1759,8 @@ TEST_F(ChangeStreamStageTest, PreparedTransactionWithMultipleOplogEntries) {
         boost::none,                      // pre-image optime
         boost::none,                      // post-image optime
         boost::none,                      // ShardId of resharding recipient
-        boost::none);                     // _id
+        boost::none,                      // _id
+        boost::none);                     // needsRetryImage
 
     // We do not use the checkTransformation() pattern that other tests use since we expect multiple
     // documents to be returned from one applyOps.
@@ -1775,7 +1895,8 @@ TEST_F(ChangeStreamStageTest, PreparedTransactionEndingWithEmptyApplyOps) {
         boost::none,                      // pre-image optime
         boost::none,                      // post-image optime
         boost::none,                      // ShardId of resharding recipient
-        boost::none);                     // _id
+        boost::none,                      // _id
+        boost::none);                     // needsRetryImage
 
     // We do not use the checkTransformation() pattern that other tests use since we expect multiple
     // documents to be returned from one applyOps.
@@ -1958,13 +2079,24 @@ TEST_F(ChangeStreamStageTest, MatchFiltersNoOp) {
     checkTransformation(noOp, boost::none);
 }
 
-TEST_F(ChangeStreamStageTest, TransformationShouldBeAbleToReParseSerializedStage) {
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest,
+       TransformationShouldBeAbleToReParseSerializedStage) {
     auto expCtx = getExpCtx();
+    const auto featureFlag = getCSOptimizationFeatureFlagValue();
+    const auto serializedStageName =
+        featureFlag ? DocumentSourceChangeStreamTransform::kStageName : DSChangeStream::kStageName;
 
-    auto originalSpec = BSON(DSChangeStream::kStageName << BSONObj());
+    DocumentSourceChangeStreamSpec spec;
+    spec.setStartAtOperationTime(kDefaultTs);
+    auto originalSpec = BSON("" << spec.toBSON());
+
     auto result = DSChangeStream::createFromBson(originalSpec.firstElement(), expCtx);
+
     vector<intrusive_ptr<DocumentSource>> allStages(std::begin(result), std::end(result));
-    ASSERT_EQ(allStages.size(), 5UL);
+
+    const size_t changeStreamStageSize = featureFlag ? 5 : 6;
+    ASSERT_EQ(allStages.size(), changeStreamStageSize);
+
     auto stage = allStages[2];
     ASSERT(dynamic_cast<DocumentSourceChangeStreamTransform*>(stage.get()));
 
@@ -1976,7 +2108,8 @@ TEST_F(ChangeStreamStageTest, TransformationShouldBeAbleToReParseSerializedStage
     ASSERT_EQ(serialization.size(), 1UL);
     ASSERT_EQ(serialization[0].getType(), BSONType::Object);
     auto serializedDoc = serialization[0].getDocument();
-    ASSERT_BSONOBJ_EQ(serializedDoc.toBson(), originalSpec);
+    ASSERT_BSONOBJ_EQ(serializedDoc[serializedStageName].getDocument().toBson(),
+                      originalSpec[""].Obj());
 
     //
     // Create a new stage from the serialization. Serialize the new stage and confirm that it is
@@ -1985,17 +2118,174 @@ TEST_F(ChangeStreamStageTest, TransformationShouldBeAbleToReParseSerializedStage
     auto serializedBson = serializedDoc.toBson();
     auto roundTripped = Pipeline::create(
         DSChangeStream::createFromBson(serializedBson.firstElement(), expCtx), expCtx);
-
     auto newSerialization = roundTripped->serialize();
 
-    ASSERT_EQ(newSerialization.size(), 1UL);
-    ASSERT_VALUE_EQ(newSerialization[0], serialization[0]);
+    // When optimiziation is enabled, we should serialize all the internal stages.
+    if (featureFlag) {
+        ASSERT_EQ(newSerialization.size(), 5UL);
+
+        // DSCSTransform stage should be the third stage after DSCSOplogMatch and
+        // DSCSUnwindTransactions stages.
+        ASSERT_VALUE_EQ(newSerialization[2], serialization[0]);
+    } else {
+        ASSERT_EQ(newSerialization.size(), 1UL);
+        ASSERT_VALUE_EQ(newSerialization[0], serialization[0]);
+    }
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest,
+       DSCSTransformStageEmptySpecSerializeResumeAfter) {
+    auto expCtx = getExpCtx();
+    auto featureFlag = getCSOptimizationFeatureFlagValue();
+    const auto serializedStageName =
+        featureFlag ? DocumentSourceChangeStreamTransform::kStageName : DSChangeStream::kStageName;
+
+    auto originalSpec = BSON(DSChangeStream::kStageName << BSONObj());
+
+    // Verify that the 'initialPostBatchResumeToken' is populated while parsing.
+    ASSERT(expCtx->initialPostBatchResumeToken.isEmpty());
+    ON_BLOCK_EXIT([&expCtx] {
+        // Reset for the next run.
+        expCtx->initialPostBatchResumeToken = BSONObj();
+    });
+
+    auto result = DSChangeStream::createFromBson(originalSpec.firstElement(), expCtx);
+    ASSERT(!expCtx->initialPostBatchResumeToken.isEmpty());
+
+    vector<intrusive_ptr<DocumentSource>> allStages(std::begin(result), std::end(result));
+    ASSERT_EQ(allStages.size(), 5);
+    auto transformStage = allStages[2];
+    ASSERT(dynamic_cast<DocumentSourceChangeStreamTransform*>(transformStage.get()));
+
+
+    // Verify that an additional start point field is populated while serializing.
+    vector<Value> serialization;
+    transformStage->serializeToArray(serialization);
+    ASSERT_EQ(serialization.size(), 1UL);
+    ASSERT_EQ(serialization[0].getType(), BSONType::Object);
+    ASSERT(!serialization[0]
+                .getDocument()[serializedStageName]
+                .getDocument()[featureFlag
+                                   ? DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName
+                                   : DocumentSourceChangeStreamSpec::kResumeAfterFieldName]
+                .missing());
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSTransformStageWithResumeTokenSerialize) {
+    auto expCtx = getExpCtx();
+    const auto serializedStageName = getCSOptimizationFeatureFlagValue()
+        ? DocumentSourceChangeStreamTransform::kStageName
+        : DSChangeStream::kStageName;
+
+    DocumentSourceChangeStreamSpec spec;
+    spec.setResumeAfter(ResumeToken::parse(makeResumeToken(kDefaultTs, testUuid())));
+    auto originalSpec = BSON("" << spec.toBSON());
+
+    // Verify that the 'initialPostBatchResumeToken' is populated while parsing.
+    ASSERT(expCtx->initialPostBatchResumeToken.isEmpty());
+    ON_BLOCK_EXIT([&expCtx] {
+        // Reset for the next run.
+        expCtx->initialPostBatchResumeToken = BSONObj();
+    });
+
+    auto stage =
+        DocumentSourceChangeStreamTransform::createFromBson(originalSpec.firstElement(), expCtx);
+    ASSERT(!expCtx->initialPostBatchResumeToken.isEmpty());
+
+    vector<Value> serialization;
+    stage->serializeToArray(serialization);
+    ASSERT_EQ(serialization.size(), 1UL);
+    ASSERT_EQ(serialization[0].getType(), BSONType::Object);
+    ASSERT_BSONOBJ_EQ(serialization[0].getDocument()[serializedStageName].getDocument().toBson(),
+                      originalSpec[""].Obj());
+}
+
+template <typename Stage, typename StageSpec>
+void validateDocumentSourceStageSerialization(
+    StageSpec spec, BSONObj specAsBSON, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto stage = Stage::createFromBson(specAsBSON.firstElement(), expCtx);
+    vector<Value> serialization;
+    stage->serializeToArray(serialization);
+    if (getCSOptimizationFeatureFlagValue()) {
+        ASSERT_EQ(serialization.size(), 1UL);
+        ASSERT_EQ(serialization[0].getType(), BSONType::Object);
+        ASSERT_BSONOBJ_EQ(serialization[0].getDocument().toBson(),
+                          BSON(Stage::kStageName << spec.toBSON()));
+    } else {
+        ASSERT(serialization.empty());
+    }
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSOplogMatchStageSerialization) {
+    auto expCtx = getExpCtx();
+
+    DocumentSourceChangeStreamOplogMatchSpec spec;
+    auto dummyFilter = BSON("a" << 1);
+    spec.setFilter(dummyFilter);
+    auto stageSpecAsBSON = BSON("" << spec.toBSON());
+
+    validateDocumentSourceStageSerialization<DocumentSourceChangeStreamOplogMatch>(
+        std::move(spec), stageSpecAsBSON, expCtx);
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSUnwindTransactionStageSerialization) {
+    auto expCtx = getExpCtx();
+
+    std::string nsRegex = "*.ns";
+    DocumentSourceChangeStreamUnwindTransactionSpec spec(nsRegex);
+    auto stageSpecAsBSON = BSON("" << spec.toBSON());
+
+    validateDocumentSourceStageSerialization<DocumentSourceChangeStreamUnwindTransaction>(
+        std::move(spec), stageSpecAsBSON, expCtx);
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSCheckInvalidateStageSerialization) {
+    auto expCtx = getExpCtx();
+
+    DocumentSourceChangeStreamCheckInvalidateSpec spec;
+    spec.setStartAfterInvalidate(ResumeToken::parse(makeResumeToken(
+        kDefaultTs, testUuid(), Value(), ResumeTokenData::FromInvalidate::kFromInvalidate)));
+    auto stageSpecAsBSON = BSON("" << spec.toBSON());
+
+    validateDocumentSourceStageSerialization<DocumentSourceChangeStreamCheckInvalidate>(
+        std::move(spec), stageSpecAsBSON, expCtx);
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSResumabilityStageSerialization) {
+    auto expCtx = getExpCtx();
+
+    DocumentSourceChangeStreamCheckResumabilitySpec spec;
+    spec.setResumeToken(ResumeToken::parse(makeResumeToken(kDefaultTs, testUuid())));
+    auto stageSpecAsBSON = BSON("" << spec.toBSON());
+
+    validateDocumentSourceStageSerialization<DocumentSourceChangeStreamCheckResumability>(
+        std::move(spec), stageSpecAsBSON, expCtx);
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSLookupChangePreImageStageSerialization) {
+    auto expCtx = getExpCtx();
+
+    DocumentSourceChangeStreamLookUpPreImageSpec spec(FullDocumentBeforeChangeModeEnum::kRequired);
+    auto stageSpecAsBSON = BSON("" << spec.toBSON());
+
+    validateDocumentSourceStageSerialization<DocumentSourceChangeStreamLookupPreImage>(
+        std::move(spec), stageSpecAsBSON, expCtx);
+}
+
+TEST_F(ChangeStreamStageWithDualFeatureFlagValueTest, DSCSLookupChangePostImageStageSerialization) {
+    auto expCtx = getExpCtx();
+
+    DocumentSourceChangeStreamLookUpPostImageSpec spec(FullDocumentModeEnum::kUpdateLookup);
+    auto stageSpecAsBSON = BSON("" << spec.toBSON());
+
+    validateDocumentSourceStageSerialization<DocumentSourceChangeStreamLookupPostImage>(
+        std::move(spec), stageSpecAsBSON, expCtx);
 }
 
 TEST_F(ChangeStreamStageTest, CloseCursorOnInvalidateEntries) {
     OplogEntry dropColl = createCommand(BSON("drop" << nss.coll()), testUuid());
     auto stages = makeStages(dropColl);
-    auto closeCursor = stages.back();
+    auto lastStage = stages.back();
 
     Document expectedDrop{
         {DSChangeStream::kIdField, makeResumeToken(kDefaultTs, testUuid())},
@@ -2011,26 +2301,35 @@ TEST_F(ChangeStreamStageTest, CloseCursorOnInvalidateEntries) {
         {DSChangeStream::kClusterTimeField, kDefaultTs},
     };
 
-    auto next = closeCursor->getNext();
+    auto next = lastStage->getNext();
     // Transform into drop entry.
     ASSERT_DOCUMENT_EQ(next.releaseDocument(), expectedDrop);
-    next = closeCursor->getNext();
+    next = lastStage->getNext();
     // Transform into invalidate entry.
     ASSERT_DOCUMENT_EQ(next.releaseDocument(), expectedInvalidate);
+
     // Then throw an exception on the next call of getNext().
-    ASSERT_THROWS(closeCursor->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
+    if (!feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV()) {
+        ASSERT_THROWS(lastStage->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
+    } else {
+        ASSERT_THROWS(lastStage->getNext(), ExceptionFor<ErrorCodes::ChangeStreamInvalidated>);
+    }
 }
 
 TEST_F(ChangeStreamStageTest, CloseCursorEvenIfInvalidateEntriesGetFilteredOut) {
     OplogEntry dropColl = createCommand(BSON("drop" << nss.coll()), testUuid());
     auto stages = makeStages(dropColl);
-    auto closeCursor = stages.back();
+    auto lastStage = stages.back();
     // Add a match stage after change stream to filter out the invalidate entries.
     auto match = DocumentSourceMatch::create(fromjson("{operationType: 'insert'}"), getExpCtx());
-    match->setSource(closeCursor.get());
+    match->setSource(lastStage.get());
 
     // Throw an exception on the call of getNext().
-    ASSERT_THROWS(match->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
+    if (!feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV()) {
+        ASSERT_THROWS(match->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
+    } else {
+        ASSERT_THROWS(match->getNext(), ExceptionFor<ErrorCodes::ChangeStreamInvalidated>);
+    }
 }
 
 TEST_F(ChangeStreamStageTest, DocumentKeyShouldIncludeShardKeyFromResumeToken) {
@@ -2197,14 +2496,13 @@ TEST_F(ChangeStreamStageTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
                         BSON("x" << 2 << "_id" << 1),
                         ResumeTokenData::FromInvalidate::kFromInvalidate);
 
-    ASSERT_THROWS_CODE(DSChangeStream::createFromBson(
-                           BSON(DSChangeStream::kStageName
-                                << BSON("resumeAfter" << resumeTokenInvalidate
-                                                      << "startAtOperationTime" << kDefaultTs))
-                               .firstElement(),
-                           expCtx),
-                       AssertionException,
-                       ErrorCodes::InvalidResumeToken);
+    ASSERT_THROWS_CODE(
+        DSChangeStream::createFromBson(
+            BSON(DSChangeStream::kStageName << BSON("resumeAfter" << resumeTokenInvalidate))
+                .firstElement(),
+            expCtx),
+        AssertionException,
+        ErrorCodes::InvalidResumeToken);
 }
 
 TEST_F(ChangeStreamStageTest, UsesResumeTokenAsSortKeyIfNeedsMergeIsFalse) {
@@ -3041,6 +3339,514 @@ TEST_F(ChangeStreamStageDBTest, StartAfterSucceedsEvenIfResumeTokenDoesNotContai
         expectedInsert,
         {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
         BSON("$changeStream" << BSON("startAfter" << resumeToken)));
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleMatch) {
+    //
+    // Tests that the single '$match' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {
+        fromjson("{$changeStream: {}}"),
+        fromjson("{$match: {operationType: 'insert'}}"),
+    };
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$match",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleMatch) {
+    //
+    // Tests that multiple '$match' gets merged and promoted before the
+    // '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$match: {operationType: 'insert'}}"),
+                                              fromjson("{$match: {operationType: 'delete'}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$match",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleMatchAndResumeToken) {
+    //
+    // Tests that multiple '$match' gets merged and promoted before the
+    // '$_internalUpdateOnAddShard' if resume token if present.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)),
+        BSON("$match" << BSON("operationType"
+                              << "insert")),
+        BSON("$match" << BSON("operationType"
+                              << "insert"))};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$match",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleProject) {
+    //
+    // Tests that the single'$project' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$project: {operationType: 1}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleProject) {
+    //
+    // Tests that multiple '$project' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$project: {operationType: 1}}"),
+                                              fromjson("{$project: {fullDocument: 1}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$project",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleProjectAndResumeToken) {
+    //
+    // Tests that multiple '$project' gets promoted before the '$_internalUpdateOnAddShard' if
+    // resume token is present.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)),
+        BSON("$project" << BSON("operationType" << 1)),
+        BSON("$project" << BSON("fullDocument" << 1))};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$project",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithProjectMatchAndResumeToken) {
+    //
+    // Tests that a '$project' followed by a '$match' gets optimized and they get promoted before
+    // the '$_internalUpdateOnAddShard'.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)),
+        BSON("$project" << BSON("operationType" << 1)),
+        BSON("$match" << BSON("operationType"
+                              << "insert"))};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$match",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleUnset) {
+    //
+    // Tests that the single'$unset' gets promoted before the '$_internalUpdateOnAddShard' as
+    // '$project'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$unset: 'operationType'}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleUnset) {
+    //
+    // Tests that multiple '$unset' gets promoted before the '$_internalUpdateOnAddShard' as
+    // '$project'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$unset: 'operationType'}"),
+                                              fromjson("{$unset: 'fullDocument'}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$project",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithUnsetAndResumeToken) {
+    //
+    // Tests that the '$unset' gets promoted before the '$_internalUpdateOnAddShard' as '$project'
+    // even if resume token is present.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {BSON("$changeStream"
+                                                   << BSON("resumeAfter" << resumeToken)),
+                                              BSON("$unset"
+                                                   << "operationType")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$project",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleAddFields) {
+    //
+    // Tests that the single'$addFields' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$addFields: {stockPrice: 100}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$addFields",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleAddFields) {
+    //
+    // Tests that multiple '$addFields' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$addFields: {stockPrice: 100}}"),
+                                              fromjson("{$addFields: {quarter: 'Q1'}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$addFields",
+                           "$addFields",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithAddFieldsAndResumeToken) {
+    //
+    // Tests that the '$addFields' gets promoted before the '$_internalUpdateOnAddShard' if
+    // resume token is present.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)),
+        BSON("$addFields" << BSON("stockPrice" << 100))};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$addFields",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleSet) {
+    //
+    // Tests that the single'$set' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$set: {stockPrice: 100}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$set",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithMultipleSet) {
+    //
+    // Tests that multiple '$set' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$set: {stockPrice: 100}}"),
+                                              fromjson("{$set: {quarter: 'Q1'}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$set",
+                           "$set",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSetAndResumeToken) {
+    //
+    // Tests that the '$set' gets promoted before the '$_internalUpdateOnAddShard' if
+    // resume token is present.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)),
+        BSON("$set" << BSON("stockPrice" << 100))};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$set",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleReplaceRoot) {
+    //
+    // Tests that the single'$replaceRoot' gets promoted before the '$_internalUpdateOnAddShard'.
+    //
+    const std::vector<BSONObj> rawPipeline = {
+        fromjson("{$changeStream: {}}"), fromjson("{$replaceRoot: {newRoot: '$fullDocument'}}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$replaceRoot",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithReplaceRootAndResumeToken) {
+    //
+    // Tests that the '$replaceRoot' gets promoted before the '$_internalUpdateOnAddShard' if
+    // resume token is present.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)),
+        BSON("$replaceRoot" << BSON("newRoot"
+                                    << "$fullDocument"))};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$replaceRoot",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithSingleReplaceWith) {
+    //
+    // Tests that the single '$replaceWith' gets promoted before the '$_internalUpdateOnAddShard' as
+    // '$replaceRoot'.
+    //
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}"),
+                                              fromjson("{$replaceWith: '$fullDocument'}")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$replaceRoot",
+                           "$_internalChangeStreamHandleTopologyChange"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithReplaceWithAndResumeToken) {
+    //
+    // Tests that the '$replaceWith' gets promoted before the '$_internalUpdateOnAddShard' if
+    // resume token is present as '$replaceRoot'.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {BSON("$changeStream"
+                                                   << BSON("resumeAfter" << resumeToken)),
+                                              BSON("$replaceWith"
+                                                   << "$fullDocument")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$replaceRoot",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
+}
+
+TEST_F(ChangeStreamPipelineOptimizationTest, ChangeStreamWithAllStagesAndResumeToken) {
+    //
+    // Tests that when all allowed stages are included along with the resume token, the final
+    // pipeline gets optimized.
+    //
+    auto resumeToken = makeResumeToken(kDefaultTs, testUuid());
+
+    const std::vector<BSONObj> rawPipeline = {BSON("$changeStream"
+                                                   << BSON("resumeAfter" << resumeToken)),
+                                              BSON("$project" << BSON("operationType" << 1)),
+                                              BSON("$unset"
+                                                   << "_id"),
+                                              BSON("$addFields" << BSON("stockPrice" << 100)),
+                                              BSON("$set"
+                                                   << BSON("fullDocument.stockPrice" << 100)),
+                                              BSON("$match" << BSON("operationType"
+                                                                    << "insert")),
+                                              BSON("$replaceRoot" << BSON("newRoot"
+                                                                          << "$fullDocument")),
+                                              BSON("$replaceWith"
+                                                   << "fullDocument.stockPrice")};
+
+    auto pipeline = buildTestPipeline(rawPipeline);
+
+    assertStagesNameOrder(std::move(pipeline),
+                          {"$_internalChangeStreamOplogMatch",
+                           "$_internalChangeStreamUnwindTransaction",
+                           "$_internalChangeStreamTransform",
+                           "$_internalChangeStreamCheckInvalidate",
+                           "$_internalChangeStreamCheckResumability",
+                           "$_internalChangeStreamCheckTopologyChange",
+                           "$match",
+                           "$project",
+                           "$project",
+                           "$addFields",
+                           "$set",
+                           "$replaceRoot",
+                           "$replaceRoot",
+                           "$_internalChangeStreamHandleTopologyChange",
+                           "$_internalChangeStreamEnsureResumeTokenPresent"});
 }
 
 }  // namespace

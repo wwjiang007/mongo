@@ -43,8 +43,8 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
@@ -133,16 +133,8 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const std::vector<BSONObj>& splitKeys,
                                                    const std::string& shardName,
                                                    const OID& expectedCollectionEpoch) {
-    const std::string whyMessage(str::stream()
-                                 << "splitting chunk " << redact(chunkRange.toString()) << " in "
-                                 << nss.toString());
-    auto scopedDistLock = DistLockManager::get(opCtx)->lock(
-        opCtx, nss.ns(), whyMessage, DistLockManager::kDefaultLockTimeout);
-    if (!scopedDistLock.isOK()) {
-        return scopedDistLock.getStatus().withContext(
-            str::stream() << "could not acquire collection lock for " << nss.toString()
-                          << " to split chunk " << chunkRange.toString());
-    }
+    auto scopedSplitOrMergeChunk(uassertStatusOK(
+        ActiveMigrationsRegistry::get(opCtx).registerSplitOrMergeChunk(opCtx, nss, chunkRange)));
 
     // If the shard key is hashed, then we must make sure that the split points are of supported
     // data types.
@@ -181,9 +173,22 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
         return cmdResponseStatus.getStatus();
     }
 
+    const Shard::CommandResponse& cmdResponse = cmdResponseStatus.getValue();
+    boost::optional<ChunkVersion> shardVersionReceived = [&]() -> boost::optional<ChunkVersion> {
+        // old versions might not have the shardVersion field
+        if (cmdResponse.response[ChunkVersion::kShardVersionField]) {
+            return uassertStatusOK(ChunkVersion::parseWithField(cmdResponse.response,
+                                                                ChunkVersion::kShardVersionField));
+        }
+        return boost::none;
+    }();
+
+    // Always refresh metadata and provide the chunk version
+    onShardVersionMismatch(opCtx, nss, shardVersionReceived);
+
     // Check commandStatus and writeConcernStatus
-    auto commandStatus = cmdResponseStatus.getValue().commandStatus;
-    auto writeConcernStatus = cmdResponseStatus.getValue().writeConcernStatus;
+    auto commandStatus = cmdResponse.commandStatus;
+    auto writeConcernStatus = cmdResponse.writeConcernStatus;
 
     // Send stale epoch if epoch of request did not match epoch of collection
     if (commandStatus == ErrorCodes::StaleEpoch) {
@@ -191,13 +196,12 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     }
 
     //
-    // If _configsvrCommitChunkSplit returned an error, refresh and look at the metadata to
+    // If _configsvrCommitChunkSplit returned an error, look at the metadata to
     // determine if the split actually did happen. This can happen if there's a network error
     // getting the response from the first call to _configsvrCommitChunkSplit, but it actually
     // succeeds, thus the automatic retry fails with a precondition violation, for example.
     //
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
-        onShardVersionMismatch(opCtx, nss, boost::none);
 
         if (checkMetadataForSuccessfulSplitChunk(
                 opCtx, nss, expectedCollectionEpoch, chunkRange, splitKeys)) {
@@ -220,9 +224,10 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore,
     // any multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-    const IndexDescriptor* idx =
-        collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx, keyPatternObj, false);
-    if (!idx) {
+    auto catalog = collection->getIndexCatalog();
+    auto shardKeyIdx = catalog->findShardKeyPrefixedIndex(
+        opCtx, *collection, keyPatternObj, /*requireSingleKey=*/false);
+    if (!shardKeyIdx) {
         return boost::optional<ChunkRange>(boost::none);
     }
 
@@ -236,13 +241,12 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     KeyPattern shardKeyPattern(keyPatternObj);
     if (shardKeyPattern.globalMax().woCompare(backChunk.getMax()) == 0 &&
-        checkIfSingleDoc(opCtx, collection.getCollection(), idx, &backChunk)) {
+        checkIfSingleDoc(opCtx, collection.getCollection(), shardKeyIdx, &backChunk)) {
         return boost::optional<ChunkRange>(ChunkRange(backChunk.getMin(), backChunk.getMax()));
     } else if (shardKeyPattern.globalMin().woCompare(frontChunk.getMin()) == 0 &&
-               checkIfSingleDoc(opCtx, collection.getCollection(), idx, &frontChunk)) {
+               checkIfSingleDoc(opCtx, collection.getCollection(), shardKeyIdx, &frontChunk)) {
         return boost::optional<ChunkRange>(ChunkRange(frontChunk.getMin(), frontChunk.getMax()));
     }
-
     return boost::optional<ChunkRange>(boost::none);
 }
 

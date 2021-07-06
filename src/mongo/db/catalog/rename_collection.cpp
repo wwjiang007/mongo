@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/list_indexes.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -56,7 +57,6 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
@@ -106,7 +106,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
     auto catalog = CollectionCatalog::get(opCtx);
     const auto sourceColl = catalog->lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
-        if (ViewCatalog::get(db)->lookup(opCtx, source.ns()))
+        if (ViewCatalog::get(db)->lookup(opCtx, source))
             return Status(ErrorCodes::CommandNotSupportedOnView,
                           str::stream() << "cannot rename view: " << source);
         return Status(ErrorCodes::NamespaceNotFound,
@@ -118,7 +118,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
     const auto targetColl = catalog->lookupCollectionByNamespace(opCtx, target);
 
     if (!targetColl) {
-        if (ViewCatalog::get(db)->lookup(opCtx, target.ns()))
+        if (ViewCatalog::get(db)->lookup(opCtx, target))
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "a view already exists with that name: " << target);
     } else {
@@ -197,7 +197,8 @@ Status renameCollectionDirectly(OperationContext* opCtx,
         // avoid unintentionally removing a collection on a secondary with the same name as
         // the target.
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
-        opObserver->onRenameCollection(opCtx, source, target, uuid, {}, 0U, options.stayTemp);
+        opObserver->onRenameCollection(
+            opCtx, source, target, uuid, {}, 0U, options.stayTemp, options.markFromMigrate);
 
         wunit.commit();
         return Status::OK();
@@ -230,8 +231,15 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
 
         auto numRecords = targetColl->numRecords(opCtx);
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
-        auto renameOpTime = opObserver->preRenameCollection(
-            opCtx, source, target, uuid, targetColl->uuid(), numRecords, options.stayTemp);
+
+        auto renameOpTime = opObserver->preRenameCollection(opCtx,
+                                                            source,
+                                                            target,
+                                                            uuid,
+                                                            targetColl->uuid(),
+                                                            numRecords,
+                                                            options.stayTemp,
+                                                            options.markFromMigrate);
 
         if (!renameOpTimeFromApplyOps.isNull()) {
             // 'renameOpTime' must be null because a valid 'renameOpTimeFromApplyOps' implies
@@ -438,7 +446,17 @@ Status renameBetweenDBs(OperationContext* opCtx,
                         const NamespaceString& source,
                         const NamespaceString& target,
                         const RenameCollectionOptions& options) {
-    invariant(source.db() != target.db());
+    invariant(
+        source.db() != target.db(),
+        str::stream()
+            << "cannot rename within same database (use renameCollectionWithinDB instead): source: "
+            << source << "; target: " << target);
+
+    // Refer to txnCmdAllowlist in commands.cpp.
+    invariant(
+        !opCtx->inMultiDocumentTransaction(),
+        str::stream() << "renameBetweenDBs not supported in multi-document transaction: source: "
+                      << source << "; target: " << target);
 
     boost::optional<Lock::DBLock> sourceDbLock;
     boost::optional<Lock::CollectionLock> sourceCollLock;
@@ -478,7 +496,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     auto catalog = CollectionCatalog::get(opCtx);
     const auto sourceColl = catalog->lookupCollectionByNamespace(opCtx, source);
     if (!sourceColl) {
-        if (sourceDB && ViewCatalog::get(sourceDB)->lookup(opCtx, source.ns()))
+        if (sourceDB && ViewCatalog::get(sourceDB)->lookup(opCtx, source))
             return Status(ErrorCodes::CommandNotSupportedOnView,
                           str::stream() << "cannot rename view: " << source);
         return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
@@ -507,7 +525,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceExists, "target namespace exists");
         }
 
-    } else if (targetDB && ViewCatalog::get(targetDB)->lookup(opCtx, target.ns())) {
+    } else if (targetDB && ViewCatalog::get(targetDB)->lookup(opCtx, target)) {
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a view already exists with that name: " << target);
     }
@@ -542,8 +560,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
 
     Collection* tmpColl = nullptr;
     {
-        auto collectionOptions =
-            DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->getCatalogId());
+        auto collectionOptions = sourceColl->getCollectionOptions();
 
         // Renaming across databases will result in a new UUID.
         collectionOptions.uuid = UUID::gen();
@@ -638,6 +655,18 @@ Status renameBetweenDBs(OperationContext* opCtx,
                                         << "' was removed while renaming collection across DBs");
         }
 
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        auto isOplogDisabledForTmpColl = replCoord->isOplogDisabledFor(opCtx, tmpName);
+
+        auto batchSize = internalInsertMaxBatchSize.load();
+
+        // Inserts to indexed capped collections cannot be batched.
+        // Otherwise, CollectionImpl::_insertDocuments() will fail with OperationCannotBeBatched.
+        // See SERVER-21512.
+        if (autoTmpColl->isCapped() && autoTmpColl->getIndexCatalog()->haveAnyIndexes()) {
+            batchSize = 1;
+        }
+
         auto cursor = sourceColl->getCursor(opCtx);
         auto record = cursor->next();
         while (record) {
@@ -647,22 +676,36 @@ Status renameBetweenDBs(OperationContext* opCtx,
             Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
                 // Always reposition cursor in case it gets a WCE midway through.
                 record = cursor->seekExact(beginBatchId);
-                for (int i = 0; record && (i < internalInsertMaxBatchSize.load()); i++) {
-                    WriteUnitOfWork wunit(opCtx);
-                    const InsertStatement stmt(record->data.releaseToBson());
-                    OpDebug* const opDebug = nullptr;
-                    auto status = autoTmpColl->insertDocument(opCtx, stmt, opDebug, true);
-                    if (!status.isOK()) {
-                        return status;
-                    }
-                    record = cursor->next();
 
-                    // Used to make sure that a WCE can be handled by this logic without data loss.
-                    if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
-                        throw WriteConflictException();
-                    }
-                    wunit.commit();
+                std::vector<InsertStatement> stmts;
+                for (int i = 0; record && (i < batchSize); i++) {
+                    stmts.push_back(InsertStatement(record->data.getOwned().releaseToBson()));
+                    record = cursor->next();
                 }
+
+                WriteUnitOfWork wunit(opCtx);
+
+                if (!isOplogDisabledForTmpColl) {
+                    auto oplogInfo = LocalOplogInfo::get(opCtx);
+                    auto slots = oplogInfo->getNextOpTimes(opCtx, stmts.size());
+                    for (std::size_t i = 0; i < stmts.size(); ++i) {
+                        stmts[i].oplogSlot = slots[i];
+                    }
+                }
+
+                OpDebug* const opDebug = nullptr;
+                auto status =
+                    autoTmpColl->insertDocuments(opCtx, stmts.begin(), stmts.end(), opDebug, true);
+                if (!status.isOK()) {
+                    return status;
+                }
+
+                // Used to make sure that a WCE can be handled by this logic without data loss.
+                if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
+                    throw WriteConflictException();
+                }
+
+                wunit.commit();
 
                 // Time to yield; make a safe copy of the current record before releasing our
                 // cursor.
@@ -715,10 +758,7 @@ void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
         // collection was dropped and recreated, as long as the new target collection has the same
         // options and indexes as the original one did. This is mainly to support concurrent $out
         // to the same collection.
-        collectionOptions = DurableCatalog::get(opCtx)
-                                ->getCollectionOptions(opCtx, collection->getCatalogId())
-                                .toBSON()
-                                .removeField("uuid");
+        collectionOptions = collection->getCollectionOptions().toBSON().removeField("uuid");
     }
 
     uassert(ErrorCodes::CommandFailed,
@@ -800,6 +840,8 @@ void validateAndRunRenameCollection(OperationContext* opCtx,
                                     const NamespaceString& source,
                                     const NamespaceString& target,
                                     const RenameCollectionOptions& options) {
+    invariant(source != target, "Can't rename a collection to itself");
+
     validateNamespacesForRenameCollection(opCtx, source, target);
 
     OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(

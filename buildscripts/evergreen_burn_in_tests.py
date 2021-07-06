@@ -17,7 +17,8 @@ from evergreen import RetryingEvergreenApi, EvergreenApi
 from buildscripts.burn_in_tests import RepeatConfig, BurnInExecutor, TaskInfo, FileChangeDetector, \
     DEFAULT_REPO_LOCATIONS, BurnInOrchestrator
 from buildscripts.ciconfig.evergreen import parse_evergreen_file, EvergreenProjectConfig
-from buildscripts.patch_builds.change_data import RevisionMap, generate_revision_map_from_manifest
+from buildscripts.patch_builds.change_data import RevisionMap
+from buildscripts.patch_builds.evg_change_data import generate_revision_map_from_manifest
 from buildscripts.patch_builds.task_generation import TimeoutInfo, resmoke_commands, \
     validate_task_generation_limit
 from buildscripts.util.fileops import write_file
@@ -226,7 +227,6 @@ class TaskGenerator:
         :param test_name: Name of test that should be executed.
         :return: Configuration for generating the specified task.
         """
-        multiversion_path = self.task_info.use_multiversion
         resmoke_args = self.task_info.resmoke_args
 
         sub_task_name = self.generate_name(index)
@@ -237,11 +237,10 @@ class TaskGenerator:
             "resmoke_args":
                 f"{resmoke_args} {self.repeat_config.generate_resmoke_options()} {test_unix_style}"
         }
-        if multiversion_path:
-            run_tests_vars["task_path_suffix"] = multiversion_path
 
         timeout = self.generate_timeouts(test_name)
-        commands = resmoke_commands("run tests", run_tests_vars, timeout, multiversion_path)
+        commands = resmoke_commands("run tests", run_tests_vars, timeout,
+                                    self.task_info.require_multiversion)
         dependencies = {TaskDependency(TASK_WITH_ARTIFACTS)}
 
         return Task(sub_task_name, commands, dependencies)

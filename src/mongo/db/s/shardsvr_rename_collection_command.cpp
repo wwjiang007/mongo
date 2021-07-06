@@ -38,7 +38,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/rename_collection_coordinator.h"
-#include "mongo/db/s/rename_collection_coordinator_document_gen.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
 #include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_ddl_util.h"
@@ -52,10 +52,14 @@ namespace mongo {
 namespace {
 
 bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForRead lock(opCtx, nss);
-    return opCtx->writesAreReplicated() &&
-        CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
-}
+    try {
+        Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
+        return true;
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // The collection is unsharded or doesn't exist
+        return false;
+    }
+}  // namespace
 
 bool renameIsAllowedOnNS(const NamespaceString& nss) {
     if (nss.isSystem()) {
@@ -119,11 +123,17 @@ public:
             const auto& fromNss = ns();
             const auto& toNss = req.getTo();
 
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't rename a collection to itself",
+                    fromNss != toNss);
+
             auto const shardingState = ShardingState::get(opCtx);
             uassertStatusOK(shardingState->canAcceptShardedCommands());
 
-            bool useNewPath = feature_flags::gShardingFullDDLSupport.isEnabled(
-                serverGlobalParams.featureCompatibility);
+            FixedFCVRegion fixedFCVRegion(opCtx);
+
+            const bool useNewPath =
+                feature_flags::gShardingFullDDLSupport.isEnabled(*fixedFCVRegion);
 
             if (fromNss.db() != toNss.db()) {
                 sharding_ddl_util::checkDbPrimariesOnTheSameShard(opCtx, fromNss, toNss);

@@ -50,6 +50,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
@@ -63,13 +64,13 @@
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/prepare_conflict_tracker.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
 #include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
@@ -416,7 +417,7 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 }
 
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
-    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+    OperationContext* opCtx, StorageEngine::LastShutdownState lastShutdownState) {
     LOGV2_DEBUG(4280500, 1, "Attempting to create internal replication collections");
     // Create necessary replication collections to guarantee that if a checkpoint sees data after
     // initial sync has completed, it also sees these collections.
@@ -461,7 +462,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
                                 "Error loading local Rollback ID document at startup",
                                 "error"_attr = status);
         }
-    } else if (lastStorageEngineShutdownState == LastStorageEngineShutdownState::kUnclean) {
+    } else if (lastShutdownState == StorageEngine::LastShutdownState::kUnclean) {
         LOGV2(501401, "Incrementing the rollback ID after unclean shutdown");
         fassert(501402, _replicationProcess->incrementRollbackID(opCtx));
     }
@@ -603,24 +604,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         myIndex = StatusWith<int>(-1);
     }
     LOGV2_DEBUG(4280509, 1, "Local configuration validated for startup");
-
-    if (serverGlobalParams.enableMajorityReadConcern && localConfig.getNumMembers() == 3 &&
-        localConfig.getNumDataBearingMembers() == 2) {
-        LOGV2_OPTIONS(21315, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(
-            21316,
-            {logv2::LogTag::kStartupWarnings},
-            "** WARNING: This replica set has a Primary-Secondary-Arbiter architecture, but "
-            "readConcern:majority is enabled ");
-        LOGV2_OPTIONS(
-            21317,
-            {logv2::LogTag::kStartupWarnings},
-            "**          for this node. This is not a recommended configuration. Please see ");
-        LOGV2_OPTIONS(21318,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          https://dochub.mongodb.org/core/psa-disable-rc-majority");
-        LOGV2_OPTIONS(21319, {logv2::LogTag::kStartupWarnings}, "");
-    }
 
     // Do not check optime, if this node is an arbiter.
     bool isArbiter =
@@ -829,8 +812,8 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     }
 }
 
-void ReplicationCoordinatorImpl::startup(
-    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+void ReplicationCoordinatorImpl::startup(OperationContext* opCtx,
+                                         StorageEngine::LastShutdownState lastShutdownState) {
     if (!isReplEnabled()) {
         if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
             uassert(ErrorCodes::InvalidOptions,
@@ -891,7 +874,7 @@ void ReplicationCoordinatorImpl::startup(
 
     ReplicaSetAwareServiceRegistry::get(_service).onStartup(opCtx);
 
-    bool doneLoadingConfig = _startLoadLocalConfig(opCtx, lastStorageEngineShutdownState);
+    bool doneLoadingConfig = _startLoadLocalConfig(opCtx, lastShutdownState);
     if (doneLoadingConfig) {
         // If we're not done loading the config, then the config state will be set by
         // _finishLoadLocalConfig.
@@ -899,6 +882,13 @@ void ReplicationCoordinatorImpl::startup(
         invariant(!_rsConfig.isInitialized());
         _setConfigState_inlock(kConfigUninitialized);
     }
+}
+
+void ReplicationCoordinatorImpl::_setImplicitDefaultWriteConcern(OperationContext* opCtx,
+                                                                 WithLock lk) {
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx);
+    bool isImplicitDefaultWriteConcernMajority = _rsConfig.isImplicitDefaultWriteConcernMajority();
+    rwcDefaults.setImplicitDefaultWriteConcernMajority(isImplicitDefaultWriteConcernMajority);
 }
 
 void ReplicationCoordinatorImpl::enterTerminalShutdown() {
@@ -939,7 +929,7 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
         return;
     }
 
-    LOGV2_DEBUG(5074000, 1, "Shutting down the replica set aware services.");
+    LOGV2(5074000, "Shutting down the replica set aware services.");
     ReplicaSetAwareServiceRegistry::get(_service).onShutdown();
 
     LOGV2(21328, "Shutting down replication subsystems");
@@ -1045,9 +1035,9 @@ Seconds ReplicationCoordinatorImpl::getSecondaryDelaySecs() const {
     return _rsConfig.getMemberAt(_selfIndex).getSecondaryDelay();
 }
 
-void ReplicationCoordinatorImpl::clearSyncSourceBlacklist() {
+void ReplicationCoordinatorImpl::clearSyncSourceDenylist() {
     stdx::lock_guard<Latch> lk(_mutex);
-    _topCoord->clearSyncSourceBlacklist();
+    _topCoord->clearSyncSourceDenylist();
 }
 
 Status ReplicationCoordinatorImpl::setFollowerModeRollback(OperationContext* opCtx) {
@@ -1951,6 +1941,7 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
               "Replication failed for write concern: {writeConcern}, waiting for optime: {opTime}, "
               "opID: {opID}, all_durable: {allDurable}, progress: {progress}",
               "Replication failed for write concern",
+              "status"_attr = redact(status),
               "writeConcern"_attr = writeConcern.toBSON(),
               "opTime"_attr = opTime,
               "opID"_attr = opCtx->getOpID(),
@@ -3050,6 +3041,67 @@ ReplSetConfig ReplicationCoordinatorImpl::getConfig() const {
     return _rsConfig;
 }
 
+ConnectionString ReplicationCoordinatorImpl::getConfigConnectionString() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getConnectionString();
+}
+
+Milliseconds ReplicationCoordinatorImpl::getConfigElectionTimeoutPeriod() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getElectionTimeoutPeriod();
+}
+
+std::vector<MemberConfig> ReplicationCoordinatorImpl::getConfigVotingMembers() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.votingMembers();
+}
+
+std::int64_t ReplicationCoordinatorImpl::getConfigTerm() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getConfigTerm();
+}
+
+std::int64_t ReplicationCoordinatorImpl::getConfigVersion() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getConfigVersion();
+}
+
+ConfigVersionAndTerm ReplicationCoordinatorImpl::getConfigVersionAndTerm() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getConfigVersionAndTerm();
+}
+
+int ReplicationCoordinatorImpl::getConfigNumMembers() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getNumMembers();
+}
+
+Milliseconds ReplicationCoordinatorImpl::getConfigHeartbeatTimeoutPeriodMillis() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getHeartbeatTimeoutPeriodMillis();
+}
+
+BSONObj ReplicationCoordinatorImpl::getConfigBSON() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.toBSON();
+}
+
+const MemberConfig* ReplicationCoordinatorImpl::findConfigMemberByHostAndPort(
+    const HostAndPort& hap) const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.findMemberByHostAndPort(hap);
+}
+
+bool ReplicationCoordinatorImpl::isConfigLocalHostAllowed() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.isLocalHostAllowed();
+}
+
+Milliseconds ReplicationCoordinatorImpl::getConfigHeartbeatInterval() const {
+    stdx::lock_guard<Latch> lock(_mutex);
+    return _rsConfig.getHeartbeatInterval();
+}
+
 WriteConcernOptions ReplicationCoordinatorImpl::_getOplogCommitmentWriteConcern(WithLock lk) {
     auto syncMode = getWriteConcernMajorityShouldJournal_inlock()
         ? WriteConcernOptions::SyncMode::JOURNAL
@@ -3434,7 +3486,13 @@ Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
     // So, acquire FCV mutex lock in shared mode to block writers from modifying the fcv document
     // to make sure fcv is not changed between getNewConfig() and storing the new config
     // document locally.
-    boost::optional<FixedFCVRegion> fixedFcvRegion(opCtx);
+    // Since 'skipSafetyChecks' is only true when this reconfig is invoked as part of
+    // 'signalDrainComplete', we can skip taking the FCV lock here because:
+    // 1. 'signalDrainComplete' acquires the RSTL in X mode prior to this reconfig, which will block
+    //    all external writers. This is also important because we must not acquire the FCV lock
+    //    while holding the RSTL to avoid deadlocking.
+    // 2. We are not able to accept replicated writes as primary until we fully exit drain mode.
+    auto fixedFcvRegion = skipSafetyChecks ? nullptr : std::make_unique<FixedFCVRegion>(opCtx);
 
     // Call the callback to get the new config given the old one.
     auto newConfigStatus = getNewConfig(oldConfig, topCoordTerm);
@@ -3442,6 +3500,29 @@ Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
     if (!status.isOK())
         return status;
     ReplSetConfig newConfig = newConfigStatus.getValue();
+
+    // If the new config changes the replica set's implicit default write concern, we fail the
+    // reconfig command. This includes force reconfigs, but excludes reconfigs that bump the config
+    // term during step-up. The user should set a cluster-wide write concern and attempt the
+    // reconfig command again. We also need to exclude shard servers from this validation, as shard
+    // servers don't store the cluster-wide write concern.
+    if (!skipSafetyChecks /* skipping step-up reconfig */ &&
+        repl::feature_flags::gDefaultWCMajority.isEnabled(
+            serverGlobalParams.featureCompatibility) &&
+        serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+        !repl::enableDefaultWriteConcernUpdatesForInitiate.load()) {
+        bool currIDWC = oldConfig.isImplicitDefaultWriteConcernMajority();
+        bool newIDWC = newConfig.isImplicitDefaultWriteConcernMajority();
+        bool isCWWCSet = ReadWriteConcernDefaults::get(opCtx).isCWWCSet(opCtx);
+        if (!isCWWCSet && currIDWC != newIDWC) {
+            return Status(
+                ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                str::stream()
+                    << "Reconfig attempted to install a config that would change the "
+                       "implicit default write concern. Use the setDefaultRWConcern command to "
+                       "set a cluster-wide write concern and try the reconfig again.");
+        }
+    }
 
     BSONObj oldConfigObj = oldConfig.toBSON();
     BSONObj newConfigObj = newConfig.toBSON();
@@ -3470,7 +3551,8 @@ Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
                     "replSetReconfig got {error} while validating {newConfig}",
                     "replSetReconfig error while validating new config",
                     "error"_attr = validateStatus,
-                    "newConfig"_attr = newConfigObj);
+                    "newConfig"_attr = newConfigObj,
+                    "oldConfig"_attr = oldConfigObj);
         return Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, validateStatus.reason());
     }
 
@@ -3504,7 +3586,7 @@ Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
     // 1) For fcv 4.4, addition of new voter nodes.
     // 2) For fcv 4.7+, only if the current config doesn't contain the 'newlyAdded' field but the
     // new config got mutated to append 'newlyAdded' field.
-    if (force || !needsFcvLock()) {
+    if (fixedFcvRegion && (force || !needsFcvLock())) {
         fixedFcvRegion.reset();
     }
 
@@ -3682,6 +3764,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     if (defaultDurableChanged || (isForceReconfig && contentChanged)) {
         _clearCommittedSnapshot_inlock();
     }
+
 
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
@@ -4476,6 +4559,21 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _rsConfig = newConfig;
     _protVersion.store(_rsConfig.getProtocolVersion());
 
+    if (!oldConfig.isInitialized()) {
+        // We allow the IDWC to be set only once after initial configuration is loaded.
+        _setImplicitDefaultWriteConcern(opCtx, lk);
+    } else {
+        // If 'enableDefaultWriteConcernUpdatesForInitiate' is enabled, we allow the IDWC to be
+        // recalculated after a reconfig. However, this logic is only relevant for testing,
+        // and should not be executed outside of our test infrastructure. This is needed due to an
+        // optimization in our ReplSetTest jstest fixture that initiates replica sets with only the
+        // primary, and then reconfigs the full membership set in. As a result, we must calculate
+        // the final IDWC only after the last node has been added to the set.
+        if (repl::enableDefaultWriteConcernUpdatesForInitiate.load()) {
+            _setImplicitDefaultWriteConcern(opCtx, lk);
+        }
+    }
+
     // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
     // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -4539,17 +4637,17 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         }
     }
 
-    // Since the ReplSetConfig always has a WriteConcernOptions, the only way to know if it has been
-    // customized is if it's different to the implicit defaults of { w: 1, wtimeout: 0 }.
-    if (const auto& wc = newConfig.getDefaultWriteConcern();
-        !(wc.wNumNodes == 1 && wc.wTimeout == 0)) {
+    // Check that getLastErrorDefaults has not been changed from the default settings of
+    // { w: 1, wtimeout: 0 }.
+    if (newConfig.containsCustomizedGetLastErrorDefaults()) {
         LOGV2_OPTIONS(21387, {logv2::LogTag::kStartupWarnings}, "");
         LOGV2_OPTIONS(21388,
                       {logv2::LogTag::kStartupWarnings},
                       "** WARNING: Replica set config contains customized getLastErrorDefaults,");
         LOGV2_OPTIONS(21389,
                       {logv2::LogTag::kStartupWarnings},
-                      "**          which are deprecated. Use setDefaultRWConcern instead to set a");
+                      "**          which have been deprecated and are now ignored. Use "
+                      "setDefaultRWConcern instead to set a");
         LOGV2_OPTIONS(21390,
                       {logv2::LogTag::kStartupWarnings},
                       "**          cluster-wide default writeConcern.");
@@ -4785,9 +4883,9 @@ const ReadPreference ReplicationCoordinatorImpl::_getSyncSourceReadPreference(Wi
         }
     }
     if (!parsedSyncSourceFromInitialSync && !memberState.primary() &&
-        !_rsConfig.isChainingAllowed()) {
-        // If we are not the primary and chaining is disabled in the config, we should only be
-        // syncing from the primary.
+        !_rsConfig.isChainingAllowed() && !enableOverrideClusterChainingSetting.load()) {
+        // If we are not the primary and chaining is disabled in the config (without overrides), we
+        // should only be syncing from the primary.
         readPreference = ReadPreference::PrimaryOnly;
     }
     return readPreference;
@@ -4817,20 +4915,20 @@ HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOp
     return newSyncSource;
 }
 
-void ReplicationCoordinatorImpl::_unblacklistSyncSource(
+void ReplicationCoordinatorImpl::_undenylistSyncSource(
     const executor::TaskExecutor::CallbackArgs& cbData, const HostAndPort& host) {
     if (cbData.status == ErrorCodes::CallbackCanceled)
         return;
 
     stdx::lock_guard<Latch> lock(_mutex);
-    _topCoord->unblacklistSyncSource(host, _replExecutor->now());
+    _topCoord->undenylistSyncSource(host, _replExecutor->now());
 }
 
-void ReplicationCoordinatorImpl::blacklistSyncSource(const HostAndPort& host, Date_t until) {
+void ReplicationCoordinatorImpl::denylistSyncSource(const HostAndPort& host, Date_t until) {
     stdx::lock_guard<Latch> lock(_mutex);
-    _topCoord->blacklistSyncSource(host, until);
+    _topCoord->denylistSyncSource(host, until);
     _scheduleWorkAt(until, [=](const executor::TaskExecutor::CallbackArgs& cbData) {
-        _unblacklistSyncSource(cbData, host);
+        _undenylistSyncSource(cbData, host);
     });
 }
 

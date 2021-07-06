@@ -3,7 +3,6 @@
 // change that we're doing the lookup for, and that change will be majority-committed.
 // @tags: [
 //   requires_majority_read_concern,
-//   sbe_incompatible,
 //   uses_change_streams,
 // ]
 (function() {
@@ -54,6 +53,10 @@ rst.awaitSecondaryNodes();
 const st = new ShardingTest({manualAddShard: true});
 assert.commandWorked(st.s.adminCommand({addShard: replSetName + "/" + rst.getPrimary().host}));
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 const mongosDB = st.s0.getDB(jsTestName());
 const mongosColl = mongosDB[jsTestName()];
 
@@ -69,6 +72,9 @@ rst.awaitReplication();
 const closestSecondary = rst.nodes[1];
 const closestSecondaryDB = closestSecondary.getDB(mongosDB.getName());
 assert.commandWorked(closestSecondaryDB.setProfilingLevel(2));
+
+// Do a read concern "local" read so that the secondary refreshes its metadata.
+mongosColl.find().readPref("secondary", [{tag: "closestSecondary"}]);
 
 // We expect the tag to ensure there is only one node to choose from, so the actual read
 // preference doesn't really matter - we use 'nearest' throughout.

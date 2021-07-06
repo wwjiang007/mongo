@@ -34,6 +34,15 @@
 #include "mongo/db/exec/sbe/vm/vm.h"
 
 namespace mongo::sbe {
+/**
+ * Evaluates a set of expressions and stores the results into corresponding output slots. This is
+ * unrelated to projections in MQL. The set of (slot, expression) pairs are passed in the 'projects'
+ * slot map.
+ *
+ * Debug string representation:
+ *
+ *  project [slot_1 = expr_1, ..., slot_n = expr_n] childStage
+ */
 class ProjectStage final : public PlanStage {
 public:
     ProjectStage(std::unique_ptr<PlanStage> input,
@@ -51,6 +60,9 @@ public:
     std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const final;
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
+
+protected:
+    void doSaveState() final;
 
 private:
     const value::SlotMap<std::unique_ptr<EExpression>> _projects;

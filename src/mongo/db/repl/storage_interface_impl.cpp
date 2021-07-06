@@ -78,7 +78,6 @@
 #include "mongo/db/storage/checkpointer.h"
 #include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/control/storage_control.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/oplog_cap_maintainer_thread.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -236,7 +235,7 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
         UnreplicatedWritesBlock uwb(opCtx.get());
 
         // Get locks and create the collection.
-        AutoGetOrCreateDb db(opCtx.get(), nss.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_IX);
         AutoGetCollection coll(opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_X));
         if (coll) {
             return Status(ErrorCodes::NamespaceExists,
@@ -245,7 +244,8 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
         {
             // Create the collection.
             WriteUnitOfWork wunit(opCtx.get());
-            fassert(40332, db.getDb()->createCollection(opCtx.get(), nss, options, false));
+            auto db = autoDb.ensureDbExists();
+            fassert(40332, db->createCollection(opCtx.get(), nss, options, false));
             wunit.commit();
         }
 
@@ -260,7 +260,8 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             if (!idIndexSpec.isEmpty()) {
                 auto status = autoColl->getWritableCollection()
                                   ->getIndexCatalog()
-                                  ->createIndexOnEmptyCollection(opCtx.get(), idIndexSpec);
+                                  ->createIndexOnEmptyCollection(
+                                      opCtx.get(), autoColl->getWritableCollection(), idIndexSpec);
                 if (!status.getStatus().isOK()) {
                     return status.getStatus();
                 }
@@ -268,7 +269,8 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             for (auto&& spec : secondaryIndexSpecs) {
                 auto status = autoColl->getWritableCollection()
                                   ->getIndexCatalog()
-                                  ->createIndexOnEmptyCollection(opCtx.get(), spec);
+                                  ->createIndexOnEmptyCollection(
+                                      opCtx.get(), autoColl->getWritableCollection(), spec);
                 if (!status.getStatus().isOK()) {
                     return status.getStatus();
                 }
@@ -453,34 +455,26 @@ Status StorageInterfaceImpl::createOplog(OperationContext* opCtx, const Namespac
 }
 
 StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx) {
-    // This writeConflictRetry loop protects callers from WriteConflictExceptions thrown by the
-    // storage engine running out of cache space, despite this operation not performing any writes.
-    return writeConflictRetry(
-        opCtx,
-        "StorageInterfaceImpl::getOplogMaxSize",
-        NamespaceString::kRsOplogNamespace.ns(),
-        [&]() -> StatusWith<size_t> {
-            AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
-            const auto& oplog = oplogRead.getCollection();
-            if (!oplog) {
-                return {ErrorCodes::NamespaceNotFound, "Your oplog doesn't exist."};
-            }
-            const auto options =
-                DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, oplog->getCatalogId());
-            if (!options.capped)
-                return {ErrorCodes::BadValue,
-                        str::stream()
-                            << NamespaceString::kRsOplogNamespace.ns() << " isn't capped"};
-            return options.cappedSize;
-        });
+    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+    const auto& oplog = oplogRead.getCollection();
+    if (!oplog) {
+        return {ErrorCodes::NamespaceNotFound, "Your oplog doesn't exist."};
+    }
+    const auto options = oplog->getCollectionOptions();
+    if (!options.capped)
+        return {ErrorCodes::BadValue,
+                str::stream() << NamespaceString::kRsOplogNamespace.ns() << " isn't capped"};
+    return options.cappedSize;
 }
 
 Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
-                                              const CollectionOptions& options) {
+                                              const CollectionOptions& options,
+                                              const bool createIdIndex,
+                                              const BSONObj& idIndexSpec) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
-        AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_IX);
-        auto db = databaseWriteGuard.getDb();
+        AutoGetDb databaseWriteGuard(opCtx, nss.db(), MODE_IX);
+        auto db = databaseWriteGuard.ensureDbExists();
         invariant(db);
         if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
             return Status(ErrorCodes::NamespaceExists,
@@ -489,7 +483,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
         Lock::CollectionLock lk(opCtx, nss, MODE_IX);
         WriteUnitOfWork wuow(opCtx);
         try {
-            auto coll = db->createCollection(opCtx, nss, options);
+            auto coll = db->createCollection(opCtx, nss, options, createIdIndex, idIndexSpec);
             invariant(coll);
         } catch (const AssertionException& ex) {
             return ex.toStatus();
@@ -1481,6 +1475,11 @@ Timestamp StorageInterfaceImpl::getPointInTimeReadTimestamp(OperationContext* op
     auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
     invariant(readTimestamp);
     return *readTimestamp;
+}
+
+void StorageInterfaceImpl::setPinnedOplogTimestamp(OperationContext* opCtx,
+                                                   const Timestamp& pinnedTimestamp) const {
+    opCtx->getServiceContext()->getStorageEngine()->setPinnedOplogTimestamp(pinnedTimestamp);
 }
 
 }  // namespace repl

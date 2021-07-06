@@ -47,8 +47,7 @@ public:
     ReplicationCoordinatorNoOp(ReplicationCoordinatorNoOp&) = delete;
     ReplicationCoordinatorNoOp& operator=(ReplicationCoordinatorNoOp&) = delete;
 
-    void startup(OperationContext* opCtx,
-                 LastStorageEngineShutdownState lastStorageEngineShutdownState) final;
+    void startup(OperationContext* opCtx, StorageEngine::LastShutdownState lastShutdownState) final;
 
     void enterTerminalShutdown() final;
 
@@ -106,7 +105,7 @@ public:
 
     Seconds getSecondaryDelaySecs() const final;
 
-    void clearSyncSourceBlacklist() final;
+    void clearSyncSourceDenylist() final;
 
     ReplicationCoordinator::StatusAndDuration awaitReplication(OperationContext*,
                                                                const OpTime&,
@@ -174,6 +173,30 @@ public:
 
     ReplSetConfig getConfig() const final;
 
+    ConnectionString getConfigConnectionString() const final;
+
+    Milliseconds getConfigElectionTimeoutPeriod() const final;
+
+    std::vector<MemberConfig> getConfigVotingMembers() const final;
+
+    std::int64_t getConfigTerm() const final;
+
+    std::int64_t getConfigVersion() const final;
+
+    ConfigVersionAndTerm getConfigVersionAndTerm() const final;
+
+    int getConfigNumMembers() const final;
+
+    Milliseconds getConfigHeartbeatTimeoutPeriodMillis() const final;
+
+    BSONObj getConfigBSON() const final;
+
+    const MemberConfig* findConfigMemberByHostAndPort(const HostAndPort& hap) const final;
+
+    bool isConfigLocalHostAllowed() const final;
+
+    Milliseconds getConfigHeartbeatInterval() const final;
+
     void processReplSetGetConfig(BSONObjBuilder*,
                                  bool commitmentStatus = false,
                                  bool includeNewlyAdded = false) final;
@@ -213,7 +236,7 @@ public:
 
     HostAndPort chooseNewSyncSource(const OpTime&) final;
 
-    void blacklistSyncSource(const HostAndPort&, Date_t) final;
+    void denylistSyncSource(const HostAndPort&, Date_t) final;
 
     void resetLastOpTimesFromOplog(OperationContext*) final;
 

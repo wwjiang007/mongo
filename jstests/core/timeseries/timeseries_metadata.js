@@ -2,12 +2,11 @@
  * Tests that only measurements with a binary identical meta field are included in the same bucket
  * in a time-series collection.
  * @tags: [
- *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_49,
- *     requires_find_command,
- *     requires_getmore,
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   does_not_support_stepdowns,
+ *   does_not_support_transactions,
+ *   requires_fcv_49,
+ *   requires_getmore,
  * ]
  */
 (function() {
@@ -52,7 +51,7 @@ TimeseriesTest.run((insert) => {
         }
 
         // Check bucket collection.
-        const bucketDocs = bucketsColl.find().sort({_id: 1}).toArray();
+        const bucketDocs = bucketsColl.find().sort({'control.min._id': 1}).toArray();
         assert.eq(2, bucketDocs.length, bucketDocs);
 
         // Check both buckets.
@@ -66,12 +65,6 @@ TimeseriesTest.run((insert) => {
                       'invalid meta in first bucket: ' + tojson(bucketDocs[0]));
             assert(!bucketDocs[0].data.hasOwnProperty(metaFieldName),
                    'unexpected metadata in first bucket data: ' + tojson(bucketDocs[0]));
-        } else {
-            assert(bucketDocs[0].hasOwnProperty('meta'),
-                   'missing meta in first bucket: ' + tojson(bucketDocs[0]));
-            assert.eq(null,
-                      bucketDocs[0].meta,
-                      'invalid meta for x in first bucket: ' + tojson(bucketDocs[0]));
         }
 
         // Second bucket should contain documents specified in 'bucketB'.
@@ -84,12 +77,6 @@ TimeseriesTest.run((insert) => {
                       'invalid meta in second bucket: ' + tojson(bucketDocs[1]));
             assert(!bucketDocs[1].data.hasOwnProperty(metaFieldName),
                    'unexpected metadata in second bucket data: ' + tojson(bucketDocs[1]));
-        } else {
-            assert(bucketDocs[1].hasOwnProperty('meta'),
-                   'missing meta in second bucket: ' + tojson(bucketDocs[1]));
-            assert.eq(null,
-                      bucketDocs[1].meta,
-                      'invalid meta for x in second bucket: ' + tojson(bucketDocs[1]));
         }
     };
 
@@ -112,10 +99,16 @@ TimeseriesTest.run((insert) => {
         ]);
 
     runTest(
-        // Null metadata field in first bucket. Temporarily use null meta instead of missing meta
-        // to accomodate the new $_internalUnpackBucket behavior which is null meta in a bucket
-        // is materialized as "null" meta.
-        // TODO SERVER-55213: Need to test both missing meta case and null meta case.
+        [
+            {_id: 0, time: t[0], meta: null, x: 0},
+            {_id: 1, time: t[1], meta: null, x: 10},
+        ],
+        [
+            {_id: 2, time: t[2], x: 20},
+            {_id: 3, time: t[3], x: 30},
+        ]);
+
+    runTest(
         [
             {_id: 0, time: t[0], meta: null, x: 0},
             {_id: 1, time: t[1], meta: null, x: 10},
@@ -131,13 +124,9 @@ TimeseriesTest.run((insert) => {
             {_id: 0, time: t[0], meta: [1, 2, 3], x: 0},
             {_id: 1, time: t[1], meta: [1, 2, 3], x: 10},
         ],
-        // Null metadata field in second bucket. Temporarily use null meta instead of missing meta
-        // to accomodate the new $_internalUnpackBucket behavior which is null meta in a bucket
-        // is materialized as "null" meta.
-        // TODO SERVER-55213: Need to test both missing meta case and null meta case.
         [
-            {_id: 2, time: t[2], meta: null, x: 20},
-            {_id: 3, time: t[3], meta: null, x: 30},
+            {_id: 2, time: t[2], x: 20},
+            {_id: 3, time: t[3], x: 30},
         ]);
 
     runTest(
@@ -149,6 +138,39 @@ TimeseriesTest.run((insert) => {
         ],
         [
             {_id: 3, time: t[3], meta: {a: 1}, x: 30},
+        ]);
+
+    runTest(
+        // Metadata field contains an array within an object.
+        [
+            {_id: 0, time: t[0], meta: {a: [{b: 1, c: 0}]}, x: 0},
+            {_id: 1, time: t[1], meta: {a: [{c: 0, b: 1}]}, x: 10},
+        ],
+        [
+            {_id: 2, time: t[2], meta: {a: [{b: 2, c: 0}]}, x: 20},
+            {_id: 3, time: t[3], meta: {a: [{c: 0, b: 2}]}, x: 30},
+        ]);
+
+    runTest(
+        // Metadata field contains a nested array.
+        [
+            {_id: 0, time: t[0], meta: {a: [{b: 1, c: 0}, [{e: 1, f: 0}]]}, x: 0},
+            {_id: 1, time: t[1], meta: {a: [{c: 0, b: 1}, [{f: 0, e: 1}]]}, x: 10},
+        ],
+        [
+            {_id: 2, time: t[2], meta: {a: [[{e: 1, f: 0}], {b: 1, c: 0}]}, x: 20},
+            {_id: 3, time: t[3], meta: {a: [[{f: 0, e: 1}], {c: 0, b: 1}]}, x: 30},
+        ]);
+
+    runTest(
+        // Metadata field contains an array.
+        [
+            {_id: 0, time: t[0], meta: {a: [1, 2, 3]}, x: 0},
+            {_id: 1, time: t[1], meta: {a: [1, 2, 3]}, x: 10},
+        ],
+        [
+            {_id: 2, time: t[2], meta: {a: [2, 1, 3]}, x: 20},
+            {_id: 3, time: t[3], meta: {a: [2, 1, 3]}, x: 30},
         ]);
 });
 })();

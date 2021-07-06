@@ -13,9 +13,9 @@ selector:
   ##
 
   # These tests expects some statements to error, which will cause txns to abort entirely.
+  - jstests/core/api_params_getmore.js
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
-  - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
@@ -28,7 +28,6 @@ selector:
   - jstests/core/geo_allowedcomparisons.js
   - jstests/core/geo_big_polygon2.js
   - jstests/core/geonear_key.js
-  - jstests/core/get_more_cmd_refuses_api_params.js
   - jstests/core/in.js
   - jstests/core/index8.js # No explicit check for failed command.
   - jstests/core/index_decimal.js
@@ -113,7 +112,6 @@ selector:
   # to test run without multi statement transactions).
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
-  - jstests/core/bulk_legacy_enforce_gle.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
   - jstests/core/field_name_validation.js
@@ -155,7 +153,6 @@ selector:
   # SERVER-34772 Tailable Cursors are not allowed with snapshot readconcern.
   - jstests/core/awaitdata_getmore_cmd.js
   - jstests/core/getmore_cmd_maxtimems.js
-  - jstests/core/invalidated_legacy_cursors.js
   - jstests/core/tailable_cursor_invalidation.js
   - jstests/core/tailable_getmore_batch_size.js
 
@@ -233,8 +230,8 @@ selector:
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
   - does_not_support_transactions
-  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
-  # cannot be run with transactions.
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
   - uses_api_parameters
 
 executor:
@@ -258,7 +255,6 @@ executor:
             # Tests in this suite only read from primaries and only one node is electable, so causal
             # consistency is not required to read your own writes.
             causalConsistency: false
-      readMode: commands
   hooks:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're

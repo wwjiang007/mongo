@@ -19,6 +19,7 @@ env.Library(
     target='bucket_catalog',
     source=[
         'bucket_catalog.cpp',
+        'minmax.cpp',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/database_holder',
@@ -27,6 +28,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/util/fail_point',
         'timeseries_idl',
+        'timeseries_options',
     ],
 )
 
@@ -41,9 +43,9 @@ env.Library(
 )
 
 env.Library(
-    target='timeseries_lookup',
+    target='timeseries_options',
     source=[
-        'timeseries_lookup.cpp',
+        'timeseries_options.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -58,6 +60,7 @@ env.CppUnitTest(
     target='db_timeseries_test',
     source=[
         'bucket_catalog_test.cpp',
+        'minmax_test.cpp',
         'timeseries_index_schema_conversion_functions_test.cpp',
     ],
     LIBDEPS=[
